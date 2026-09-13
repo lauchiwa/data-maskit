@@ -1376,17 +1376,30 @@ def _apply_upstream_headers_once(flow, upstream):
     _apply_extra_headers(flow, upstream)
 
 
+_DEVICE_ID_CACHE = None
+
+
 def _device_id():
-    """返回本机稳定设备标识；只落独立运行时文件，避免把机器指纹写进配置。"""
+    """返回本机稳定设备标识；只落独立运行时文件，避免把机器指纹写进配置。
+
+    进程内缓存：这个值在进程生命周期内不变，而命中 model 规则的**每个**请求都要
+    用它。不缓存等于每请求一次 open+read+正则校验（实测约 23μs），纯属重复劳动。
+    缓存也顺带把 _DATA_ROOT 只读挂载、磁盘被占满这类偶发 IO 故障挡在热路径外。
+    """
+    global _DEVICE_ID_CACHE
+    if _DEVICE_ID_CACHE is not None:
+        return _DEVICE_ID_CACHE
     path = _DATA_ROOT / "model_rules_device_id"
     try:
         value = path.read_text("ascii").strip()
         if re.fullmatch(r"[0-9a-f]{64}", value):
+            _DEVICE_ID_CACHE = value
             return value
     except Exception:
         pass
     # 数据目录本身随安装实例稳定，哈希后既满足上游 64 hex 要求又不暴露路径。
     value = hashlib.sha256(str(_DATA_ROOT).encode("utf-8")).hexdigest()
+    _DEVICE_ID_CACHE = value
     try:
         path.write_text(value, encoding="ascii")
     except Exception:
