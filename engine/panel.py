@@ -3177,9 +3177,33 @@ def normalize_config(raw, warnings=None):
                     if len(vv) > 2048:
                         continue
                     extra_headers[kk] = vv
+            model_rules = []
+            raw_rules = u.get("model_rules")
+            if isinstance(raw_rules, list):
+                for rule in raw_rules[:MAX_ITEMS]:
+                    if not isinstance(rule, dict):
+                        continue
+                    match = str(rule.get("match") or "").strip()
+                    if not match or len(match) > 256:
+                        continue
+                    rule_headers = {}
+                    if isinstance(rule.get("headers"), dict):
+                        for k, v in rule["headers"].items():
+                            kk = str(k or "").strip()
+                            if re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", kk) and len(str(v or "")) <= 2048:
+                                rule_headers[kk] = str(v or "")
+                    rule_body = rule.get("body")
+                    try:
+                        body_size = len(json.dumps(rule_body, ensure_ascii=False, separators=(",", ":")))
+                    except Exception:
+                        continue
+                    # body 只支持可 JSON 化的浅层注入值，限制体积防止配置占满控制面内存。
+                    if body_size > 32768 or not isinstance(rule_body, dict):
+                        continue
+                    model_rules.append({"match": match, "headers": rule_headers, "body": rule_body})
             ups.append({"name": name, "base_path": base_path, "port": port, "target": target,
                         "paths": paths_u, "use_proxy": bool(u.get("use_proxy")),
-                        "extra_headers": extra_headers})
+                        "extra_headers": extra_headers, "model_rules": model_rules})
     if not ups:
         ups = list(DEFAULT_UPSTREAMS)
 

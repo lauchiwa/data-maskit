@@ -20,7 +20,14 @@ export interface UpstreamConfig {
   paths?: string[]
   api_key_header?: string
   extra_headers?: Record<string, string>
+  model_rules?: ModelRule[]
   use_proxy?: boolean
+}
+
+export interface ModelRule {
+  match: string
+  headers: Record<string, string>
+  body: Record<string, unknown>
 }
 
 export interface EgressProxy {

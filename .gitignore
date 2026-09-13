@@ -24,6 +24,8 @@ build_engine/
 build_temp/
 *.spec.bak
 proxy_token
+# model_rules 的 {{device_id}} 种子：按数据目录生成的机器指纹，绝不入库
+model_rules_device_id
 _smoke_data/
 ai-coding/
 frontend/.playwright-cli/

@@ -4652,5 +4652,350 @@ class AuditFailClosedBlockTests(unittest.TestCase):
         self.assertEqual(flow.response.status_code, 500)
 
 
+class ModelRulesTests(unittest.TestCase):
+    """model_rules：按 model 注入请求头 + 请求体字段。
+
+    动机（实测，见 FINDINGS-client-fingerprint.md）：中转站的「仅限指定客户端」校验
+    同时看请求头和请求体，且同一个 upstream 下不同 model 要求不同的客户端身份，
+    upstream 级的 extra_headers 无法表达。
+    """
+
+    def setUp(self):
+        self._old_log = tr._log
+        tr._log = lambda line: None
+        tr._EXTRA_HEADER_SKIP_WARNED.clear()
+
+    def tearDown(self):
+        tr._log = self._old_log
+
+    def _flow(self, headers=None):
+        from mitmproxy.test import tflow
+        f = tflow.tflow()
+        for k, v in (headers or {}).items():
+            f.request.headers[k] = v
+        return f
+
+    # ---------- 规则选择 ----------
+
+    def test_exact_match_wins_over_glob(self):
+        """精确规则优先于 glob，且不受数组顺序影响。
+
+        用户把兜底的 claude-* 写在前面是很自然的写法，若按数组顺序取第一条命中，
+        针对 claude-opus-5 的专属规则就永远不会生效。
+        """
+        up = {"name": "u", "model_rules": [
+            {"match": "claude-*", "headers": {"x-which": "glob"}, "body": {}},
+            {"match": "claude-opus-5", "headers": {"x-which": "exact"}, "body": {}},
+        ]}
+        rule = tr._select_model_rule(up, "claude-opus-5")
+        self.assertEqual(rule["headers"]["x-which"], "exact")
+        self.assertEqual(
+            tr._select_model_rule(up, "claude-sonnet-9")["headers"]["x-which"], "glob")
+
+    def test_first_glob_wins_within_same_tier(self):
+        """同一层级内按配置顺序取第一条，保证可预测。"""
+        up = {"name": "u", "model_rules": [
+            {"match": "gpt-*", "headers": {"x-which": "first"}, "body": {}},
+            {"match": "gpt-5*", "headers": {"x-which": "second"}, "body": {}},
+        ]}
+        self.assertEqual(
+            tr._select_model_rule(up, "gpt-5.6-luna")["headers"]["x-which"], "first")
+
+    def test_match_is_glob_not_regex(self):
+        """match 是 glob 而非正则：正则元字符按字面量处理。
+
+        故意不支持正则——用户可控的正则会引入超线性回溯风险（参见 0.2.9 对
+        CONNSTR 模式的回溯修复），而按 model 名匹配不需要正则的表达力。
+        """
+        up = {"name": "u", "model_rules": [
+            {"match": "gpt-5.6-luna", "headers": {}, "body": {}}]}
+        self.assertIsNone(tr._select_model_rule(up, "gpt-5X6-luna"),
+                          "正则里 . 匹配任意字符；glob 下必须字面相等")
+        self.assertIsNotNone(tr._select_model_rule(up, "gpt-5.6-luna"))
+        self.assertIsNone(tr._select_model_rule(up, "GPT-5.6-LUNA"), "大小写敏感")
+
+    def test_no_rules_or_no_match_returns_none(self):
+        self.assertIsNone(tr._select_model_rule({"name": "u"}, "x"))
+        self.assertIsNone(tr._select_model_rule({"name": "u", "model_rules": []}, "x"))
+        self.assertIsNone(tr._select_model_rule(
+            {"name": "u", "model_rules": [{"match": "a*", "headers": {}, "body": {}}]}, "b"))
+
+    # ---------- 与 extra_headers 的互斥 ----------
+
+    def test_model_rule_hit_suppresses_extra_headers(self):
+        """命中 model 规则后 extra_headers 完全不生效。
+
+        两套客户端指纹叠加会得到一个「既不像 Codex 也不像 Claude Code」的四不像，
+        比只注入一套更容易被上游判定为异常。
+        """
+        flow = self._flow()
+        up = {"name": "u",
+              "extra_headers": {"x-upstream-level": "yes"},
+              "model_rules": [{"match": "m1",
+                               "headers": {"x-model-level": "yes"}, "body": {}}]}
+        self.assertTrue(tr._apply_model_rule(flow, up, {"model": "m1"}, "m1"))
+        self.assertEqual(flow.request.headers.get("x-model-level"), "yes")
+        self.assertIsNone(flow.request.headers.get("x-upstream-level"),
+                          "命中 model 规则时不得再叠加 upstream 级 extra_headers")
+
+    def test_model_rule_miss_falls_back_to_extra_headers(self):
+        """未命中任何规则时行为与改动前完全一致。"""
+        flow = self._flow()
+        up = {"name": "u",
+              "extra_headers": {"x-upstream-level": "yes"},
+              "model_rules": [{"match": "other", "headers": {}, "body": {}}]}
+        self.assertFalse(tr._apply_model_rule(flow, up, {"model": "m1"}, "m1"))
+        self.assertEqual(flow.request.headers.get("x-upstream-level"), "yes")
+
+    # ---------- header 安全过滤必须共用 ----------
+
+    def test_credential_headers_skipped_in_model_rules(self):
+        """凭据头在 model_rules.headers 里同样被跳过，不能因为换了入口就放宽。
+
+        凭据归客户端所有；在这里填凭据只会把客户端自带的真 key 顶掉，
+        换回一个必然 401，而上游只报「无效的令牌」（历史报障成因）。
+        """
+        flow = self._flow({"authorization": "Bearer real-key",
+                           "x-api-key": "real-key"})
+        up = {"name": "u", "model_rules": [{"match": "m1", "headers": {
+            "authorization": "Bearer fake", "x-api-key": "fake",
+            "anthropic-beta": "claude-code-20250219"}, "body": {}}]}
+        tr._apply_model_rule(flow, up, {"model": "m1"}, "m1")
+        self.assertEqual(flow.request.headers.get("authorization"), "Bearer real-key")
+        self.assertEqual(flow.request.headers.get("x-api-key"), "real-key")
+        self.assertEqual(flow.request.headers.get("anthropic-beta"),
+                         "claude-code-20250219", "非凭据协议头照常注入")
+
+    def test_placeholder_and_empty_header_values_skipped(self):
+        """占位符值与空值同样跳过（与 extra_headers 同一口径）。"""
+        flow = self._flow({"x-real": "keep"})
+        up = {"name": "u", "model_rules": [{"match": "m1", "headers": {
+            "x-real": "<YOUR_API_KEY>", "x-blank": "  ", "x-good": "ok"}, "body": {}}]}
+        tr._apply_model_rule(flow, up, {"model": "m1"}, "m1")
+        self.assertEqual(flow.request.headers.get("x-real"), "keep")
+        self.assertIsNone(flow.request.headers.get("x-blank"))
+        self.assertEqual(flow.request.headers.get("x-good"), "ok")
+
+    # ---------- body 注入 ----------
+
+    def test_body_top_level_keys_injected_and_overwritten(self):
+        flow = self._flow()
+        up = {"name": "u", "model_rules": [{"match": "m1", "headers": {}, "body": {
+            "prompt_cache_key": "fixed-value",
+            "system": [{"type": "text", "text": "identity"}]}}]}
+        body = {"model": "m1", "prompt_cache_key": "old", "messages": [{"role": "user"}]}
+        tr._apply_model_rule(flow, up, body, "m1")
+        self.assertEqual(body["prompt_cache_key"], "fixed-value", "同名顶层键直接覆盖")
+        self.assertEqual(body["system"], [{"type": "text", "text": "identity"}])
+        self.assertEqual(body["messages"], [{"role": "user"}], "未涉及的键不得被动到")
+
+    def test_uuid_placeholder_replaced_per_request(self):
+        up = {"name": "u", "model_rules": [
+            {"match": "m1", "headers": {}, "body": {"prompt_cache_key": "{{uuid}}"}}]}
+        b1, b2 = {"model": "m1"}, {"model": "m1"}
+        tr._apply_model_rule(self._flow(), up, b1, "m1")
+        tr._apply_model_rule(self._flow(), up, b2, "m1")
+        for b in (b1, b2):
+            self.assertRegex(b["prompt_cache_key"],
+                             r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                             r"[0-9a-f]{4}-[0-9a-f]{12}$")
+        self.assertNotEqual(b1["prompt_cache_key"], b2["prompt_cache_key"],
+                            "{{uuid}} 每次请求必须重新生成")
+
+    def test_device_id_is_64hex_and_stable(self):
+        """{{device_id}} 必须是 64 位小写 hex 且跨调用稳定。
+
+        上游对 device_id 的形态有硬要求（64 hex），短标签会被拒；
+        而「稳定」是语义要求：它描述的是同一台机器。
+        """
+        d1, d2 = tr._device_id(), tr._device_id()
+        self.assertEqual(d1, d2)
+        self.assertRegex(d1, r"^[0-9a-f]{64}$")
+
+    def test_placeholder_replaced_inside_nested_json_string(self):
+        """占位符要能替换嵌套结构里的字符串。
+
+        真实需求：metadata.user_id 的值本身是一个内层含占位符的 JSON 字符串
+        {"device_id":"{{device_id}}","account_uuid":"","session_id":"{{uuid}}"}。
+        """
+        up = {"name": "u", "model_rules": [{"match": "m1", "headers": {}, "body": {
+            "metadata": {"user_id": '{"device_id":"{{device_id}}",'
+                                    '"account_uuid":"","session_id":"{{uuid}}"}'}}}]}
+        body = {"model": "m1"}
+        tr._apply_model_rule(self._flow(), up, body, "m1")
+        inner = json.loads(body["metadata"]["user_id"])
+        self.assertRegex(inner["device_id"], r"^[0-9a-f]{64}$")
+        self.assertRegex(inner["session_id"],
+                         r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                         r"[0-9a-f]{4}-[0-9a-f]{12}$")
+        self.assertEqual(inner["account_uuid"], "")
+        self.assertNotIn("{{", body["metadata"]["user_id"])
+
+    def test_unknown_placeholder_never_leaks_literal(self):
+        """未知占位符必须整键跳过，绝不把 {{...}} 字面量发给上游。"""
+        up = {"name": "u", "model_rules": [{"match": "m1", "headers": {}, "body": {
+            "bad": "{{not_a_placeholder}}",
+            "nested_bad": {"inner": "{{nope}}"},
+            "good": "{{uuid}}"}}]}
+        body = {"model": "m1"}
+        tr._apply_model_rule(self._flow(), up, body, "m1")
+        self.assertNotIn("bad", body)
+        self.assertNotIn("nested_bad", body, "嵌套层的未知占位符同样让整个顶层键失效")
+        self.assertIn("good", body)
+        self.assertNotIn("{{", json.dumps(body))
+
+    def test_non_string_body_values_pass_through(self):
+        """数字/布尔/None 等非字符串值原样保留，不被占位符逻辑破坏。"""
+        up = {"name": "u", "model_rules": [{"match": "m1", "headers": {}, "body": {
+            "store": False, "n": 3, "nothing": None, "arr": [1, "{{uuid}}", True]}}]}
+        body = {"model": "m1"}
+        tr._apply_model_rule(self._flow(), up, body, "m1")
+        self.assertIs(body["store"], False)
+        self.assertEqual(body["n"], 3)
+        self.assertIsNone(body["nothing"])
+        self.assertEqual(body["arr"][0], 1)
+        self.assertIs(body["arr"][2], True)
+        self.assertRegex(body["arr"][1], r"^[0-9a-f]{8}-")
+
+    def test_malformed_rule_never_raises(self):
+        """规则写坏时静默放行，绝不阻断请求（沿用 extra_headers 的既有原则）。"""
+        flow = self._flow()
+        for bad in ({"model_rules": "not-a-list"},
+                    {"model_rules": [None, 42, "x"]},
+                    {"model_rules": [{"match": "m1"}]},
+                    {"model_rules": [{"match": "m1", "headers": "bad", "body": "bad"}]}):
+            bad["name"] = "u"
+            try:
+                tr._apply_model_rule(flow, bad, {"model": "m1"}, "m1")
+            except Exception as e:
+                self.fail(f"畸形配置不得抛异常: {bad!r} -> {e!r}")
+
+    def test_upstream_headers_applied_only_once(self):
+        """幂等标记生效：重复调用不重复注入。
+
+        为什么要幂等：调用点从「入口一处」下移到近十个提前 return 分支后，
+        分支只管调、去重交给函数，新增分支就不会再漏注入。
+        """
+        flow = self._flow()
+        up = {"name": "u", "extra_headers": {"x-once": "v"}}
+        tr._apply_upstream_headers_once(flow, up)
+        self.assertEqual(flow.request.headers.get("x-once"), "v")
+        flow.request.headers["x-once"] = "user-modified"
+        tr._apply_upstream_headers_once(flow, up)
+        self.assertEqual(flow.request.headers.get("x-once"), "user-modified",
+                         "第二次调用应被幂等标记短路")
+
+    # ---------- 与脱敏链路并存（端到端） ----------
+
+    _PORT = 18799
+
+    def _reverse_upstream(self, **over):
+        up = {"name": "u", "base_path": "/u", "port": self._PORT,
+              "target": "https://example.invalid",
+              "paths": ["/v1/chat/completions"], "use_proxy": False,
+              "extra_headers": {}, "model_rules": []}
+        up.update(over)
+        return up
+
+    def _reverse_flow(self, method, path, content=None):
+        """造一个能命中多端口路由的 flow。
+
+        reverse 模式优先按**入站监听端口**匹配 upstream（_listener_port 读
+        client_conn.sockname），而 tflow 默认 sockname 是 ('', 0)，不设置的话
+        永远匹配不到 upstream，测试会假失败。
+        """
+        from mitmproxy.test import tflow
+        flow = tflow.tflow()
+        flow.client_conn.sockname = ("127.0.0.1", self._PORT)
+        flow.request.method = method
+        flow.request.path = path
+        if content is not None:
+            flow.request.headers["content-type"] = "application/json"
+            flow.request.content = content
+        return flow
+
+    def test_injection_survives_masking_and_reaches_upstream(self):
+        """注入的字段必须真的发到上游，且与脱敏改写并存。
+
+        这是最容易静默失效的地方：脱敏也会重写 body，若注入发生在脱敏之后的
+        序列化之外，改动会被整片丢掉。所以走一次完整 request() 而不是只测函数。
+        """
+        old = (tr._emit, tr.CAPTURE_MODE, tr.UPSTREAMS, tr._log)
+        tr._emit, tr._log = (lambda *a, **k: None), (lambda line: None)
+        try:
+            tr.CAPTURE_MODE = "reverse"
+            tr.UPSTREAMS = [self._reverse_upstream(model_rules=[
+                {"match": "m1", "headers": {"originator": "codex_exec"},
+                 "body": {"prompt_cache_key": "{{uuid}}"}}])]
+            flow = self._reverse_flow("POST", "/v1/chat/completions", json.dumps({
+                "model": "m1",
+                "messages": [{"role": "user", "content": "hi"}]}).encode())
+            tr.request(flow)
+            sent = json.loads(flow.request.content)
+            self.assertIn("prompt_cache_key", sent,
+                          "注入的 body 字段必须出现在真正发出的请求里")
+            self.assertRegex(sent["prompt_cache_key"], r"^[0-9a-f]{8}-")
+            self.assertEqual(sent["model"], "m1")
+            self.assertEqual(sent["messages"][0]["content"], "hi",
+                             "注入不得破坏原有请求内容")
+            self.assertEqual(flow.request.headers.get("originator"), "codex_exec")
+        finally:
+            tr._emit, tr.CAPTURE_MODE, tr.UPSTREAMS, tr._log = old
+
+    def test_extra_headers_injected_on_unlisted_readonly_path(self):
+        """白名单外的只读请求也要带 upstream 级协议头。
+
+        回归防护：extra_headers 原先在 request() 开头一处调用覆盖全部分支，
+        引入 model_rules 后调用点下移，两条 passthrough_unlisted_path 分支曾漏掉，
+        表现为 /v1/models 这类初始化接口丢掉 anthropic-beta。
+        """
+        old = (tr._emit, tr.CAPTURE_MODE, tr.UPSTREAMS, tr._log)
+        tr._emit, tr._log = (lambda *a, **k: None), (lambda line: None)
+        try:
+            tr.CAPTURE_MODE = "reverse"
+            tr.UPSTREAMS = [self._reverse_upstream(
+                extra_headers={"anthropic-beta": "context-1m-2025-08-07"})]
+            # /v1/models 不在 paths 白名单里 → 走 passthrough_unlisted_path 分支
+            flow = self._reverse_flow("GET", "/v1/models")
+            tr.request(flow)
+            self.assertEqual(flow.request.headers.get("anthropic-beta"),
+                             "context-1m-2025-08-07")
+        finally:
+            tr._emit, tr.CAPTURE_MODE, tr.UPSTREAMS, tr._log = old
+
+
+class ModelRulesConfigTests(unittest.TestCase):
+    """panel 侧 model_rules 的规范化与上限。"""
+
+    def _norm(self, rules):
+        cfg = panel.normalize_config({"upstreams": [{
+            "name": "u", "base_path": "/u", "port": 18799,
+            "target": "https://example.invalid", "model_rules": rules}]})
+        return cfg["upstreams"][0].get("model_rules")
+
+    def test_rules_normalized_and_invalid_dropped(self):
+        out = self._norm([
+            {"match": "ok", "headers": {"x-a": "1"}, "body": {"k": "v"}},
+            {"match": "", "headers": {}, "body": {}},      # 空 match 丢弃
+            {"match": "no-body", "headers": {}},            # 缺 body 丢弃
+            "not-a-dict",                                   # 非对象丢弃
+        ])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["match"], "ok")
+
+    def test_illegal_header_names_and_long_values_dropped(self):
+        out = self._norm([{"match": "m", "headers": {
+            "x-good": "v",
+            "bad header": "v",       # 含空格，非法头名
+            "x-long": "y" * 3000,    # 超 2048
+        }, "body": {}}])
+        self.assertEqual(set(out[0]["headers"]), {"x-good"})
+
+    def test_oversized_body_rejected(self):
+        """body 体积要有上限，避免配置里塞进巨型对象拖慢每个请求。"""
+        self.assertEqual(self._norm([{"match": "m", "headers": {},
+                                      "body": {"k": "z" * 40000}}]), [])
+
+
 if __name__ == "__main__":
     unittest.main()

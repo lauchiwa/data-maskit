@@ -13,6 +13,10 @@ __pycache__
 .env.*
 *.local
 proxy_token
+# 本机跑门禁用的 venv：数百 MB，进构建上下文只会拖慢 build，镜像里另有 pip install
+.venv/
+# model_rules 的 {{device_id}} 种子：机器指纹，绝不能烤进镜像（会让所有部署共用同一个 id）
+model_rules_device_id
 shield.pid
 shield-env-backup.json
 model_prices_cache.json

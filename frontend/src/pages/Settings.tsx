@@ -177,12 +177,20 @@ function UpstreamForm({
   const [newHeaderVal, setNewHeaderVal] = useState('')
   const { t, tf } = useI18n()
   const extraHeaders = form.extra_headers ?? {}
+  // 用 JSON 保留规则数组顺序和 body 的任意嵌套结构，避免 UI 先验限制真实协议字段。
+  // 没有规则时留空而不是显示 "[]"：空数组字面量会让人以为「已经配了什么」，
+  // 而 saveChecked 里 `modelRulesText || '[]'` 已把空串当空数组处理。
+  const [modelRulesText, setModelRulesText] = useState(() =>
+    (initial.model_rules ?? []).length > 0 ? JSON.stringify(initial.model_rules, null, 2) : '')
   // 「注入请求头」是可选的高级覆盖入口，默认收起——请求头本来就原样透传，不需要用户做任何事。
   // 但已有配置（含历史遗留的占位符行）必须默认展开，否则用户看不到问题行、也删不掉。
   // 受控 + onToggle 回写：初始值由 lazy initializer 一次性算出（不依赖 effect 时机，弹窗在
   // Radix portal 里挂载时 effect 里改 DOM 不生效），用户手动开合时把 DOM 真实状态同步回 state，
   // 于是重渲染永远写回正确值，不会把用户展开的状态弹回去。
-  const [advOpen, setAdvOpen] = useState(() => Object.keys(initial.extra_headers ?? {}).length > 0)
+  // model_rules 也要能把高级区撑开：已配了规则却默认收起，用户看不到也改不掉
+  // （与 extra_headers 同一理由）。
+  const [advOpen, setAdvOpen] = useState(() =>
+    Object.keys(initial.extra_headers ?? {}).length > 0 || (initial.model_rules ?? []).length > 0)
 
   const presets = CLIENT_TYPE_PRESETS[clientType] ?? CLIENT_TYPE_PRESETS.openai
   const presetPaths = presets.paths.filter((p) => !(form.paths ?? []).includes(p))
@@ -239,7 +247,35 @@ function UpstreamForm({
       toast(tf('settings.upstream.headerPlaceholder', { k: bad[0], v: bad[1] }), 'error')
       return
     }
-    onSave(form)
+    let parsedRules: unknown
+    try { parsedRules = JSON.parse(modelRulesText || '[]') } catch {
+      toast(t('settings.upstream.modelRulesJson'), 'error')
+      return
+    }
+    if (!Array.isArray(parsedRules)) {
+      toast(t('settings.upstream.modelRulesJson'), 'error')
+      return
+    }
+    for (const rule of parsedRules) {
+      if (!rule || typeof rule !== 'object' || typeof (rule as Record<string, unknown>).match !== 'string') {
+        toast(t('settings.upstream.modelRulesJson'), 'error')
+        return
+      }
+      const headers = (rule as Record<string, unknown>).headers
+      if (headers && typeof headers === 'object') {
+        for (const [k, v] of Object.entries(headers as Record<string, unknown>)) {
+          if (isCredentialHeader(k) && String(v ?? '').trim()) {
+            toast(tf('settings.upstream.headerCredential', { k }), 'error')
+            return
+          }
+          if (PLACEHOLDER_HEADER_VAL.test(String(v ?? ''))) {
+            toast(tf('settings.upstream.headerPlaceholder', { k, v: String(v) }), 'error')
+            return
+          }
+        }
+      }
+    }
+    onSave({ ...form, model_rules: parsedRules as UpstreamConfig['model_rules'] })
   }
 
   return (
@@ -362,6 +398,11 @@ function UpstreamForm({
                 </div>
               </div>
               <p className="mt-1.5 text-[11px] text-muted-foreground">{t('settings.upstream.headerHint')}</p>
+              <div className="mt-3 border-t border-border/60 pt-2">
+                <Label className="text-[11px]">{t('settings.upstream.modelRules')}</Label>
+                <Textarea className="mt-1 min-h-28 font-mono text-[11px]" value={modelRulesText} onChange={(e) => setModelRulesText(e.target.value)} placeholder={t('settings.upstream.modelRulesPh')} />
+                <p className="mt-1 text-[11px] text-muted-foreground">{t('settings.upstream.modelRulesHint')}</p>
+              </div>
             </div>
           </details>
 
@@ -1108,6 +1149,13 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                     {Object.keys(u.extra_headers ?? {}).length > 0 && (
                       <Badge variant="outline" className="font-mono text-[10px]" title={tf('settings.clients.injectedHeaders', { list: Object.keys(u.extra_headers ?? {}).join(', ') })}>
                         {tf('settings.clients.headerCount', { n: Object.keys(u.extra_headers ?? {}).length })}
+                      </Badge>
+                    )}
+                    {/* 按模型规则同样要在列表页可见：命中规则时 extra_headers 会被整体
+                        跳过，只显示「请求头 N」会让人误判当前生效的是哪一套注入。 */}
+                    {(u.model_rules ?? []).length > 0 && (
+                      <Badge variant="outline" className="font-mono text-[10px]" title={tf('settings.clients.modelRulesList', { list: (u.model_rules ?? []).map((r) => r.match).join(', ') })}>
+                        {tf('settings.clients.modelRuleCount', { n: (u.model_rules ?? []).length })}
                       </Badge>
                     )}
                   </div>

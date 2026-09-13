@@ -42,6 +42,7 @@ from credential_labels import CREDENTIAL_LABELS
 import audit_signals as _audit
 import base64
 import hashlib
+import fnmatch
 
 # 内置正则规则（敏感词字面在 config.json，正则规则固定，避免 UI 误改）
 ID_BOUND_L = r"(?<![A-Za-z0-9])"
@@ -1296,7 +1297,7 @@ _CREDENTIAL_HEADER_NAMES = frozenset({
 _EXTRA_HEADER_SKIP_WARNED = set()
 
 
-def _apply_extra_headers(flow, upstream):
+def _apply_safe_headers(flow, upstream, headers):
     """按 upstream 配置注入静态请求头（extra_headers）。
 
     场景：上游要求某个**与凭据无关**的协议头，但客户端根本不发
@@ -1316,11 +1317,10 @@ def _apply_extra_headers(flow, upstream):
     真要注入的协议头照常按真实值覆盖。
     """
     try:
-        extra = (upstream or {}).get("extra_headers") or {}
-        if not isinstance(extra, dict) or not extra:
+        if not isinstance(headers, dict) or not headers:
             return
         up_name = str((upstream or {}).get("name") or "")
-        for key, value in extra.items():
+        for key, value in headers.items():
             k = str(key or "").strip()
             if not k:
                 continue
@@ -1345,6 +1345,128 @@ def _apply_extra_headers(flow, upstream):
                 pass
     except Exception:
         pass
+
+
+def _apply_extra_headers(flow, upstream):
+    """按 upstream 配置注入静态请求头；安全过滤必须与 model_rules 共用。"""
+    _apply_safe_headers(flow, upstream, (upstream or {}).get("extra_headers") or {})
+
+
+def _apply_upstream_headers_once(flow, upstream):
+    """幂等地注入 upstream 级 extra_headers；同一个 flow 重复调用只生效一次。
+
+    为什么需要幂等标记：extra_headers 原先在 request() 开头**一处**调用，覆盖全部
+    分支；引入 model_rules 后两者互斥（命中 model 规则就不能再叠加 upstream 级头，
+    否则两套客户端指纹混成一个都不像的四不像），于是注入时机被迫下移到「确定不会
+    命中 model 规则」之后。
+
+    但 request() 有近十个提前 return 分支（readonly / filter_off / 非 JSON /
+    body 过大 / invalid_json / passthrough_unlisted_path …），逐个补调用极易漏
+    —— 实测就漏掉过两条 passthrough_unlisted_path 分支，表现为 /v1/models 这类
+    初始化请求丢掉 anthropic-beta。所以改成「入口处无脑调用 + 标记去重」：
+    分支只管调，重复与否由本函数负责，新增分支不会再漏。
+    """
+    try:
+        if flow.metadata.get("shield_extra_headers_done"):
+            return
+        flow.metadata["shield_extra_headers_done"] = True
+    except Exception:
+        # metadata 不可用时退化为直接注入：漏注入比重复注入更糟（重复是幂等的）
+        pass
+    _apply_extra_headers(flow, upstream)
+
+
+def _device_id():
+    """返回本机稳定设备标识；只落独立运行时文件，避免把机器指纹写进配置。"""
+    path = _DATA_ROOT / "model_rules_device_id"
+    try:
+        value = path.read_text("ascii").strip()
+        if re.fullmatch(r"[0-9a-f]{64}", value):
+            return value
+    except Exception:
+        pass
+    # 数据目录本身随安装实例稳定，哈希后既满足上游 64 hex 要求又不暴露路径。
+    value = hashlib.sha256(str(_DATA_ROOT).encode("utf-8")).hexdigest()
+    try:
+        path.write_text(value, encoding="ascii")
+    except Exception:
+        pass
+    return value
+
+
+_MODEL_RULE_PLACEHOLDER_RX = re.compile(r"\{\{([^{}]+)\}\}")
+
+
+def _replace_model_rule_value(value, device_id):
+    """递归替换规则值；未知占位符让整个顶层字段失效，避免字面量外泄。"""
+    if isinstance(value, str):
+        unknown = False
+        def replace(match):
+            nonlocal unknown
+            name = match.group(1)
+            if name == "uuid":
+                return str(uuid.uuid4())
+            if name == "device_id":
+                return device_id
+            unknown = True
+            return match.group(0)
+        result = _MODEL_RULE_PLACEHOLDER_RX.sub(replace, value)
+        return (None, True) if unknown else (result, False)
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            replaced, bad = _replace_model_rule_value(item, device_id)
+            if bad:
+                return None, True
+            out[key] = replaced
+        return out, False
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            replaced, bad = _replace_model_rule_value(item, device_id)
+            if bad:
+                return None, True
+            out.append(replaced)
+        return out, False
+    return value, False
+
+
+def _select_model_rule(upstream, model):
+    rules = (upstream or {}).get("model_rules") or []
+    if not isinstance(rules, list):
+        return None
+    # 精确规则优先，glob 规则仍按配置顺序决定，避免用户无法预测命中项。
+    for exact in (True, False):
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            match = str(rule.get("match") or "")
+            if ("*" not in match) != exact:
+                continue
+            if fnmatch.fnmatchcase(model, match):
+                return rule
+    return None
+
+
+def _apply_model_rule(flow, upstream, body, model):
+    """按 model 注入一条规则；异常只跳过注入，不能阻断原有转发。"""
+    try:
+        rule = _select_model_rule(upstream, model)
+        if rule is None:
+            # 未命中 model 规则：退回 upstream 级 extra_headers（原有行为完全不变）
+            _apply_upstream_headers_once(flow, upstream)
+            return False
+        _apply_safe_headers(flow, upstream, rule.get("headers") or {})
+        device_id = _device_id()
+        for key, value in (rule.get("body") or {}).items():
+            replaced, bad = _replace_model_rule_value(value, device_id)
+            if bad:
+                _log(f"[mask] 客户端「{upstream.get('name', '')}」model 规则 body 键 {key} 含未知占位符，已跳过")
+                continue
+            body[key] = replaced
+        return True
+    except Exception:
+        return False
 
 
 def _apply_egress_proxy(flow, upstream):
@@ -3010,14 +3132,13 @@ def request(flow: http.HTTPFlow):
         # 初始化必打的接口，直接拒绝会让人以为代理坏了。这里只决定"是否脱敏"，转发照旧。
         up_name = matched_up.get("name") or ""
         flow.metadata["shield_upstream"] = up_name
-        # 客户端级注入请求头（extra_headers）：只注入与凭据无关的协议头
-        # （凭据头与占位符/空值都会被 _apply_extra_headers 跳过）。
-        # 必须在转发前设置（客户端请求头在 request() 阶段可改）。
-        _apply_extra_headers(flow, matched_up)
         # 出口代理必须在任何 return 之前挂上（含下面的 passthrough_unlisted_path 分支）
         _apply_egress_proxy(flow, matched_up)
         if not _upstream_path_ok(matched_up, path):
             if method in _READONLY_METHODS:
+                # 白名单外的只读请求同样要带 upstream 级协议头：/v1/models 这类
+                # 初始化接口缺 anthropic-beta 会让客户端启动就失败。
+                _apply_upstream_headers_once(flow, matched_up)
                 _emit_skip(host, method, path, "passthrough_unlisted_path", source=source, upstream=up_name)
                 return
             # 无论是否在白名单，非只读请求只要像 LLM 请求就继续进入脱敏流程；
@@ -3053,6 +3174,9 @@ def request(flow: http.HTTPFlow):
                 # 但解析失败」返回 True（交 fail_closed 脱敏），对「解析成功但键不
                 # 认识」返回 False（放行） —— 原本解析失败反而比解析成功更安全。
                 if not FAIL_CLOSED:
+                    # 同上：放行的请求也必须带 upstream 级协议头，否则关掉
+                    # fail_closed 反而会让上游因缺头而拒绝。
+                    _apply_upstream_headers_once(flow, matched_up)
                     _emit_skip(host, method, path, "passthrough_unlisted_path", source=source, upstream=up_name)
                     return
     else:
@@ -3067,11 +3191,13 @@ def request(flow: http.HTTPFlow):
 
     # 只读方法没有请求体，无需脱敏，直接转发 —— 仍记 PASS（过网关必有日志）
     if method in _READONLY_METHODS:
+        _apply_upstream_headers_once(flow, matched_up)
         _emit_skip(host, method, path, "readonly_method", source=source, upstream=up_name)
         return
 
     # 过滤开关关闭：路由已生效（reverse 模式已改写 host），但不脱敏，透明转发到上游
     if not FILTER_ENABLED:
+        _apply_upstream_headers_once(flow, matched_up)
         flow.metadata["shield_filter_off"] = True
         _emit(
             "BYPASS",
@@ -3084,6 +3210,7 @@ def request(flow: http.HTTPFlow):
 
     ct = (flow.request.headers.get("content-type", "") or "").lower()
     if "json" not in ct:
+        _apply_upstream_headers_once(flow, matched_up)
         # 声明非 JSON（multipart 上传、二进制等）：脱敏管线处理不了。
         # fail_closed 下阻断（无法确认里面没有原文）；仅排查问题时
         # 可关 fail_closed 放行，此时记 BYPASS 让用户在日志里看得见。
@@ -3112,6 +3239,7 @@ def request(flow: http.HTTPFlow):
     # event loop。超限一律拒绝（不看 fail_closed）——放行等于把原文原样上行，
     # 正是脱敏代理绝不能做的事。
     if len(raw_content) > _MAX_REQUEST_BODY:
+        _apply_upstream_headers_once(flow, matched_up)
         _emit("BLOCK", host=host, method=method, path=path.split("?")[0],
               reason="request_too_large", bytes=len(raw_content),
               upstream=up_name, **source)
@@ -3126,6 +3254,7 @@ def request(flow: http.HTTPFlow):
     try:
         body = json.loads(raw_content)
     except Exception:
+        _apply_upstream_headers_once(flow, matched_up)
         # 声明了 JSON 却解析不了：无法确认里面没有原文。fail_closed 下必须拦。
         if FAIL_CLOSED:
             _emit("BLOCK", host=host, method=method, path=path.split("?")[0], reason="invalid_json", upstream=up_name, **source)
@@ -3145,6 +3274,11 @@ def request(flow: http.HTTPFlow):
     # 这里不阻断而是照常脱敏：_mask_tree 对 list/str/标量一样有效，脱敏比 400 更不
     # 容易误伤用户自建的非标准接口。做法是套一层合成根键让下游的 dict 逻辑照常跑，
     # 发往上游前再拆掉，上游看到的仍是原来的形态。
+    # model 级注入必须在合成根键**之前**做：包装之后 _extract_model 取不到 model，
+    # 且发往上游前会把 body 拆回 body[_ROOT_WRAP_KEY]（见下方序列化处），注到外层
+    # wrapper 上的字段会被整片丢掉——静默失效比报错更难查。
+    # 放在脱敏之前、由脱敏统一序列化，则两次写 body 不会互相覆盖。
+    _apply_model_rule(flow, matched_up, body, _extract_model(body))
     root_is_object = isinstance(body, dict)
     if not root_is_object:
         body = {_ROOT_WRAP_KEY: body}
@@ -4437,10 +4571,34 @@ def _read_settings():
                     if len(vv) > 2048:
                         continue
                     extra_headers[kk] = vv
+            model_rules = []
+            raw_rules = u.get("model_rules")
+            if isinstance(raw_rules, list):
+                for rule in raw_rules[:500]:
+                    if not isinstance(rule, dict):
+                        continue
+                    match = str(rule.get("match") or "").strip()
+                    body = rule.get("body")
+                    if not match or len(match) > 256 or not isinstance(body, dict):
+                        continue
+                    try:
+                        if len(json.dumps(body, ensure_ascii=False, separators=(",", ":"))) > 32768:
+                            continue
+                    except Exception:
+                        continue
+                    headers = {}
+                    raw_headers = rule.get("headers")
+                    if isinstance(raw_headers, dict):
+                        for key, value in raw_headers.items():
+                            clean_key = str(key or "").strip()
+                            clean_value = str(value or "")
+                            if re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", clean_key) and len(clean_value) <= 2048:
+                                headers[clean_key] = clean_value
+                    model_rules.append({"match": match, "headers": headers, "body": body})
 
             ups.append({"name": name, "base_path": base, "port": port, "target": target,
                         "paths": list(paths), "use_proxy": bool(u.get("use_proxy")),
-                        "extra_headers": extra_headers})
+                        "extra_headers": extra_headers, "model_rules": model_rules})
     if not ups:
         ups = list(DEFAULT_UPSTREAMS)
     # 出口代理：enabled 关闭时直接置 None，省得 request() 每次都判两个字段。
