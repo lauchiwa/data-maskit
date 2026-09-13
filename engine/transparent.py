@@ -1448,25 +1448,61 @@ def _select_model_rule(upstream, model):
     return None
 
 
-def _apply_model_rule(flow, upstream, body, model):
-    """按 model 注入一条规则；异常只跳过注入，不能阻断原有转发。"""
+def _apply_model_rule_headers(flow, upstream, model):
+    """按 model 选规则并注入其请求头；返回命中的规则（未命中返回 None）。
+
+    **只做 header**。body 注入由 `_apply_model_rule_body` 在脱敏之后单独做，
+    两者刻意分开，原因见那个函数的 docstring。
+
+    返回值要给调用方留着传进 `_apply_model_rule_body`：规则选择有精确优先、
+    同层顺序等语义，选两次既浪费也可能因中间的配置热重载而选出不同结果。
+    """
     try:
         rule = _select_model_rule(upstream, model)
         if rule is None:
             # 未命中 model 规则：退回 upstream 级 extra_headers（原有行为完全不变）
             _apply_upstream_headers_once(flow, upstream)
-            return False
+            return None
         _apply_safe_headers(flow, upstream, rule.get("headers") or {})
+        return rule
+    except Exception:
+        return None
+
+
+def _apply_model_rule_body(body, rule, upstream):
+    """把命中规则的 body 字段写进 body；必须在脱敏**之后**、序列化之前调用。
+
+    为什么不能放在脱敏之前（实测踩过）：注入值会跟着一起过 `_mask_tree`。
+    用户只要在词表里加了 `Claude` 这类词，注入的身份行就会变成
+    `You are {{TERM_xxx}} Code, ...`，渠道判定立刻失败——而用户完全联想不到
+    是自己加的敏感词导致的（两件事之间没有任何可见关联）。
+
+    为什么不改成「按值豁免」：`_mask_tree` 的豁免全部按**字段名 + 位置**判定
+    （见 AGENTS 约束 12），加一条「值白名单」会破坏那个设计原则，且值白名单
+    本身就是泄漏面——命中即整串跳过。分离时机不需要动脱敏一行代码。
+
+    安全边界：注入值来自用户自己写的规则配置（静态客户端指纹），不是对话正文，
+    所以跳过脱敏不构成泄漏路径。若用户把真实 PII 写进规则 body，那是显式配置的
+    结果，与在 `extra_headers` 里填明文同理。
+
+    不做深层 merge：同名顶层键直接覆盖。已验证需要的字段（prompt_cache_key /
+    system / metadata）都是顶层，深层 merge 是没有需求支撑的复杂度。
+    """
+    if not rule:
+        return
+    try:
         device_id = _device_id()
         for key, value in (rule.get("body") or {}).items():
             replaced, bad = _replace_model_rule_value(value, device_id)
             if bad:
-                _log(f"[mask] 客户端「{upstream.get('name', '')}」model 规则 body 键 {key} 含未知占位符，已跳过")
+                _log(f"[mask] 客户端「{(upstream or {}).get('name', '')}」model 规则 "
+                     f"body 键 {key} 含未知占位符，已跳过")
                 continue
             body[key] = replaced
-        return True
     except Exception:
-        return False
+        # 与 header 注入同一原则：注入失败只是少了指纹（上游会拒），
+        # 绝不能因此阻断请求或让脱敏管线抛出异常。
+        pass
 
 
 def _apply_egress_proxy(flow, upstream):
@@ -3274,11 +3310,11 @@ def request(flow: http.HTTPFlow):
     # 这里不阻断而是照常脱敏：_mask_tree 对 list/str/标量一样有效，脱敏比 400 更不
     # 容易误伤用户自建的非标准接口。做法是套一层合成根键让下游的 dict 逻辑照常跑，
     # 发往上游前再拆掉，上游看到的仍是原来的形态。
-    # model 级注入必须在合成根键**之前**做：包装之后 _extract_model 取不到 model，
-    # 且发往上游前会把 body 拆回 body[_ROOT_WRAP_KEY]（见下方序列化处），注到外层
-    # wrapper 上的字段会被整片丢掉——静默失效比报错更难查。
-    # 放在脱敏之前、由脱敏统一序列化，则两次写 body 不会互相覆盖。
-    _apply_model_rule(flow, matched_up, body, _extract_model(body))
+    # model 级 header 注入放在这里（合成根键之前）：包装之后 _extract_model 取不到
+    # model，选不出规则。命中的规则要留到脱敏之后再写 body —— 注入值若跟着过
+    # _mask_tree，用户词表里一个 `Claude` 就能把身份行改成 {{TERM_xxx}}，
+    # 渠道判定随即失败（详见 _apply_model_rule_body 的 docstring）。
+    _model_rule = _apply_model_rule_headers(flow, matched_up, _extract_model(body))
     root_is_object = isinstance(body, dict)
     if not root_is_object:
         body = {_ROOT_WRAP_KEY: body}
@@ -3370,6 +3406,14 @@ def request(flow: http.HTTPFlow):
         # 非字符串/列表/字典（数字/bool/null）_mask_tree 原样返回，无副作用。
         for key in list(body.keys()):
             body[key] = _mask_tree(body[key], sid, key)
+
+        # model 规则的 body 注入：**必须在脱敏之后**，否则注入的客户端指纹会被
+        # 当成正文脱敏掉（用户词表里一个 `Claude` 就足以让身份行失效）。
+        # 只在顶层是对象时注入：非对象 body（JSON 数组/标量）此刻装在合成根键里，
+        # 序列化只取 body[_ROOT_WRAP_KEY]，写到 wrapper 上的键会被整片丢掉。
+        # 而那种形态本就不是任何 LLM API 的请求体，不存在需要注入指纹的场景。
+        if root_is_object:
+            _apply_model_rule_body(body, _model_rule, matched_up)
 
         masked_raw = json.dumps(
             body if root_is_object else body[_ROOT_WRAP_KEY], ensure_ascii=False

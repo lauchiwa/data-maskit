@@ -4733,7 +4733,8 @@ class ModelRulesTests(unittest.TestCase):
               "extra_headers": {"x-upstream-level": "yes"},
               "model_rules": [{"match": "m1",
                                "headers": {"x-model-level": "yes"}, "body": {}}]}
-        self.assertTrue(tr._apply_model_rule(flow, up, {"model": "m1"}, "m1"))
+        rule = tr._apply_model_rule_headers(flow, up, "m1")
+        self.assertIsNotNone(rule, "命中规则时应返回该规则供 body 注入复用")
         self.assertEqual(flow.request.headers.get("x-model-level"), "yes")
         self.assertIsNone(flow.request.headers.get("x-upstream-level"),
                           "命中 model 规则时不得再叠加 upstream 级 extra_headers")
@@ -4744,7 +4745,8 @@ class ModelRulesTests(unittest.TestCase):
         up = {"name": "u",
               "extra_headers": {"x-upstream-level": "yes"},
               "model_rules": [{"match": "other", "headers": {}, "body": {}}]}
-        self.assertFalse(tr._apply_model_rule(flow, up, {"model": "m1"}, "m1"))
+        rule = tr._apply_model_rule_headers(flow, up, "m1")
+        self.assertIsNone(rule, "未命中规则时应返回 None")
         self.assertEqual(flow.request.headers.get("x-upstream-level"), "yes")
 
     # ---------- header 安全过滤必须共用 ----------
@@ -4760,7 +4762,7 @@ class ModelRulesTests(unittest.TestCase):
         up = {"name": "u", "model_rules": [{"match": "m1", "headers": {
             "authorization": "Bearer fake", "x-api-key": "fake",
             "anthropic-beta": "claude-code-20250219"}, "body": {}}]}
-        tr._apply_model_rule(flow, up, {"model": "m1"}, "m1")
+        tr._apply_model_rule_headers(flow, up, "m1")
         self.assertEqual(flow.request.headers.get("authorization"), "Bearer real-key")
         self.assertEqual(flow.request.headers.get("x-api-key"), "real-key")
         self.assertEqual(flow.request.headers.get("anthropic-beta"),
@@ -4771,7 +4773,7 @@ class ModelRulesTests(unittest.TestCase):
         flow = self._flow({"x-real": "keep"})
         up = {"name": "u", "model_rules": [{"match": "m1", "headers": {
             "x-real": "<YOUR_API_KEY>", "x-blank": "  ", "x-good": "ok"}, "body": {}}]}
-        tr._apply_model_rule(flow, up, {"model": "m1"}, "m1")
+        tr._apply_model_rule_headers(flow, up, "m1")
         self.assertEqual(flow.request.headers.get("x-real"), "keep")
         self.assertIsNone(flow.request.headers.get("x-blank"))
         self.assertEqual(flow.request.headers.get("x-good"), "ok")
@@ -4784,7 +4786,8 @@ class ModelRulesTests(unittest.TestCase):
             "prompt_cache_key": "fixed-value",
             "system": [{"type": "text", "text": "identity"}]}}]}
         body = {"model": "m1", "prompt_cache_key": "old", "messages": [{"role": "user"}]}
-        tr._apply_model_rule(flow, up, body, "m1")
+        rule = tr._apply_model_rule_headers(self._flow(), up, "m1")
+        tr._apply_model_rule_body(body, rule, up)
         self.assertEqual(body["prompt_cache_key"], "fixed-value", "同名顶层键直接覆盖")
         self.assertEqual(body["system"], [{"type": "text", "text": "identity"}])
         self.assertEqual(body["messages"], [{"role": "user"}], "未涉及的键不得被动到")
@@ -4793,8 +4796,10 @@ class ModelRulesTests(unittest.TestCase):
         up = {"name": "u", "model_rules": [
             {"match": "m1", "headers": {}, "body": {"prompt_cache_key": "{{uuid}}"}}]}
         b1, b2 = {"model": "m1"}, {"model": "m1"}
-        tr._apply_model_rule(self._flow(), up, b1, "m1")
-        tr._apply_model_rule(self._flow(), up, b2, "m1")
+        r1 = tr._apply_model_rule_headers(self._flow(), up, "m1")
+        tr._apply_model_rule_body(b1, r1, up)
+        r2 = tr._apply_model_rule_headers(self._flow(), up, "m1")
+        tr._apply_model_rule_body(b2, r2, up)
         for b in (b1, b2):
             self.assertRegex(b["prompt_cache_key"],
                              r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
@@ -4822,7 +4827,8 @@ class ModelRulesTests(unittest.TestCase):
             "metadata": {"user_id": '{"device_id":"{{device_id}}",'
                                     '"account_uuid":"","session_id":"{{uuid}}"}'}}}]}
         body = {"model": "m1"}
-        tr._apply_model_rule(self._flow(), up, body, "m1")
+        rule = tr._apply_model_rule_headers(self._flow(), up, "m1")
+        tr._apply_model_rule_body(body, rule, up)
         inner = json.loads(body["metadata"]["user_id"])
         self.assertRegex(inner["device_id"], r"^[0-9a-f]{64}$")
         self.assertRegex(inner["session_id"],
@@ -4838,7 +4844,8 @@ class ModelRulesTests(unittest.TestCase):
             "nested_bad": {"inner": "{{nope}}"},
             "good": "{{uuid}}"}}]}
         body = {"model": "m1"}
-        tr._apply_model_rule(self._flow(), up, body, "m1")
+        rule = tr._apply_model_rule_headers(self._flow(), up, "m1")
+        tr._apply_model_rule_body(body, rule, up)
         self.assertNotIn("bad", body)
         self.assertNotIn("nested_bad", body, "嵌套层的未知占位符同样让整个顶层键失效")
         self.assertIn("good", body)
@@ -4849,7 +4856,8 @@ class ModelRulesTests(unittest.TestCase):
         up = {"name": "u", "model_rules": [{"match": "m1", "headers": {}, "body": {
             "store": False, "n": 3, "nothing": None, "arr": [1, "{{uuid}}", True]}}]}
         body = {"model": "m1"}
-        tr._apply_model_rule(self._flow(), up, body, "m1")
+        rule = tr._apply_model_rule_headers(self._flow(), up, "m1")
+        tr._apply_model_rule_body(body, rule, up)
         self.assertIs(body["store"], False)
         self.assertEqual(body["n"], 3)
         self.assertIsNone(body["nothing"])
@@ -4866,7 +4874,8 @@ class ModelRulesTests(unittest.TestCase):
                     {"model_rules": [{"match": "m1", "headers": "bad", "body": "bad"}]}):
             bad["name"] = "u"
             try:
-                tr._apply_model_rule(flow, bad, {"model": "m1"}, "m1")
+                rule = tr._apply_model_rule_headers(flow, bad, "m1")
+                tr._apply_model_rule_body({"model": "m1"}, rule, bad)
             except Exception as e:
                 self.fail(f"畸形配置不得抛异常: {bad!r} -> {e!r}")
 
@@ -4941,6 +4950,41 @@ class ModelRulesTests(unittest.TestCase):
             self.assertEqual(flow.request.headers.get("originator"), "codex_exec")
         finally:
             tr._emit, tr.CAPTURE_MODE, tr.UPSTREAMS, tr._log = old
+
+    def test_injected_body_not_rewritten_by_custom_words(self):
+        """注入的客户端指纹不得被用户自定义词表改写。
+
+        这是本 feature 最隐蔽的坑：注入原先发生在脱敏之前，用户只要把 `Claude`
+        或 `Anthropic` 加进词表（很自然的动作——不想让公司名外泄），注入的身份行
+        就会变成 `You are {{TERM_xxx}} Code, ...`，上游渠道判定立刻失败。用户完全
+        无法把「加了个敏感词」和「几天后渠道拒绝」这两件事联系起来。
+        所以注入必须在脱敏之后执行；同时正文里的同一个词仍要照常脱敏。
+        """
+        identity = "You are Claude Code, Anthropic's official CLI for Claude."
+        old = (tr._emit, tr.CAPTURE_MODE, tr.UPSTREAMS, tr._log,
+               dict(tr.CUSTOM_WORDS))
+        tr._emit, tr._log = (lambda *a, **k: None), (lambda line: None)
+        try:
+            tr.CUSTOM_WORDS.clear()
+            tr.CUSTOM_WORDS.update({"Claude": "厂商", "Anthropic": "厂商"})
+            tr.CAPTURE_MODE = "reverse"
+            tr.UPSTREAMS = [self._reverse_upstream(model_rules=[
+                {"match": "m1", "headers": {},
+                 "body": {"system": [{"type": "text", "text": identity}]}}])]
+            flow = self._reverse_flow("POST", "/v1/chat/completions", json.dumps({
+                "model": "m1",
+                "messages": [{"role": "user", "content": "帮我问下 Claude"}],
+            }).encode())
+            tr.request(flow)
+            sent = json.loads(flow.request.content)
+            self.assertEqual(sent["system"][0]["text"], identity,
+                             "注入的身份行必须原样送达，不能被词表改写")
+            self.assertNotIn("Claude", sent["messages"][0]["content"],
+                             "正文里的同一个词仍必须照常脱敏")
+        finally:
+            (tr._emit, tr.CAPTURE_MODE, tr.UPSTREAMS, tr._log, words) = old
+            tr.CUSTOM_WORDS.clear()
+            tr.CUSTOM_WORDS.update(words)
 
     def test_extra_headers_injected_on_unlisted_readonly_path(self):
         """白名单外的只读请求也要带 upstream 级协议头。
