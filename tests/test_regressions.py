@@ -266,6 +266,396 @@ class MaskPathAwarenessTests(unittest.TestCase):
                 tr.FAIL_CLOSED = old
         self._with_no_reload(run)
 
+    def test_clean_body_is_passed_through_byte_identical(self):
+        """零改写透传：请求体不含任何敏感词时，上游必须收到与客户端逐字节相同的字节。
+
+        回归背景（2026-09）：`request()` 原先无条件
+        `json.dumps(body, ensure_ascii=False)` 回写 `flow.request.content`。
+        默认分隔符是 `(", ", ": ")`，会在每个逗号/冒号后补空格；`ensure_ascii=False`
+        又会把客户端的 `\\u5f20\\u4e09` 展开成「张三」。于是**哪怕一个敏感词都没命中**，
+        上游收到的前缀字节也与客户端发出的不同 —— 上游按前缀做 Prompt Cache，
+        前缀一变就整段 miss（实测紧凑体 113 字节被改写成 123 字节）。
+
+        修法：`_mask_hit` 记录「真的替换过」，没命中就一个字都不动。
+        """
+
+        def build(raw):
+            return SimpleNamespace(
+                request=SimpleNamespace(
+                    pretty_host="api.openai.com", path="/v1/chat/completions",
+                    method="POST", headers={"content-type": "application/json"},
+                    content=raw, host="api.openai.com", port=5802, scheme="http",
+                ),
+                response=None, metadata={},
+                client_conn=SimpleNamespace(sockname=("127.0.0.1", 18701)),
+            )
+
+        def run():
+            # 1) 紧凑体 + 非 ASCII 原字符：必须逐字节不变
+            compact = (
+                '{"model":"gpt-4o","messages":[{"role":"user",'
+                '"content":"帮我看看这段代码"}],"stream":true}'
+            ).encode("utf-8")
+            flow = build(compact)
+            tr.request(flow)
+            self.assertEqual(
+                flow.request.content, compact,
+                "无敏感词时请求体必须逐字节透传（含分隔符与键序）",
+            )
+
+            # 2) 客户端用 ensure_ascii=True 的转义体：连 \u 形态也要原样保留
+            escaped = (
+                '{"model":"gpt-4o","messages":[{"role":"user",'
+                '"content":"\\u5e2e\\u6211\\u770b\\u770b"}],"stream":true}'
+            ).encode("utf-8")
+            flow = build(escaped)
+            tr.request(flow)
+            self.assertEqual(
+                flow.request.content, escaped,
+                "无敏感词时连 \\u 转义形态都必须原样保留",
+            )
+
+            # 3) 真有敏感词时必须照常脱敏，且回写用紧凑分隔符（否则前缀整体挪位）
+            dirty = (
+                '{"model":"gpt-4o","messages":[{"role":"user",'
+                '"content":"我的手机号是13812345678"}]}'
+            ).encode("utf-8")
+            flow = build(dirty)
+            tr.request(flow)
+            out = flow.request.content
+            text = out.decode("utf-8")
+            self.assertNotEqual(out, dirty, "命中敏感词必须回写")
+            self.assertNotIn("13812345678", text, "手机号必须脱敏")
+            self.assertIn("{{PHONE_", text, "应签发 PHONE 占位符")
+            self.assertNotIn(b'": "', out, "回写必须用紧凑分隔符")
+            self.assertNotIn(b'", "', out, "回写必须用紧凑分隔符")
+
+            # 4) 既命中敏感词、正文里又有 \u 转义：回写必须沿用客户端的转义策略。
+            #    否则「这次重序列化」会把别处的 \u5e2e 展开成「帮」，凭空扩大字节差异。
+            mixed = (
+                '{"model":"gpt-4o","messages":[{"role":"user",'
+                '"content":"\\u5e2e\\u6211\\u770b\\u770b 13812345678"}]}'
+            ).encode("utf-8")
+            flow = build(mixed)
+            tr.request(flow)
+            out = flow.request.content
+            self.assertNotIn("13812345678", out.decode("utf-8"), "手机号必须脱敏")
+            self.assertIn(b"\\u5e2e", out, "客户端用 \\u 转义时回写必须沿用同一策略")
+
+            # 5) 客户端字节里 json.dumps 复现不出来的形态（尾随换行、1e-05 这类数字写法）：
+            #    没命中敏感词时同样必须原样透传。这条正是「跳过回写」相对
+            #    「用紧凑分隔符重序列化」多出来的那层保证 —— 重序列化做不到逐字节还原。
+            odd = (
+                b'{"model":"gpt-4o","temperature":0.00001,'
+                b'"messages":[{"role":"user","content":"hello"}]}\n'
+            )
+            flow = build(odd)
+            tr.request(flow)
+            self.assertEqual(
+                flow.request.content, odd,
+                "无敏感词时必须原样透传，不做任何规范化",
+            )
+
+        self._with_no_reload(run)
+
+    def test_cache_control_subtree_is_never_masked(self):
+        """协议元数据对象整棵跳过：Anthropic 的 cache_control 不能被改写。
+
+        回归背景（2026-09）：`cache_control` 一直被列在 `_MASK_ALWAYS_SKIP` 里，
+        但那个集合只在 `_mask_tree` 的**字符串分支**生效，而 `cache_control` 恒为
+        对象 `{"type": "ephemeral"}` —— 判定被整个绕过，`"ephemeral"` 照常送进
+        `mask()`。默认词表不命中这个英文词，所以线上一直无感；一旦自定义词表里
+        出现它（或任何与之同形的词），缓存指令会被写成
+        `{"type": "{{TERM_xxxxxx}}"}`，上游判其非法、缓存静默失效。
+
+        修法：新增 `_MASK_SKIP_SUBTREE_KEYS`，在 `_mask_tree` 的 dict 分支开头
+        整棵子树跳过（见该集合上方的注释）。
+        """
+        tr.CUSTOM_WORDS["ephemeral"] = "TERM"
+
+        def run():
+            flow = self._flow("api.anthropic.com", "/v1/messages", {
+                "model": "claude-sonnet-4",
+                "system": [
+                    {"type": "text", "text": "我的手机号是13812345678",
+                     "cache_control": {"type": "ephemeral"}},
+                ],
+                "messages": [{"role": "user", "content": "hi"}],
+            }, listen_port=18701)
+            tr.request(flow)
+            body = json.loads(flow.request.content)
+            self.assertEqual(
+                body["system"][0]["cache_control"], {"type": "ephemeral"},
+                "cache_control 是协议元数据，整棵子树必须原样保留",
+            )
+            # 同一块里的正文照常脱敏：子树豁免不能扩成「整条消息不扫」
+            sent = json.dumps(body, ensure_ascii=False)
+            self.assertNotIn("13812345678", sent, "同一块里的正文仍必须脱敏")
+            self.assertIn("{{PHONE_", sent, "应签发 PHONE 占位符")
+
+        self._with_no_reload(run)
+
+    def test_response_format_schema_values_are_still_scanned(self):
+        """反向锁：`response_format` / `format` **不许**进子树豁免。
+
+        它们和 `cache_control` 一样是 dict 值（同样绕过了 `_MASK_ALWAYS_SKIP` 的
+        字符串分支），但 OpenAI 的 `response_format.json_schema.schema` 与 Ollama 的
+        `format` 都可以是一整份 JSON Schema，其 `enum` 可能承载真实业务取值 ——
+        整棵跳过等于新增一条漏检路径，而收益为零。
+
+        本用例把敏感值放进 `enum`：必须照常脱敏。若后人图省事把这两个键也塞进
+        `_MASK_SKIP_SUBTREE_KEYS`，这里会立刻变红。
+        """
+
+        def run():
+            flow = self._flow("api.openai.com", "/v1/chat/completions", {
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "resp",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"owner": {"enum": ["张三"]}},
+                        },
+                    },
+                },
+            }, listen_port=18701)
+            tr.request(flow)
+            sent = json.dumps(json.loads(flow.request.content), ensure_ascii=False)
+            self.assertNotIn("张三", sent, "response_format 里的业务取值仍必须脱敏")
+            self.assertIn("{{NAME_", sent, "应签发 NAME 占位符")
+
+        self._with_no_reload(run)
+
+
+class PromptCacheByteFidelityTests(unittest.TestCase):
+    """命中敏感词时，**只允许被脱敏的那一段字节**发生变化。
+
+    背景（2026-09）：命中后整棵 `json.dumps` 重序列化会把客户端 body 的排版一并
+    抹掉，与客户端原始字节的首个差异位就从「真正的敏感值」前移到 body 开头附近。
+    上游按前缀做 Prompt Cache，差异位之前的缓存全部 miss —— 实测一条带空格 +
+    `\\u` 转义的请求：敏感值在 byte 74，差异位却在 byte 9，中间 65 字节被白白改掉。
+
+    修法见 `transparent._splice_mask`：只对「被脱敏的原文」做字节替换，
+    并用 `json.loads(结果) == 脱敏后的树` 等价校验兜底，不过就退回重序列化。
+    """
+
+    def setUp(self):
+        tr.sessions.clear()
+        tr._RECENT_FWD.clear()
+        tr._RECENT_REV.clear()
+        tr._RECENT_SUFFIX.clear()
+        tr.CUSTOM_WORDS.clear()
+        tr.CUSTOM_WORDS.update({"张三": "NAME"})
+        tr.SENSITIVE_DISABLED = set()
+        tr.SENSITIVE_WORD_DISABLED = {}
+        tr.BUILTIN_RULES = dict(tr.DEFAULT_BUILTIN_RULES)
+        tr._CUSTOM_WORD_RX_CACHE.clear()
+        tr.SECRET_PREFIXES = ["sk-", "ah-"]
+        tr.UPSTREAMS = list(tr.DEFAULT_UPSTREAMS)
+        tr.CAPTURE_MODE = "reverse"
+        self._old_splice = tr.BYTE_SPLICE
+
+    def tearDown(self):
+        tr.BYTE_SPLICE = self._old_splice
+
+    def _run(self, raw):
+        flow = SimpleNamespace(
+            request=SimpleNamespace(
+                pretty_host="api.openai.com", path="/v1/chat/completions",
+                method="POST", headers={"content-type": "application/json"},
+                content=raw, host="api.openai.com", port=5802, scheme="http",
+            ),
+            response=None, metadata={},
+            client_conn=SimpleNamespace(sockname=("127.0.0.1", 18701)),
+        )
+        old_reload, old_emit = tr._maybe_reload, tr._emit
+        try:
+            tr._maybe_reload = lambda force=False: None
+            tr._emit = lambda *args, **kwargs: None
+            tr.request(flow)
+        finally:
+            tr._maybe_reload, tr._emit = old_reload, old_emit
+        return flow
+
+    def _fresh(self):
+        tr.sessions.clear()
+        tr._RECENT_FWD.clear()
+        tr._RECENT_REV.clear()
+        tr._RECENT_SUFFIX.clear()
+
+    def test_only_the_masked_span_differs_across_client_layouts(self):
+        """四种客户端排版下，首个差异位都必须正好落在被脱敏的值上。"""
+        body = {"model": "gpt-4o",
+                "messages": [{"role": "user", "content": "我叫张三，请帮我看看"}]}
+        variants = {
+            # (构造的 body 文本, 该变体里敏感值的字节起点特征, 排版保留特征)
+            "紧凑/原字符": (
+                json.dumps(body, ensure_ascii=False, separators=(",", ":")),
+                "张三".encode("utf-8"), None,
+            ),
+            "带空格/原字符": (
+                json.dumps(body, ensure_ascii=False),
+                "张三".encode("utf-8"), b'": "',
+            ),
+            "紧凑/\\u 转义": (
+                json.dumps(body, ensure_ascii=True, separators=(",", ":")),
+                b"\\u5f20\\u4e09", None,
+            ),
+            "缩进/\\u 转义": (
+                json.dumps(body, ensure_ascii=True, indent=2),
+                b"\\u5f20\\u4e09", b"\n  ",
+            ),
+        }
+        tr.BYTE_SPLICE = True
+        for name, (text, anchor_bytes, layout_marker) in variants.items():
+            raw = text.encode("utf-8")
+            self._fresh()
+            out = self._run(raw).request.content
+            anchor = raw.find(anchor_bytes)
+            self.assertGreaterEqual(anchor, 0, f"{name}: 用例本身没构造出敏感值")
+            diff = next((i for i, (a, b) in enumerate(zip(raw, out)) if a != b), -1)
+            self.assertEqual(
+                diff, anchor,
+                f"{name}: 首个差异位应在被脱敏的值上（byte {anchor}），实际 {diff} —— "
+                "更靠前的前缀也被改了，上游前缀缓存会整段 miss",
+            )
+            self.assertNotIn("张三", out.decode("utf-8"), f"{name}: 原文泄漏")
+            self.assertIn("{{NAME_", out.decode("utf-8"), f"{name}: 应签发占位符")
+            if layout_marker is not None:
+                self.assertIn(
+                    layout_marker, out,
+                    f"{name}: 客户端排版被抹掉了（这条变体的意义就是保住它）",
+                )
+
+    def test_non_object_root_body_keeps_its_layout(self):
+        """顶层不是对象的请求体（裸数组）同样只动被脱敏的那一段。
+
+        这条路径单独测：`request()` 对非对象根会先包一层 `_ROOT_WRAP_KEY` 再脱敏，
+        回写时要把包装拆掉，很容易在这里悄悄退回整棵重序列化（实测改前
+        `first_diff_byte` 是 1，缩进被抹平成单行）。
+        """
+        raw = json.dumps([" 我叫张三 ", " 第二段 "], ensure_ascii=False, indent=1).encode("utf-8")
+        tr.BYTE_SPLICE = True
+        self._fresh()
+        out = self._run(raw).request.content
+        anchor = raw.find("张三".encode("utf-8"))
+        self.assertGreaterEqual(anchor, 0, "用例本身没构造出敏感值")
+        diff = next((i for i, (a, b) in enumerate(zip(raw, out)) if a != b), -1)
+        self.assertEqual(diff, anchor, "非对象根也必须只动被脱敏的那一段")
+        self.assertIn(b"\n ", out, "缩进排版必须保留")
+        self.assertNotIn("张三", out.decode("utf-8"), "原文泄漏")
+
+    def test_equivalence_failure_falls_back_to_reserialisation(self):
+        """字节替换多替换了就必须整条退回重序列化（等价校验兜底）。
+
+        构造：同一原文既出现在 `_mask_tree` **有意跳过**的位置（顶层 `model`），
+        又出现在会被扫描的位置（正文）。字节替换是纯文本替换，会把两处都换掉 ——
+        等价校验发现结果与脱敏后的树不一致，必须退回 `json.dumps`。
+        这条用例锁住的是「splice 永远不会把有意跳过的字段也改掉」。
+        """
+        tr.CUSTOM_WORDS.clear()
+        tr.CUSTOM_WORDS["gpt-4o"] = "TERM"
+        tr._CUSTOM_WORD_RX_CACHE.clear()
+        raw = ('{"model": "gpt-4o", "messages": [{"role": "user", '
+               '"content": "用的是gpt-4o"}]}').encode("utf-8")
+        tr.BYTE_SPLICE = True
+        self._fresh()
+        out = self._run(raw).request.content
+        parsed = json.loads(out)
+        self.assertEqual(parsed["model"], "gpt-4o", "被有意跳过的 model 必须原样保留")
+        self.assertNotIn("gpt-4o", parsed["messages"][0]["content"], "正文里的必须脱敏")
+        self.assertNotIn(
+            b'": "', out,
+            "等价校验失败后应退回紧凑重序列化（字节替换会保留客户端冒号后的空格）",
+        )
+
+    def test_oversized_body_falls_back_to_reserialisation(self):
+        """超过体积上限的请求体不做字节替换，直接退回重序列化。"""
+        old_max = tr._SPLICE_MAX
+        tr._SPLICE_MAX = 32
+        try:
+            raw = ('{"model": "gpt-4o", "messages": [{"role": "user", '
+                   '"content": "我叫张三"}]}').encode("utf-8")
+            tr.BYTE_SPLICE = True
+            self._fresh()
+            out = self._run(raw).request.content
+            self.assertNotIn("张三", out.decode("utf-8"), "仍然必须脱敏")
+            self.assertNotIn(b'": "', out, "超限应退回紧凑重序列化")
+        finally:
+            tr._SPLICE_MAX = old_max
+
+    def test_long_conversation_body_still_uses_byte_splice(self):
+        """长会话（>1MB）必须走字节级替换，不能退回整棵重序列化。
+
+        `_SPLICE_MAX` 早先是 1MB，恰好把长会话挡在外面 —— 而那恰恰是上游
+        Prompt Cache 收益最大的场景（上下文越长，前缀 miss 一次越贵）。实测放宽
+        到 8MB 后，完整路径（含调用方的 `json.loads` 等价校验）对退路 `json.dumps`
+        只多 4ms（8MB 28.0ms vs 23.9ms），所以没有理由把长会话排除掉。
+
+        这里直接调 `_splice_mask` 而不走 `request()`：1.5MB 文本再跑一遍脱敏正则
+        要几百毫秒，单测里不划算；「`request()` 会调用它」由本类其余走 `_run`
+        的用例覆盖。
+
+        ⚠️ 两个上限**故意不联动**，别顺手把 `_FIRST_DIFF_MAX` 也放宽：那值是每次
+        回写都要算的纯诊断数据，耗时随差异位置后移暴涨（1MB/最末 14.5ms、
+        8MB 173ms），跟着放宽等于给热路径加 100ms+。
+        """
+        self.assertGreater(
+            tr._SPLICE_MAX, tr._FIRST_DIFF_MAX,
+            "两个上限故意不联动：_FIRST_DIFF_MAX 跟着放宽会拖慢热路径",
+        )
+        item = {"role": "user", "content": "我叫张三 " + "y" * 200}
+        one = len(json.dumps(item, separators=(",", ":")).encode("utf-8"))
+        rows = max(2, (1 << 20) // one + 1)
+        raw = json.dumps({"model": "m", "messages": [item] * rows},
+                         separators=(",", ":")).encode("utf-8")
+        self.assertGreater(len(raw), 1 << 20, "用例本身没构造出超过旧上限（1MB）的 body")
+        masked_root = json.loads(raw.decode("utf-8"))
+        for m in masked_root["messages"]:
+            m["content"] = m["content"].replace("张三", "{{NAME_bcdfgh}}")
+        out = tr._splice_mask(raw, masked_root, {"张三": "{{NAME_bcdfgh}}"})
+        self.assertIsNotNone(
+            out, f"{len(raw) / 1048576:.1f}MB 被上限挡在外面了（长会话拿不到前缀保真）")
+        self.assertEqual(json.loads(out), masked_root, "大 body 的替换结果也必须过等价校验")
+        self.assertNotIn("张三", out.decode("utf-8"), "原文泄漏")
+
+    def test_many_unique_originals_still_use_byte_splice(self):
+        """单请求命中 64+ 个不同原文（>旧 64 上限）仍必须走字节级替换。
+
+        `_SPLICE_MAX_FORMS` 2026-09-13 由 64 提到 128：8MB body 下 splice 生效耗时
+        与退路 dumps 同价（32 分支 21ms / 128 分支 23ms / 256 分支 27ms vs 22ms），
+        退回不省时间、只丢前缀保真，所以把日常长会话（几十个敏感值）挡在线外没有
+        任何收益。本用例构造 40 个不同中文原文（≈80 分支 > 旧 64 上限）锁住新档位；
+        同时验证 splice 生效/退回两种路径的还原都正确 —— 上限只影响写回方式，
+        不影响脱敏与还原（还原只看占位符→rev）。
+        """
+        # 词表本身也要有 40 个词才能命中 40 个不同原文
+        origins = [f"客户{chr(0x4e00 + i)}号" for i in range(40)]
+        tr.CUSTOM_WORDS.update({o: "CUSTOMER" for o in origins})
+        tr._CUSTOM_WORD_RX_CACHE.clear()
+        body_obj = {"model": "m", "messages": [{"role": "user", "content": " | ".join(origins)}]}
+        payload = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
+        sid = "many-uniq"
+        tr._new_session(sid)
+        masked_root = json.loads(payload.decode("utf-8"))
+        masked_root["messages"][0]["content"] = tr.mask(" | ".join(origins), sid)
+        pairs = dict(tr.sessions[sid]["fwd"])
+        out = tr._splice_mask(payload, masked_root, pairs)
+        self.assertIsNotNone(
+            out, "80 分支被 _SPLICE_MAX_FORMS 挡在门外（长会话拿不到前缀保真）")
+        self.assertEqual(json.loads(out), masked_root, "大分支数的替换结果必须过等价校验")
+        for o in origins:
+            self.assertNotIn(o, out.decode("utf-8"), "原文泄漏")
+        # splice 生效与退回都不影响还原：还原只看占位符→rev 映射
+        self.assertEqual(
+            tr.restore(out.decode("utf-8"), sid),
+            payload.decode("utf-8"),
+            "splice 生效路径还原必须一致",
+        )
+
 
 class CredentialRedactionTests(unittest.TestCase):
     """P0-2：凭据永不明文落库。"""
@@ -3824,6 +4214,8 @@ class CardFalsePositiveTests(unittest.TestCase):
 
     def _mask(self, text):
         sid = "card-fp"
+        # PLATE 是默认关闭的可选规则；本组专门验证其开启后的误报/漏报边界。
+        tr.BUILTIN_RULES["PLATE"] = True
         tr.sessions.pop(sid, None)
         tr._RECENT_FWD.clear()
         tr._RECENT_REV.clear()
@@ -4284,6 +4676,29 @@ class CoreChineseValidationTests(unittest.TestCase):
             masked = tr.mask(f"代码片段 {ne}", sid)
             self.assertNotIn("{{EMAIL_", masked, f"非邮箱 {ne} 不应被误判")
 
+    def test_email_git_diff_and_markdown_prefix(self):
+        """EMAIL 规则防吞噬行首符号回归：Git diff 的 + 符号及 Markdown 列表 - 符号不应被并入邮箱。"""
+        # Git diff 添加行
+        diff_add = "+user@example.com"
+        sid_add = "diff-add-email"
+        masked_add = tr.mask(diff_add, sid_add)
+        self.assertTrue(masked_add.startswith("+{{EMAIL_"), f"Git diff 新增符号 + 应保留: {masked_add}")
+        self.assertEqual(tr.restore(masked_add, sid_add), diff_add)
+
+        # Markdown 列表项或 diff 删除行
+        diff_del = "-user@example.com"
+        sid_del = "diff-del-email"
+        masked_del = tr.mask(diff_del, sid_del)
+        self.assertTrue(masked_del.startswith("-{{EMAIL_"), f"列表/删除符号 - 应保留: {masked_del}")
+        self.assertEqual(tr.restore(masked_del, sid_del), diff_del)
+
+        # 邮箱内包含合法 + 别名（如 user+tag@example.com）仍可正常脱敏与还原
+        alias_mail = "user+tag@gmail.com"
+        sid_alias = "alias-email"
+        masked_alias = tr.mask(f"send to {alias_mail}", sid_alias)
+        self.assertIn("{{EMAIL_", masked_alias)
+        self.assertEqual(tr.restore(masked_alias, sid_alias), f"send to {alias_mail}")
+
     def test_phone_set2_not_killed(self):
         """回归（0.1.18 修）：set<=2 会误杀真实在用号段，只允许 set==1 挡全同号。
         13131313131（131 联通）与 15151515151（151 移动）均被旧逻辑误杀。"""
@@ -4372,6 +4787,181 @@ class CoreChineseValidationTests(unittest.TestCase):
         self.assertIn("IDCARD", sd.DEFAULT_BUILTIN_RULES)
         self.assertNotIn("IDCARD18", sd.DEFAULT_BUILTIN_RULES)
 
+    def test_connstr_false_positive_exemption(self):
+        """CONNSTR 防文档与工具模板误报回归：
+        1. 排除非数字端口（:port、:<port>、:{port} 等）：如 Pi 工具定义中的 http://user:pass@host:port 不再误脱敏；
+        2. 排除占位主机与文档保留域名：host、hostname、example.com/org/net 等；
+        3. 排除模板占位密码：{password}、<password>、{UPSTREAM_PORT}、[password] 等；
+        4. 排除通用文档凭据对：user:pass、username:password 等经典教学示例；
+        5. 真实生产/内网数据库连接串（如 postgres://user:secret123@db.internal:5432/app）仍正常脱敏与还原。
+        """
+        # --- 误报用例：不应被脱敏 ---
+        false_positives = [
+            # Pi / 终端工具参数说明中的代理示例（万次霸榜根因）
+            "proxy: http://user:" + "pass" + "@host:port or socks5://host:port",
+            # 全大写 PASS 且主机为 host
+            "http://user:" + "PASS" + "@host",
+            # 模板端口占位符
+            "http://localhost:{UPSTREAM_PORT}/api",
+            # RFC 2606 示例域名
+            "mysql://admin:" + "password" + "@example.com:3306/db",
+            # 密码为模板占位符
+            "postgres://user:{password}@localhost:5432/db",
+            "postgres://user:<password>@localhost:5432/db",
+            # 非数字端口
+            "http://user:" + "secret123" + "@localhost:port/app",
+            # 经典通用文档凭据对（user:pass）
+            "http://user:" + "pass" + "@proxy.company.internal:8080",
+            # 经典通用教学凭据对（guest:guest，如 RabbitMQ 文档）
+            "amqp://guest:" + "guest" + "@localhost:5672/vhost",
+            "amqp://guest:" + "guest" + "@127.0.0.1:5672",
+        ]
+        for idx, fp_text in enumerate(false_positives):
+            sid = f"conn-fp-{idx}"
+            tr._new_session(sid)
+            masked = tr.mask(fp_text, sid)
+            self.assertEqual(masked, fp_text, f"文档模板不应被误脱敏 [{idx}]: {fp_text}")
+
+        # --- 正类用例：真实连接串必须正常脱敏且可还原 ---
+        true_positives = [
+            # 内网数据库连接串（带有效数字端口与非模板主机）
+            ("连接串 postgres://user:" + "secret123" + "@db.internal:5432/app", "secret123"),
+            # 生产数据库连接串（随机高熵口令）
+            ("postgres://usr:" + "Zq9xLm2pTv8w" + "@db.internal:5432/prod", "Zq9xLm2pTv8w"),
+            # 真实内网 IP 与端口
+            ("mysql://root:" + "MyProdPass999" + "@192.168.1.100:3306/prod", "MyProdPass999"),
+            # guest 用户名但真实口令（依然必须脱敏）
+            ("amqp://guest:" + "Xk9$mQ2p" + "@db.internal:5672/prod", "Xk9$mQ2p"),
+        ]
+        for idx, (tp_text, secret) in enumerate(true_positives):
+            sid = f"conn-tp-{idx}"
+            tr._new_session(sid)
+            masked = tr.mask(tp_text, sid)
+            self.assertNotIn(secret, masked, f"真实连接串密码必须脱敏 [{idx}]: {tp_text}")
+            self.assertIn("{{CONNSTR_", masked, f"真实连接串必须签发 CONNSTR 占位符 [{idx}]")
+            restored = tr.restore(masked, sid)
+            self.assertEqual(restored, tp_text, f"真实连接串还原必须一致 [{idx}]")
+
+    def test_connstr_exemption_must_not_leak_real_passwords(self):
+        """豁免规则不得把真实口令放明文出网（2026-09 复审回归）。
+
+        旧实现用字符类 `[{<\\[\\$%]` 判「密码含模板符号」，把 `Xk9$mQ2p`、`p%40ssw0rd`
+        这类真实口令当模板豁免；更阴的是豁免会让下游规则接盘 —— CONNSTR 排在 EMAIL
+        之前，让路后 EMAIL 把「口令尾@host」整段当邮箱吃掉，输出
+        `postgres://app:Xk9${{EMAIL_x}}:5432/prod`，看着有占位符、实际口令前半截明文。
+        本用例逐条锁死：豁免判据必须是锚定形态（不是字符类），且豁免必须让下游避让。
+        """
+        # --- 真实口令：一条都不许漏 ---
+        must_mask = [
+            ("dollar", "postgres://app:Xk9$mQ2p@db.internal:5432/prod", "Xk9$mQ2p"),
+            ("percent", "mysql://root:Sec%reT99@10.0.0.5:3306/prod", "Sec%reT99"),
+            # 用户名含 % 不是密码像模板的理由
+            ("pct-user", "postgres://us%65r:S3cret99@db.internal:5432/db", "S3cret99"),
+            ("brace", "redis://app:Aa{bb}99@cache.internal:6379/0", "Aa{bb}99"),
+            ("square", "postgres://admin:Aa[b]99x@db.internal:5432/db", "Aa[b]99x"),
+            # 占位主机：只查主机不查密码会把这两条放行
+            ("dummy-host", "postgres://admin:S3cret99@host:5432/db", "S3cret99"),
+            ("dummy-domain", "postgres://admin:S3cret99@test.com:5432/db", "S3cret99"),
+            # 占位主机 + 非数字端口：规则 1 曾把 host_dummy 当佐证，等于拿「端口像模板」
+            # 的同类信号去证「密码是假的」，整串豁免。实测 12 个占位主机名全漏。
+            ("dummy-host-tpl-port", "postgres://admin:S3cret99@host:port/db", "S3cret99"),
+            ("dummy-domain-tpl-port", "postgres://admin:S3cret99@example.com:port/db", "S3cret99"),
+            ("dummy-suffix-tpl-port", "postgres://admin:S3cret99@db.example:port/db", "S3cret99"),
+            # IPv6 字面量：按 split(":", 1) 拆会把 [::1]:5432 的端口看成 ::1 而误豁免
+            ("ipv6", "postgres://svc:S3cret99@[::1]:5432/db", "S3cret99"),
+            # 非数字端口：端口是模板推不出密码是假的
+            ("port-tpl", "https://svc:secret123@db.internal:port/x", "secret123"),
+        ]
+        for idx, (name, text, secret) in enumerate(must_mask):
+            sid = f"conn-leak-{idx}"
+            tr._new_session(sid)
+            masked = tr.mask(text, sid)
+            self.assertNotIn(secret, masked, f"[{name}] 真实口令必须脱敏：{masked}")
+            self.assertIn("{{CONNSTR_", masked, f"[{name}] 必须签发 CONNSTR 占位符：{masked}")
+            self.assertEqual(tr.restore(masked, sid), text, f"[{name}] 还原必须一致")
+
+        # --- 整体豁免的模板：不得被 EMAIL 规则二次命中（半明文泄漏） ---
+        exempt_only = [
+            # 占位用户名 + 模板端口
+            "http://user:secret123@db.internal:port/app",
+            # 万次霸榜根因：AI 编码助手的网络工具参数文档
+            "proxy: http://user:" + "pass" + "@host:port or socks5://host:port",
+            # 锚定模板密码
+            "postgres://user:{password}@localhost:5432/db",
+            # 占位主机 + 占位密码
+            "mysql://admin:" + "password" + "@example.com:3306/db",
+        ]
+        for idx, text in enumerate(exempt_only):
+            sid = f"conn-exempt-{idx}"
+            tr._new_session(sid)
+            masked = tr.mask(text, sid)
+            self.assertEqual(masked, text, f"文档模板不应被脱敏：{masked}")
+            self.assertNotIn("{{EMAIL_", masked, f"豁免段不得被 EMAIL 二次命中：{masked}")
+
+            self.assertNotIn("{{CONNSTR_", masked, f"不应签发 CONNSTR：{masked}")
+
+        # --- 同一 token 里的真实邮箱仍须脱敏（避让不能误伤邻居） ---
+        mixed = "url=https://svc:secret123@db.internal:port/app,mail=zhang.san@corp.com"
+        sid_mixed = "conn-mixed"
+        tr._new_session(sid_mixed)
+        masked_mixed = tr.mask(mixed, sid_mixed)
+        self.assertNotIn("secret123", masked_mixed, f"真实口令必须脱敏：{masked_mixed}")
+        self.assertNotIn("zhang.san", masked_mixed, f"相邻真实邮箱必须脱敏：{masked_mixed}")
+        self.assertIn("{{EMAIL_", masked_mixed, f"邮箱应签发 EMAIL 占位符：{masked_mixed}")
+        self.assertEqual(tr.restore(masked_mixed, sid_mixed), mixed)
+
+    def test_connstr_guard_must_not_skip_real_email_after_exempt_conn(self):
+        """EMAIL 避让只能跳过**与豁免区间重叠**的命中，不能跳过紧随其后的真实邮箱。
+
+        `_starts_with_exempt_conn` 原本判「EMAIL 命中紧接在被豁免连接串之后」，
+        实测后果是：连接串的主机名本身是邮箱时（`redis://default:{password}@`
+        + `zhang.san@example.com`），那个**真实邮箱被整段跳过、明文上行**（2026-09-13
+        由用户探针发现）。而它想防的「EMAIL 吃掉口令尾」起点在 `@` 之前，用
+        「紧接其后」根本挡不到 —— 判据与意图是错位的。
+
+        现改为 `_overlaps_exempt_conn`：只跳过与豁免区间**重叠**的命中。
+        本用例双向锁死；该函数此前零用例覆盖（整体改成 return False 时 660 项仍全过）。
+        """
+        # --- 方向一：豁免连接串之后的真实邮箱必须脱敏（此前漏检） ---
+        cases = [
+            "redis://default:{password}@zhang.san@example.com:6379/0",
+            "mysql://user:" + "pass" + "@zhang.san@example.com:3306/db",
+            "https://user:{PORT}@zhang.san@example.com/app",
+        ]
+        mail = "zhang.san@example.com"
+        for idx, text in enumerate(cases):
+            sid = f"conn-guard-{idx}"
+            tr._new_session(sid)
+            masked = tr.mask(text, sid)
+            self.assertNotIn(mail, masked, f"[{idx}] 真实邮箱不得明文上行：{masked}")
+            self.assertIn("{{EMAIL_", masked, f"[{idx}] 真实邮箱应被 EMAIL 脱敏：{masked}")
+            # 连接串本体仍按豁免处理（模板密码不该被 CONNSTR 改写）
+            self.assertNotIn("{{CONNSTR_", masked, f"[{idx}] 模板连接串仍应豁免：{masked}")
+            self.assertEqual(tr.restore(masked, sid), text, f"[{idx}] 还原必须一致")
+
+        # --- 方向二：判据是「重叠」，不是「紧接其后」 ---
+        self.assertTrue(tr._overlaps_exempt_conn(5, 10, [(0, 8)]), "起点落在豁免区间内 = 重叠")
+        self.assertTrue(tr._overlaps_exempt_conn(0, 30, [(5, 8)]), "豁免区间被整体包含 = 重叠")
+        self.assertFalse(tr._overlaps_exempt_conn(8, 20, [(0, 8)]), "紧接其后不算重叠，不得跳过")
+        self.assertFalse(tr._overlaps_exempt_conn(20, 30, [(0, 8)]), "完全在其后不算重叠")
+        self.assertFalse(tr._overlaps_exempt_conn(0, 5, [(8, 12)]), "完全在其前不算重叠")
+        self.assertFalse(tr._overlaps_exempt_conn(3, 7, []), "空区间恒不重叠")
+
+    def test_email_underscore_local_part_not_dropped(self):
+        """EMAIL 回归（2026-09 复审）：本地部分以下划线开头必须照常脱敏。
+
+        收紧 lookbehind 修 Git diff 的 `+`/`-` 吞噬时，`_` 被同时留在首字符类之外、
+        负向断言集合之内：首字符不是 `_`，从 `s` 起又被断言挡住 → `_svc@corp.com`
+        整段不匹配，明文漏检。修法是把 `_` 放进首字符类、留在断言里。
+        """
+        for text in ("contact _svc@corp.com now", "id_zhang@corp.com", "_a@corp.com"):
+            sid = "email-underscore"
+            tr._new_session(sid)
+            masked = tr.mask(text, sid)
+            self.assertIn("{{EMAIL_", masked, f"下划线开头邮箱必须脱敏：{masked}")
+            self.assertNotIn("corp.com", masked, f"域名不应残留明文：{masked}")
+            self.assertEqual(tr.restore(masked, sid), text)
+
 class ReverseRoutingQueryAndCompatTests(unittest.TestCase):
     def test_apply_reverse_routing_preserves_query_params(self):
         """反代模式下必须完整保留客户端请求中的 Query 参数，且正确合并 Target 自带的 Query。"""
@@ -4434,6 +5024,75 @@ class ReverseRoutingQueryAndCompatTests(unittest.TestCase):
         # 只要没有被 503 阻断，说明成功通过 Content-Type 检查
         if flow.response is not None:
             self.assertNotEqual(flow.response.status_code, 503, "Application/JSON 绝不可被 503 阻断")
+
+    def test_clean_request_body_preserved_verbatim_for_prompt_cache(self):
+        """Prompt Cache 保护：未命中任何敏感词时，请求体逐字节零改写透传。
+        1. 格式化 JSON（含换行、缩进空格、浮点数表达如 1e-05）原封不动；
+        2. 带 \\u 转义的客户端 JSON（如 \\u4f60\\u597d）不被提前展开成中文字符；
+        3. 命中真实敏感词时回写采用紧凑分隔符 separators=(',', ':')，避免默认加空格挪移上游缓存前缀。
+        """
+        tr.UPSTREAMS = [{
+            "name": "cache-up", "port": 18701, "base_path": "/cache-up",
+            "target": "https://api.openai.com/v1",
+            "paths": ["/v1/chat/completions"],
+        }]
+        old_emit, old_reload = tr._emit, tr._maybe_reload
+        try:
+            tr._emit = lambda *a, **k: None
+            tr._maybe_reload = lambda force=False: None
+
+            # 场景 1：格式化缩进与特殊浮点数字面量（无敏感词）
+            raw_clean = (
+                b'{\n'
+                b'  "model": "gpt-4o",\n'
+                b'  "messages": [\n'
+                b'    {"role": "user", "content": "hello world"}\n'
+                b'  ],\n'
+                b'  "temperature": 1e-05\n'
+                b'}\n'
+            )
+            req1 = SimpleNamespace(
+                method="POST", path="/v1/chat/completions", host="127.0.0.1",
+                port=18701, scheme="http", headers={"content-type": "application/json"},
+                content=raw_clean, pretty_host="127.0.0.1",
+            )
+            f1 = SimpleNamespace(request=req1, response=None, metadata={},
+                                client_conn=SimpleNamespace(sockname=("127.0.0.1", 18701)),
+                                server_conn=SimpleNamespace(via=None))
+            tr.request(f1)
+            self.assertEqual(f1.request.content, raw_clean, "无敏感词请求体必须逐字节完全一致")
+
+            # 场景 2：客户端使用 \\u 转义中文字面量（无敏感词）
+            raw_escaped = b'{"messages":[{"role":"user","content":"\\u4f60\\u597d\\u4e16\\u754c"}]}'
+            req2 = SimpleNamespace(
+                method="POST", path="/v1/chat/completions", host="127.0.0.1",
+                port=18701, scheme="http", headers={"content-type": "application/json"},
+                content=raw_escaped, pretty_host="127.0.0.1",
+            )
+            f2 = SimpleNamespace(request=req2, response=None, metadata={},
+                                client_conn=SimpleNamespace(sockname=("127.0.0.1", 18701)),
+                                server_conn=SimpleNamespace(via=None))
+            tr.request(f2)
+            self.assertEqual(f2.request.content, raw_escaped, "未命中敏感词的转义体必须原样保留")
+
+            # 场景 3：命中真实敏感词（必须使用紧凑分隔符 separators=(',', ':')）
+            raw_hit = b'{"model":"gpt-4o","messages":[{"role":"user","content":"call me 13800138000"}]}'
+            req3 = SimpleNamespace(
+                method="POST", path="/v1/chat/completions", host="127.0.0.1",
+                port=18701, scheme="http", headers={"content-type": "application/json"},
+                content=raw_hit, pretty_host="127.0.0.1",
+            )
+            f3 = SimpleNamespace(request=req3, response=None, metadata={},
+                                client_conn=SimpleNamespace(sockname=("127.0.0.1", 18701)),
+                                server_conn=SimpleNamespace(via=None))
+            tr.request(f3)
+            self.assertNotIn(b"13800138000", f3.request.content)
+            self.assertIn(b"{{PHONE_", f3.request.content)
+            # 紧凑格式：不应有 ", " 或 ": "（默认 json.dumps 分隔符空格）
+            self.assertNotIn(b': "', f3.request.content)
+            self.assertNotIn(b'", "', f3.request.content)
+        finally:
+            tr._emit, tr._maybe_reload = old_emit, old_reload
 
     def test_unlisted_path_blocked_under_fail_closed(self):
         """P1 隐私旁路防御：在 FAIL_CLOSED 下，反代端口未列入白名单的非只读请求（如 multipart/audio）必须被 503 阻断。"""

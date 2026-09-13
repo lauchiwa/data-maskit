@@ -129,9 +129,12 @@ RULES = [
     # +86 / 0086 / (86) 前缀整体脱敏。
     # 分组分隔符必须前后一致（反向引用），或整体无分隔。
     (re.compile(ID_BOUND_L + r"(?:(?:\+?86|0086|[\(（]\+?86[\)）])[\s-]?)?1[3-9]\d(?:([-\s])\d{4}\1\d{4}|\d{8})" + ID_BOUND_R), "PHONE", 0),
-    # 邮箱：本地部分支持中文用户名，前后边界防伪邮箱。
-    # 本地部分前不能是 :（连接串 user:pass@host 形态防误伤）。
-    (re.compile(r"(?<!:)(?<![A-Za-z0-9._%+\-\u4e00-\u9fff])[\u4e00-\u9fffA-Za-z0-9._%+-]{1,64}@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z\u4e00-\u9fff]{2,}(?![A-Za-z0-9._%+-])"), "EMAIL", 0),
+    # 邮箱：本地部分首字符须为字母/数字/下划线/中文（排除 +- 等符号，防止 Git diff 的 +
+    # 符号或列表 - 符号被当成用户名一部分吞噬）。
+    # 本地部分前不能是 :（连接串 user:pass@host 形态防误伤），亦不能紧跟在其他词法字符后。
+    # 下划线必须留在首字符类里：它同时在负向断言集合内，两边都排除会让 `_svc@corp.com`
+    # 整段不匹配（首字符不是 `_`、从 `s` 起又被断言挡住）→ 明文漏检（2026-09 复审）。
+    (re.compile(r"(?<!:)(?<![A-Za-z0-9._\u4e00-\u9fff])[a-zA-Z0-9_\u4e00-\u9fff][\u4e00-\u9fffA-Za-z0-9._%+-]{0,63}@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z\u4e00-\u9fff]{2,}(?![A-Za-z0-9._%+-])"), "EMAIL", 0),
     # 座机：3位区号(010/02x)或4位区号(03xx-09xx) + 分隔符/括号 + 7-8位本地号 + 可选分机号。
     (re.compile(
         ID_BOUND_L +
@@ -287,6 +290,14 @@ FAIL_CLOSED = True
 RESPONSE_SCAN = True
 # SSE 实时转发（默认开）：逐事件还原后立即下发，流末再做完整审计/扫描收尾。
 STREAM_RESPONSE = True
+# 字节级精确替换（默认开）：命中敏感词时只替换被脱敏的那个字符串字面量，
+# 不再整棵 `json.dumps` 重序列化，从而保住客户端 body 的原始排版 —— 上游按前缀
+# 做的 Prompt Cache 只会从真正的敏感值处失效，而不是从 body 开头附近就失效
+# （实测一条带空格 + `\u` 转义的请求：敏感值在 byte 74，旧实现的差异位在 byte 9）。
+# 结果必须通过 `json.loads(结果) == 脱敏后的树` 等价校验才会被采用，不过就自动
+# 退回重序列化，所以它**不改变发往上游的内容**，只改变排版。
+# 排查用的一键退路：环境变量 MASKIT_BYTE_SPLICE=0 即回到整棵重序列化的旧行为。
+BYTE_SPLICE = os.environ.get("MASKIT_BYTE_SPLICE", "1") not in ("0", "false", "False")
 # 流式接管黑名单：确认某上游接管后断连时，把 host 加进来保持整包路径。
 # 仅在配置里**没有** stream_exclude_hosts 键时作为回落默认（老配置兼容）；
 # 键存在即以配置为准，空列表 = 用户显式清空 = 不排除任何 host。
@@ -354,7 +365,7 @@ _DATA_ROOT = Path(os.environ.get("LLM_SHIELD_DATA_DIR") or str(_ROOT)).resolve()
 _skip_seen = {}
 _skip_seen_last_purge = 0.0
 
-# ========== 引擎 ==========
+# ---------- 引擎 ----------
 sessions: dict = {}
 
 
@@ -400,6 +411,11 @@ def _new_session(sid, source=None):
         "degraded": 0,
         "last_hits": set(),
         "new_orig": set(),
+        # 本次请求签发的占位符里，有没有「沿用复用表旧 token」的。
+        # 只用于 MASK 事件的诊断字段（suffix_reused），不参与任何决策：
+        # 全为 True 说明占位符后缀长期稳定，上游前缀缓存仍有机会命中；
+        # 全为 False 的长会话说明每轮都在重签，缓存必然逐轮失效。
+        "suffix_reused": False,
         # inflight: 请求已发出、响应未到。长生成（>SESSION_TTL）期间
         # 不能让 _sweep 按 ts 误删会话，否则整包路径响应到达时查不到 rev，
         # 占位符全部泄漏且不报错（P1-2）。
@@ -626,6 +642,168 @@ def _jwt_ok(token: str) -> bool:
         return False
 
 
+# ---- CONNSTR 误报豁免的形态常量 ----
+# 全部提到模块级：mask() 是热路径，一次请求可能命中上万条连接串，
+# 函数内每次调用重建 set / 编译正则纯属浪费（审计 2026-09 复审）。
+# 判据一律「锚定整体形态」，**绝不**用字符类判「密码里含模板符号」——
+# 曾用 `re.search(r"[{<\[\$%]", orig)`，结果 `Xk9$mQ2p`、`p%40ssw0rd` 这类
+# 真实口令被判成模板而豁免，明文直接上行（详见 _connstr_ok 注释）。
+_CONNSTR_TPL_RXS = (
+    re.compile(r"^\$?\{[A-Za-z_][A-Za-z0-9_]*\}$"),   # {password} / ${PORT}
+    re.compile(r"^<[A-Za-z_][A-Za-z0-9_]*>$"),        # <password>
+    re.compile(r"^\[[A-Za-z_][A-Za-z0-9_]*\]$"),      # [password]
+    re.compile(r"^\$[A-Za-z_][A-Za-z0-9_]*$"),        # $PORT
+    re.compile(r"^%[A-Za-z_][A-Za-z0-9_]*%$"),        # %PWD%
+)
+# 通配占位：**** / ... / xxxx
+_CONNSTR_WILDCARD_RX = re.compile(r"^[xX*.]+$")
+# 文档保留 / 占位主机（RFC 2606 的 example.* 与常见教程主机名）
+_CONNSTR_DUMMY_HOSTS = frozenset({
+    "host", "hostname", "myhost", "server", "myserver",
+    "example.com", "example.org", "example.net",
+    "test.com", "sample.com", "your-host", "yourhost", "yourdomain.com",
+})
+_CONNSTR_DUMMY_HOST_SUFFIXES = (".example", ".invalid")
+# 经典教学占位凭据对
+_CONNSTR_PLACEHOLDER_USERS = frozenset({"user", "username", "your_username", "yourusername", "usr", "guest"})
+_CONNSTR_PLACEHOLDER_PASSWORDS = frozenset({
+    "pass", "password", "passwd", "your_password", "yourpassword", "changeme", "change_me", "guest",
+})
+# 一次请求里最多记录多少条「被豁免的连接串原文」供下游规则避让。
+# 上界只为防病态输入：集合是去重的，文档模板反复出现只会留 1 条；
+# 超过上界后不再记录，最坏结果是下游规则照常脱敏（安全方向）。
+_CONNSTR_EXEMPT_MAX = 512
+
+# `@` 之后的 authority（host[:port]）。IPv6 字面量必须整体吃进 `[...]`：
+# 按 `split(":", 1)` 拆 `[::1]:5432` 会得到 host=`[`、port=`::1`，
+# 非数字端口判定随即把它当模板豁免 —— 真实口令明文上行（复审实测漏检）。
+_CONNSTR_AUTH_RX = re.compile(r"^(?:\[[^\]\s]*\](?::[^\s/?#\"'`)>},;]*)?|[^\s/?#\"'`)>\]},;]*)")
+
+
+def _connstr_authority(text: str, pos: int):
+    """取 pos 处的 authority，返回 (host, port)；port 无端口时为空串。"""
+    tail = text[pos:pos + 256] if text else ""
+    m = _CONNSTR_AUTH_RX.match(tail)
+    auth = m.group(0) if m else ""
+    if auth.startswith("["):
+        host, _, rest = auth.partition("]")
+        return host, (rest[1:] if rest.startswith(":") else "")
+    host, sep, port = auth.partition(":")
+    return host, (port if sep else "")
+
+
+def _connstr_ok(orig: str, m=None, text: str = "") -> bool:
+    """连接串密码真伪校验：只豁免「一眼是文档/代码模板」的形态，其余照常脱敏。
+
+    判据分四档，任一档成立才豁免（**fail-closed：拿不准就脱敏**）：
+
+      1. 端口非数字（`:port` / `:<port>` / `:{port}` / `:$PORT`）**且**用户名或密码是
+         占位形态 —— RFC 3986 规定端口必须是纯数字，非数字端口是模板；但「端口是模板」
+         推不出「密码是假的」，单凭端口豁免会把 `https://svc:secret123@db.internal:port/x`
+         的真实口令原样放行。
+         ⚠️ 佐证项**不含占位主机**：主机像模板同样是「端口是模板」的同类信号，拿它当
+         佐证等于循环论证，会把 `postgres://admin:S3cret99@host:port/db` 整体豁免
+         （实测 12 个占位主机名全部漏检，2026-09 复审）。主机只在第 3 档与「密码是占位词」
+         **同时**成立时才算证据。
+         另外要求端口里一个数字都没有：`:5432x` 这种带数字的照常脱敏。
+      2. 密码整体是锚定模板形态：`{password}` / `<password>` / `[password]` /
+         `$PORT` / `%PWD%` / `****` / `xxxx`。
+      3. 主机是文档保留域名或占位词（host / example.com / test.com …）**且**密码也是
+         占位词 —— 只查主机不查密码，会把 `admin:S3cret99@host:5432` 这类真实口令放行。
+      4. 用户名与密码是经典教学组合（user:pass / username:password）。
+
+    历史教训（2026-09 复审，两处必须记住的坑）：
+      · 用字符类 `[{<\\[\\$%]` 判「密码含模板符号」会把真实口令判成模板而豁免，
+        `mysql://root:p%40ssw0rd@…` 直接全明文上行。
+      · 豁免本身还会**放走下游规则**：CONNSTR 让路后排在后面的 EMAIL 规则会把
+        「口令尾@host」整段当邮箱吃掉，输出 `postgres://app:Xk9${{EMAIL_x}}:5432/prod`
+        —— 看着有占位符、实际口令前半截明文上行，最危险的一类。
+        由 mask() / 扫描路径里的 `exempt_conn` 区间列表负责避让，两处必须成对修改
+        （判据见 `_overlaps_exempt_conn`：只跳过**与豁免区间重叠**的 EMAIL 命中）。
+    """
+    if not isinstance(orig, str) or not orig:
+        return False
+    if _CONNSTR_WILDCARD_RX.match(orig):
+        return False
+    if any(rx.match(orig) for rx in _CONNSTR_TPL_RXS):
+        return False
+    if m is None:
+        return True
+
+    try:
+        # 从 `scheme://user:pass@` 里回推 username
+        prefix = m.group(0)
+        user_part = ""
+        if "://" in prefix:
+            _scheme, rest = prefix.split("://", 1)
+            idx = rest.rfind(":" + orig + "@")
+            user_part = rest[:idx] if idx != -1 else rest.split(":", 1)[0]
+
+        host, port = _connstr_authority(text, m.end())
+        host_lower = host.lower().strip("[]")
+        user_lower = user_part.lower()
+        pass_lower = orig.lower()
+        host_dummy = (host_lower in _CONNSTR_DUMMY_HOSTS
+                      or host_lower.endswith(_CONNSTR_DUMMY_HOST_SUFFIXES))
+        user_dummy = user_lower in _CONNSTR_PLACEHOLDER_USERS
+        pass_dummy = pass_lower in _CONNSTR_PLACEHOLDER_PASSWORDS
+
+        # 1. 非数字端口。注意：端口是模板 ≠ 密码是假的，我们决定的是「要不要脱密码」，
+        #    所以还要一个弱信号佐证 —— 但佐证只能是**用户名或密码**是占位词。
+        #    曾把 host_dummy 也算进来，等于「端口像模板 + 主机像模板 ⇒ 密码是假的」：
+        #    主机像模板和端口像模板是同一类信号，循环论证，实测
+        #    `postgres://admin:S3cret99@{host|example.com|db.example|…}:port/db` 12/12 全漏，
+        #    真实口令原样上行（2026-09 复审）。主机要到第 3 档、与占位密码同时成立才算数。
+        #    端口里不含任何数字才认（`:5432x` 这种带数字的照常脱敏）。
+        if port and not any(ch.isdigit() for ch in port):
+            if user_dummy or pass_dummy:
+                return False
+
+        # 2. 占位主机：必须「主机 + 密码」同时像占位才豁免。
+        #    只查主机不查密码，会把 `admin:S3cret99@host:5432` 这类真实口令放行。
+        if host_dummy and pass_dummy:
+            return False
+
+        # 3. 经典教学凭据对（user:pass / username:password）
+        if user_dummy and pass_dummy:
+            return False
+    except Exception:
+        # 校验自身出错时保守脱敏（绝不把疑似凭据放明文出网）
+        return True
+
+    return True
+
+
+def _overlaps_exempt_conn(start: int, end: int, spans) -> bool:
+    """EMAIL 命中 [start, end) 是否与被豁免的连接串**重叠**。
+
+    为什么判「重叠」而不是「紧接其后」（2026-09-13 修正）：
+    连接串的 CONNSTR 命中止于 userinfo 结尾的 `@`（host/port 在 `m.end()` 之后由
+    `_connstr_authority` 单独解析），所以真正需要避让的 EMAIL 命中是**起点落在豁免
+    串内部**的那些——它们才是「口令尾@host」，脱掉一半会留半截口令明文。
+    而「起点正好在豁免串之后」的 EMAIL 命中是**独立的真实邮箱**（例如
+    `redis://default:{password}@zhang.san@example.com:6379` 里那个 `@example.com`
+    主机名形式的邮箱），把它一起跳掉等于新增一条漏检：实测 guard 开着时该邮箱
+    明文上行，关掉才被正常脱敏。
+
+    ⚠️ 判据必须是重叠、不能只看「前一个字符是不是 `@`」：后者既挡不住口令尾
+    （口令在 `@` 之前，前一个是 `:`），又会误伤紧跟其后的真实邮箱。
+    把本函数整体改成 `return False` 时 660 个用例仍全过 —— 说明它此前**没有任何
+    用例保护**，改这里务必同步补用例。
+
+    `spans` 由 finditer 顺序追加，天然按 start 递增且互不重叠，故一旦
+    `s_start >= end` 即可提前结束。
+    """
+    if not spans:
+        return False
+    for s_start, s_end in spans:
+        if s_start >= end:
+            break
+        if start < s_end and end > s_start:
+            return True
+    return False
+
+
 _prefix_rx_cache = None
 _prefix_rx_key = None
 
@@ -650,7 +828,7 @@ def _prefix_secret_regex():
     return _prefix_rx_cache
 
 
-# ========== 占位符 ==========
+# ---------- 占位符 ----------
 # 格式：{{LABEL_后缀6位}}，纯 ASCII。后缀自 0.1.13 起是纯辅音（见下方 _TOKEN_ALPHABET），
 # 存量 hex6 后缀仍继续识别（见 _SUFFIX_PAT）。
 # 旧格式 ⟦X·hex⟧ 用生僻 Unicode 且不带语义：主流 tokenizer 会切成多个罕见 token，
@@ -894,9 +1072,19 @@ def _recall_token(orig, label):
 
 
 def _remember(fwd, labels, orig, label):
+    """登记原文→占位符映射；返回 True 表示沿用了复用表里的旧 token。
+
+    返回值只用于诊断（MASK 事件的 `suffix_reused`）：沿用旧 token 说明占位符
+    后缀与前缀都没变，上游按前缀做的 Prompt Cache 仍有机会命中；本次全新签发
+    则意味着缓存必然从这个位置起失效。
+    """
     if orig not in fwd:
+        hit = _RECENT_FWD.get(orig)
+        reused = bool(hit) and time.time() - hit[2] <= _recent_ttl()
         fwd[orig] = _recall_token(orig, label)
         labels[orig] = label
+        return reused
+    return False
 
 
 # 按长度降序的敏感词表（长词优先匹配，保证同一位置长词先命中）。
@@ -1095,7 +1283,7 @@ def is_target(host, path):
     return False
 
 
-# ========== 反向代理路由 ==========
+# ---------- 反向代理路由 ----------
 
 def _parse_upstream_target(target):
     """'https://api.openai.com' -> ('api.openai.com', 443, 'https', '', '')
@@ -1485,6 +1673,8 @@ def _apply_model_rule_headers(flow, upstream, model):
 def _apply_model_rule_body(body, rule, upstream):
     """把命中规则的 body 字段写进 body；必须在脱敏**之后**、序列化之前调用。
 
+    返回值表示 body 是否真的发生了改变，供 request() 决定是否需要回写请求体。
+
     为什么不能放在脱敏之前（实测踩过）：注入值会跟着一起过 `_mask_tree`。
     用户只要在词表里加了 `Claude` 这类词，注入的身份行就会变成
     `You are {{TERM_xxx}} Code, ...`，渠道判定立刻失败——而用户完全联想不到
@@ -1502,7 +1692,8 @@ def _apply_model_rule_body(body, rule, upstream):
     system / metadata）都是顶层，深层 merge 是没有需求支撑的复杂度。
     """
     if not rule:
-        return
+        return False
+    changed = False
     try:
         device_id = _device_id()
         for key, value in (rule.get("body") or {}).items():
@@ -1511,11 +1702,14 @@ def _apply_model_rule_body(body, rule, upstream):
                 _log(f"[mask] 客户端「{(upstream or {}).get('name', '')}」model 规则 "
                      f"body 键 {key} 含未知占位符，已跳过")
                 continue
+            if body.get(key) != replaced:
+                changed = True
             body[key] = replaced
+        return changed
     except Exception:
         # 与 header 注入同一原则：注入失败只是少了指纹（上游会拒），
         # 绝不能因此阻断请求或让脱敏管线抛出异常。
-        pass
+        return changed
 
 
 def _apply_egress_proxy(flow, upstream):
@@ -2292,7 +2486,8 @@ def mask(text, sid):
     def _hit(orig, label="API_KEY"):
         if orig not in fwd:
             new_orig.add(orig)
-            _remember(fwd, labels, orig, label)
+            if _remember(fwd, labels, orig, label):
+                s["suffix_reused"] = True
             # rev 增量维护：只有新增才补一条，避免每次 mask 全量重建（长会话 fwd 数千条）
             rev[fwd[orig]] = orig
         hit_orig.add(orig)
@@ -2324,6 +2519,11 @@ def mask(text, sid):
             return fwd.get(orig_key, word)
         text = _mask_excluding_placeholders(text, cw_rx, _cw_sub)
 
+    # 被豁免的连接串**区间** [start, end)（end 即 userinfo 结尾的 `@` 之后）：
+    # RULES 里 CONNSTR 排在 EMAIL 之前，本列表用于让 EMAIL 避开与这些区间重叠的
+    # 命中，否则「口令尾@host」会被当邮箱吃掉、留下口令半明文。
+    exempt_conn = []
+
     for rx, label, group_idx in RULES:
         if not _rule_enabled(label):
             continue
@@ -2345,6 +2545,14 @@ def mask(text, sid):
             if label == "IBAN" and not _iban_ok(orig):
                 continue
             if label == "JWT" and not _jwt_ok(orig):
+                continue
+            if label == "CONNSTR" and not _connstr_ok(orig, m, text):
+                # 记下被豁免的区间：CONNSTR 排在 EMAIL 之前，下面必须让 EMAIL 避开
+                # 与它重叠的命中，否则「口令尾@host」会被当邮箱吃掉留下半明文。
+                if len(exempt_conn) < _CONNSTR_EXEMPT_MAX:
+                    exempt_conn.append((m.start(), m.end()))
+                continue
+            if label == "EMAIL" and _overlaps_exempt_conn(m.start(), m.end(), exempt_conn):
                 continue
             _hit(orig, label)
             matched.append(orig)
@@ -2605,11 +2813,27 @@ def _restore_tree(obj, sid, key=None, depth=0):
 #   不应用任何字段名豁免——业务字段的敏感值必须脱敏；
 # - 业务区外的跳过按「完整路径 + 协议位置」判定，禁止裸字段名豁免。
 # model 全局跳过（模型名不是 PII 且扫描无害）；object/finish_reason 等响应侧枚举同理。
-_MASK_ALWAYS_SKIP = {
+# ⚠️ 这个集合**只对字符串叶子生效**（判定点在 _mask_tree 的 str 分支）。
+# 键的值若是对象/数组，写在这里也拦不住——递归会照常进到子树里。
+# 2026-09 实测 `cache_control` 就是这种情况：它一直被列在本集合里，但
+# `{"type": "ephemeral"}` 里的 "ephemeral" 仍会被自定义词表命中，写成
+# `{"type": "{{TERM_xxxxxx}}"}`，Anthropic 侧缓存指令当场失效。
+# **dict 值的键请用 _MASK_SKIP_SUBTREE_KEYS。**
+_MASK_SKIP_SCALAR_KEYS = {
     "model", "object", "finish_reason", "stop_reason",
-    "cache_control", "citations", "response_format", "format", "detail",
-    "encoding_format", "media_type",
+    "citations", "detail", "encoding_format", "media_type",
 }
+# 值恒为「协议元数据对象」的键：整棵子树跳过（判定点在 dict 分支开头）。
+# 收录门槛很窄——只收结构固定、绝无业务载荷的键，因为整棵跳过 = 放弃该子树里
+# 全部字符串的扫描，是一条实打实的漏检路径：
+#   cache_control 形如 {"type": "ephemeral", "ttl": "1h"}，改写它只会让上游
+#   判缓存指令非法，保护不了任何东西。
+# 故意**不收** response_format 与 format（两者同为 dict 值，同样"死条目"）：
+#   - OpenAI 的 response_format.json_schema.schema 可以带 enum 示例值；
+#   - Ollama 的 format 可以是一整份 JSON Schema，其 enum 同样可能承载真实业务取值。
+# 整棵跳过它们收益为零（里面本就没有 PII 以外的数据），风险却是新增漏检面。
+# 见 tests/test_regressions.py::MaskPathAwarenessTests 的反向锁用例。
+_MASK_SKIP_SUBTREE_KEYS = {"cache_control"}
 # role/type 是判别字段，但只在其协议容器内跳过；出现在业务自定义对象里
 # （如 {"type": "13812345678"}）必须扫描——审计实测 input.type 原文上行即此类。
 _MASK_ROLE_TYPE_PARENTS = {
@@ -2645,7 +2869,139 @@ _MASK_MAX_DEPTH = 24
 _ROOT_WRAP_KEY = "__shield_root__"
 
 
-def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0):
+# 首个差异字节的扫描上限。超过就不算（记 -1）。
+# 实测（二分 + 切片比较，差异位置越靠后越贵）：1MB 14.5ms、8MB 173ms、32MB 约 700ms。
+# 这个值只用于「前缀有没有被改动」的诊断，而它在回写分支里**每次都调**
+# （与 splice 成不成无关），不值得为它拖慢热路径。
+# ⚠️ 别跟着 `_SPLICE_MAX`（8MB）一起放宽（见那里的注释）。
+_FIRST_DIFF_MAX = 1 << 20
+
+
+def _first_diff_byte(a, b):
+    """返回 a、b 首个不同字节的下标；一方是另一方前缀时返回较短者的长度。
+
+    只用于诊断（MASK 事件的 first_diff_byte），**不参与任何脱敏决策**。
+    用途：判断「命中敏感词时，客户端原始 body 的排版是否被我们的重序列化改掉了」——
+    差异位若正好落在第一个被脱敏的值上，说明客户端本来就在发紧凑体，
+    当前的回写方式没有额外损失；差异位若远小于它（例如 byte 9 的
+    `{"model": ` 空格），说明还有整段前缀被凭空改动，值得考虑字节级替换。
+
+    实现用二分 + 切片相等比较：每次比较是 C 级 memcmp，整体 O(log n) 次，
+    避免 Python 逐字节循环在 MB 级请求体上跑到几百毫秒。切片相等性对前缀长度
+    单调（长度 m 的公共前缀 ⇒ 所有更短的也相等），所以二分成立。
+    """
+    if len(a) > _FIRST_DIFF_MAX or len(b) > _FIRST_DIFF_MAX:
+        return -1
+    n = min(len(a), len(b))
+    if n == 0:
+        return -1 if len(a) == len(b) else 0
+    if a[:n] == b[:n]:
+        return -1 if len(a) == len(b) else n
+    lo, hi = 0, n - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if a[:mid + 1] == b[:mid + 1]:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+# 字节级替换的体积与条目上限。超过就退回整棵重序列化。
+#
+# `_SPLICE_MAX` 取 8MB。早先取 1MB 的注释理由是「省下的前缀对齐收益抵不过 CPU
+# 开销」，**实测不成立**——完整路径（`_splice_mask` + 调用方的 `json.loads` 等价校验）
+# 对退路 `json.dumps` 的比值：1MB 3.2/2.4ms（1.34x）、8MB 28.0/23.9ms（1.17x），
+# 最坏只多 4ms（敏感值 1→64 个耗时只差 2 倍，不是分支数的线性放大）。
+# 而 1MB 恰好把**长会话**挡在了外面——那恰恰是上游 Prompt Cache 收益最大的场景，
+# 上下文越长，前缀 miss 一次越贵。
+#
+# ⚠️ 别把它和 `_FIRST_DIFF_MAX`（1MB）联动放宽：后者是每次回写都要算的纯诊断值，
+# 耗时随差异位置后移暴涨（1MB/最末 14.5ms、8MB 173ms），跟着放宽等于给热路径加
+# 100ms+。后果：>1MB 的请求 splice 生效但 `first_diff_byte` 记 -1，仪表盘
+# 「平均首个差异字节」样本数为 0 —— **已知口径，不是 bug**，别重复排查。
+#
+# `_SPLICE_MAX_FORMS = 128` 是**另一条独立的退回线**：本次请求里被脱敏的**唯一原文**
+# 数上限（每个原文按「原字符 / \uXXXX」两种合法 JSON 写法各建一条交替分支，
+# 所以 128 个原文 ≈ 256 个分支）。超了 `_splice_mask` 直接返回 None，同样退回整棵
+# 重序列化 → 前缀又被改，首个差异位回到 body 开头附近。
+#   · 为什么是 128 而不是 64：2026-09-13 在 8MB body 上复测了上限档位——splice 生效
+#     的耗时与退路的 `json.dumps` **同价**（32 分支 21ms / 128 分支 23ms / 256 分支
+#     27ms vs dumps 22ms），退回并没有省时间，只是白白丢掉前缀保真；而分支数在
+#     64→256 区间内几乎不放大耗时（主成本在大 body 扫描本身）。取 128 是让日常长会
+#     话（单请求几十个不同敏感值）不再踩线，同时保留体积上限做硬护栏。继续放宽的
+#     代价仍是同价的，若未来感知到慢再回来复测档位——只要分支数仍在个位数毫秒级。
+#   · 唯一副作用也附带测量过：splice 生效与否不影响脱敏/还原正确性（两端都是同一
+#     棵已脱敏树，还原只看占位符→rev 表），只影响发往上游字节的前缀保真。
+#   · 诊断方式：这类请求 `body_rewritten=true` 但 `first_diff_byte` **明显早于敏感值
+#     在 body 里的真实位置**（客户端用带空格排版时约在 byte 9），而 splice 生效时
+#     差异位正好落在敏感值上 —— 两者对照一眼可辨。
+_SPLICE_MAX = 8 << 20
+_SPLICE_MAX_FORMS = 128
+
+
+def _splice_mask(raw, masked_root, pairs):
+    """把 raw 里被脱敏的原文**就地**换成占位符，保住客户端 body 的原始排版。
+
+    为什么值得多这一条路径：命中敏感词时旧实现用 `json.dumps` 整棵重序列化，
+    客户端 body 的排版（冒号后空格、缩进、`1e-05` 这类数字写法）被一并抹掉，
+    与客户端原始字节的首个差异位就从「真正的敏感值」前移到 body 开头附近
+    （实测一条带空格 + `\\u` 转义的请求：敏感值在 byte 74，差异位却在 byte 9）。
+    上游按前缀做的 Prompt Cache 从差异位起整段 miss，中间那 65 个字节被白白改掉。
+
+    做法：对每个被脱敏的原文，按「原字符」与「\\uXXXX」两种合法 JSON 写法各建一条
+    替换项，在原始字节上一次性替换 —— 客户端用哪种转义风格，占位符就用哪种写回去。
+    不做结构解析，所以不动键名、不动数字字面量、不改排版。
+
+    ⚠️ **正确性不由这个函数保证**：调用方必须校验
+    `json.loads(结果) == masked_root`，不过就整条退回 `json.dumps`。
+    所以这里可以粗暴 —— 多替换了（命中键名、命中 `_mask_tree` 有意跳过的位置、
+    把历史里已有的占位符切碎）都会被等价校验拦下，退回**同一棵已经脱敏的树**。
+    因此这条路径在任何情况下都不会放行原文，最差只是回到改动前的行为。
+
+    pairs: {原文: 占位符}。返回替换后的字节；一个都没替换就返回 None。
+    """
+    if not pairs or not raw or len(raw) > _SPLICE_MAX:
+        return None
+    table = {}
+    for orig, tok in pairs.items():
+        if not orig or not tok or orig == tok:
+            continue
+        for ascii_esc in (False, True):
+            lit = json.dumps(orig, ensure_ascii=ascii_esc)[1:-1]
+            repl = json.dumps(tok, ensure_ascii=ascii_esc)[1:-1]
+            if lit != repl:
+                table[lit.encode("utf-8")] = repl.encode("utf-8")
+    if not table or len(table) > _SPLICE_MAX_FORMS:
+        return None
+    # 长 form 优先：正则交替是「首个匹配胜出」，短原文若是长原文的子串，
+    # 排在前面就会把长原文切碎。
+    forms = sorted(table, key=len, reverse=True)
+    pat = re.compile(b"|".join(re.escape(f) for f in forms))
+    new, hits = pat.subn(lambda m: table[m.group(0)], raw)
+    return new if hits else None
+
+
+def _mask_hit(obj, sid, flag=None):
+    """调 `mask()` 并记录「这个请求体真的被改写过」。
+
+    flag 是调用方传进来的单元素 list（None = 调用方不关心）。用途见
+    `_mask_tree` 的调用方：一个敏感词都没命中时**完全不回写**
+    `flow.request.content`，让上游收到的字节与客户端发出的逐字节一致。
+
+    为什么非要有这个标记：`json.dumps` 的默认分隔符是 `(", ", ": ")`，
+    重序列化会在每个逗号/冒号后插空格；`ensure_ascii` 的取值还会决定非 ASCII
+    是写成 `\\u5f20` 还是「张」。哪怕一个敏感词都没命中，这两点也足以让上游
+    收到的字节与客户端发出的不同 —— 上游按前缀做 Prompt Cache，前缀一变就
+    整段 miss（实测紧凑体 113 字节被改写成 123 字节）。
+    """
+    out = mask(obj, sid)
+    if flag is not None and out != obj:
+        flag[0] = True
+    return out
+
+
+def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0, flag=None):
     """递归脱敏 JSON 里的字符串叶子（完整路径判定 + 业务区强制扫描）。
 
     只处理 message.content 会整片漏掉多轮历史里的
@@ -2653,6 +3009,9 @@ def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0):
     这些位置常年携带上一轮的真实值，是最容易被绕过的泄漏面。
     JSON 深度超过上限不再静默原文放行：抛异常走 fail-closed 阻断（fail-closed 关闭时
     记 ERR 跳过），杜绝"深到扫不到就直出"的泄漏路径。
+
+    flag：可选单元素 list，任一叶子真的被替换过就置 True（见 `_mask_hit`）。
+    调用方靠它决定「要不要回写请求体」——没命中就一个字都不改，保住上游前缀缓存。
     """
     if depth > _MASK_MAX_DEPTH:
         raise ValueError("json_depth_exceeded: 请求嵌套超过脱敏递归上限，拒绝透传")
@@ -2677,7 +3036,7 @@ def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0):
         # （customer.id、正文里的 url），维持按位置判定（见 AGENTS 约束 12）。
         if key in _MASK_CORRELATION_ID_KEYS:
             return obj
-        if not in_business and key in _MASK_ALWAYS_SKIP:
+        if not in_business and key in _MASK_SKIP_SCALAR_KEYS:
             return obj
         if not in_business and key in ("role", "type") and (parent is None or parent in _MASK_ROLE_TYPE_PARENTS):
             return obj
@@ -2687,16 +3046,20 @@ def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0):
             # - url/data/b64_json：仅媒体容器里的图片 URL/base64（改了就破图）
             # - id：仅协议容器（messages/content/tool_calls/response/output 等）的关联 ID
             if key == "name" and parent not in _MASK_PROTOCOL_PARENTS:
-                return mask(obj, sid)
+                return _mask_hit(obj, sid, flag)
             if key in ("url", "data", "b64_json", "image_url") and parent not in _MASK_PROTOCOL_PARENTS:
-                return mask(obj, sid)
+                return _mask_hit(obj, sid, flag)
             if key == "id" and parent not in _MASK_PROTOCOL_ID_PARENTS:
-                return mask(obj, sid)
+                return _mask_hit(obj, sid, flag)
             return obj
-        return mask(obj, sid)
+        return _mask_hit(obj, sid, flag)
     if isinstance(obj, list):
-        return [_mask_tree(v, sid, key, parent, path, depth + 1) for v in obj]
+        return [_mask_tree(v, sid, key, parent, path, depth + 1, flag) for v in obj]
     if isinstance(obj, dict):
+        # 协议元数据对象整棵跳过。必须放在 dict 分支——str 分支的
+        # _MASK_SKIP_SCALAR_KEYS 对对象值无效（见该集合上方的注释）。
+        if not in_business and key in _MASK_SKIP_SUBTREE_KEYS:
+            return obj
         # 对象**键名不脱敏**，这是有意保留的边界，不是遗漏：
         # 1) 键名承载结构语义（content/type/role/messages…），一旦被自定义短词误命中
         #    （用户加个 "con" 就会命中 content），整条请求的协议骨架当场崩掉——代价是
@@ -2705,7 +3068,7 @@ def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0):
         #    partial_json）在上游是 JSON **字符串**，走的是下面的 str 分支，
         #    整个 JSON 文本（含键名）都会被扫描，本来就没漏。
         # 若要覆盖剩余场景，必须先能可靠区分「数据键」与「结构键」，否则误伤面大于收益。
-        return {k: _mask_tree(v, sid, k, key, path + (k,), depth + 1) for k, v in obj.items()}
+        return {k: _mask_tree(v, sid, k, key, path + (k,), depth + 1, flag) for k, v in obj.items()}
     return obj
 
 
@@ -2785,7 +3148,7 @@ def _emit(typ, **kw):
         pass
 
 
-# ========== 2.0 审计钩子（隔离保证：永不改 body，永不抛异常，关时零开销） ==========
+# ---------- 2.0 审计钩子（隔离保证：永不改 body，永不抛异常，关时零开销） ----------
 def _hash_body(content):
     try:
         if not content:
@@ -3083,7 +3446,7 @@ def error(flow):
         _drop(sid)
 
 
-# ========== mitmproxy hooks ==========
+# ---------- mitmproxy hooks ----------
 
 
 def _clean_tool_enums(body):
@@ -3098,28 +3461,39 @@ def _clean_tool_enums(body):
     「该参数没有任何合法取值」，比不带 enum 更糟——模型会认为无法构造合法
     参数而干脆不调用该工具。boolean/integer 类型的 enum 天然全是非字符串
     （如 `{"type":"boolean","enum":[true,false]}`），是最常见的命中场景。
+
+    返回值：body 是否真的被改动过。调用方据此决定要不要回写请求体 ——
+    没改就一个字都不动，保住上游前缀缓存（见 `_mask_hit`）。
     """
+    changed = False
     try:
         tools = body.get("tools") if isinstance(body, dict) else None
         if not isinstance(tools, list):
-            return
+            return False
+
         def clean(obj):
+            nonlocal changed
             if isinstance(obj, dict):
                 if isinstance(obj.get("enum"), list):
                     kept = [x for x in obj["enum"] if isinstance(x, str)]
                     if kept:
+                        if len(kept) != len(obj["enum"]):
+                            changed = True
                         obj["enum"] = kept
                     else:
                         obj.pop("enum", None)  # 全非字符串：删键，不留空数组
+                        changed = True
                 for v in obj.values():
                     clean(v)
             elif isinstance(obj, list):
                 for v in obj:
                     clean(v)
+
         for t in tools:
             clean(t)
     except Exception:
         pass
+    return changed
 
 def _clean_reasoning_effort(body, up_name):
     """标记 reasoning_effort 可疑值，不做删除——透明代理不改下游请求。
@@ -3371,8 +3745,9 @@ def request(flow: http.HTTPFlow):
     # enum 清洗对任何上游都是无损操作（enum 仅取值提示），官方三渠道原生 API
     # 校验宽松可不改；中转渠道的 tools 转换器拒绝非字符串 enum（实测），
     # 故对所有非官方渠道 + gemini 模型启用。
+    enum_changed = False
     if up_name not in ("openai", "deepseek", "anthropic") and str(body.get("model", "")).startswith("gemini"):
-        _clean_tool_enums(body)
+        enum_changed = _clean_tool_enums(body)
     # 标记 reasoning_effort 可疑值（不修改请求）：上游 400 时在事件里提示
     # 下游排查模型配置（pi 的 thinkingLevelMap off→"none" 曾导致识图 400）
     flow.metadata["shield_reasoning_effort"] = _clean_reasoning_effort(body, up_name)
@@ -3407,6 +3782,11 @@ def request(flow: http.HTTPFlow):
 
     # fail-closed：整个脱敏管线包一层，异常时阻断请求（503），绝不放行原文上行。
     # 关闭 fail-closed 仅用于排查问题：异常时记录 ERR 后继续转发（可能泄露原文）。
+    # body_rewritten / first_diff_byte 只用于 MASK 事件的诊断，不参与脱敏决策：
+    # 用户报「上游缓存命中率归零」时，这两个值能直接区分「我们改了字节」与
+    # 「上游自己 miss」，也是决定要不要做字节级替换的唯一实测依据。
+    body_rewritten = False
+    first_diff_byte = -1
     _mask_t0 = time.perf_counter()
     try:
         # 脱敏前记录扫描范围 + 各角色文本（仅内存，归因用，不落原文）
@@ -3417,23 +3797,72 @@ def request(flow: http.HTTPFlow):
         # 注意：必须遍历 body 全部顶层 key——曾只处理白名单 key，顶层自定义业务对象
         # （customer 等）整体绕过脱敏（审计验收点"任意 customer.id"实测漏检）。
         # 非字符串/列表/字典（数字/bool/null）_mask_tree 原样返回，无副作用。
+        # body_changed 是单元素 list（可变），由 _mask_hit 在真的替换过时置 True。
+        body_changed = [False]
         for key in list(body.keys()):
-            body[key] = _mask_tree(body[key], sid, key)
+            body[key] = _mask_tree(body[key], sid, key, flag=body_changed)
 
         # model 规则的 body 注入：**必须在脱敏之后**，否则注入的客户端指纹会被
         # 当成正文脱敏掉（用户词表里一个 `Claude` 就足以让身份行失效）。
         # 只在顶层是对象时注入：非对象 body（JSON 数组/标量）此刻装在合成根键里，
         # 序列化只取 body[_ROOT_WRAP_KEY]，写到 wrapper 上的键会被整片丢掉。
         # 而那种形态本就不是任何 LLM API 的请求体，不存在需要注入指纹的场景。
+        rule_body_changed = False
         if root_is_object:
-            _apply_model_rule_body(body, _model_rule, matched_up)
+            rule_body_changed = _apply_model_rule_body(body, _model_rule, matched_up)
 
-        masked_raw = json.dumps(
-            body if root_is_object else body[_ROOT_WRAP_KEY], ensure_ascii=False
-        )
-        # 历史里带上来的、上一轮遗留的占位符：登记进本会话，响应侧仍能还原（自愈）
-        _seed_known(masked_raw, sid)
-        flow.request.content = masked_raw.encode("utf-8")
+        if body_changed[0] or enum_changed or rule_body_changed:
+            # 只有真的改过才回写请求体。回写方式分三级，目标都是别把「前缀」整体挪位 ——
+            # 上游按前缀做 Prompt Cache，前缀字节一变就整段 miss：
+            #   1) 首选**字节级文本替换**（`_splice_mask`）：直接在客户端原始 JSON 文本上
+            #      做敏感值占位符替换，客户端 body 的排版（空格、缩进、数字写法、转义风格）
+            #      全部原样保留。实测一条带空格 + `\u` 转义的请求：敏感值在 byte 74，
+            #      整棵重序列化的差异位却在 byte 9 —— 中间 65 字节的前缀被白白改掉。
+            #      由等价校验确保结构正确。见 `_splice_mask`。
+            #   2) 替换结果必须通过 `json.loads(结果) == 脱敏后的树` 等价校验才采用；
+            #      不过（含 enum 清洗这类结构性改动，splice 表达不了）就退回下一级。
+            #   3) 退路是整棵重序列化，两个细节同样为了保前缀：
+            #      · separators 用紧凑形态：json.dumps 默认 (", ", ": ") 会在每个
+            #        逗号/冒号后插空格，把 SDK 普遍发的紧凑体整体改写（实测 113→123 字节）。
+            #      · ensure_ascii 跟随客户端已表现出的策略：正文里出现过 `\u` 转义，
+            #        说明客户端用 ensure_ascii=True，我们回写时也转义；否则这次重序列化
+            #        会把 `\u5f20\u4e09` 展开成「张三」，凭空扩大与客户端前缀的字节差异。
+            # 三级回写的都是**同一棵已经脱敏的树**，所以不存在放行原文的路径。
+            masked_root = body if root_is_object else body[_ROOT_WRAP_KEY]
+            masked_raw = None
+            # model 规则注入是新增结构，无法由原始 body 的字节替换表达；必须强制
+            # 走整棵树的重序列化，否则无敏感词命中时会被零改写短路静默丢掉。
+            if BYTE_SPLICE and not enum_changed and not rule_body_changed:
+                try:
+                    spliced = _splice_mask(
+                        raw_content, masked_root,
+                        {o: t for o, t in (sessions.get(sid, {}).get("fwd") or {}).items() if t},
+                    )
+                except Exception:
+                    spliced = None
+                if spliced is not None:
+                    try:
+                        if json.loads(spliced) == masked_root:
+                            masked_raw = spliced.decode("utf-8")
+                    except Exception:
+                        masked_raw = None
+            if masked_raw is None:
+                masked_raw = json.dumps(
+                    masked_root,
+                    ensure_ascii=(b"\\u" in raw_content),
+                    separators=(",", ":"),
+                )
+            # 历史里带上来的、上一轮遗留的占位符：登记进本会话，响应侧仍能还原（自愈）
+            _seed_known(masked_raw, sid)
+            flow.request.content = masked_raw.encode("utf-8")
+            body_rewritten = True
+            first_diff_byte = _first_diff_byte(raw_content, flow.request.content)
+        else:
+            # 零改写透传：一个敏感词都没命中，就**一个字都不动** flow.request.content。
+            # 除了省一次序列化，更重要的是保证上游收到的字节与客户端发出的完全一致
+            # （含分隔符、键序、\u 转义、数字字面量写法），这是 Prompt Cache 命中的前提。
+            # _seed_known 照常跑：客户端历史里带来的占位符本轮响应若被模型复述仍要能还原。
+            _seed_known(raw_content.decode("utf-8", "replace"), sid)
 
     except Exception as e:
         _drop(sid)
@@ -3562,6 +3991,12 @@ def request(flow: http.HTTPFlow):
         # 便于用户在日志里发现「这条是靠兜底脱敏的」并反馈新协议形态。
         **({"body_shape": "non_object_root"} if not root_is_object
            else {"body_shape": "unknown_shape"} if unknown_shape else {}),
+        # 前缀诊断（均不含原文）：本次是否回写了请求体、回写后与客户端原始字节的
+        # 首个差异位置、命中的占位符是否为复用。用户报「上游缓存命中率归零」时，
+        # 这三项能直接区分「我们改了字节」与「上游自己 miss」。
+        body_rewritten=body_rewritten,
+        first_diff_byte=first_diff_byte,
+        suffix_reused=bool(sessions.get(sid, {}).get("suffix_reused")),
         **source,
     )
 
@@ -3657,6 +4092,9 @@ def _scan_response(flow, sid, host, method, path, source, streamed_text=None):
         if len(body) > _SCAN_BODY_MAX:
             body = body[:_SCAN_BODY_MAX]
         found = {}
+        # 与 mask() 同款避让：被豁免的连接串区间不许 EMAIL 规则二次命中，
+        # 否则模型复述的模板会被误报成「发现邮箱」（此处只影响告警，不改文本）。
+        exempt_conn = []
         for rx, label, gidx in RULES:
             if not _rule_enabled(label):
                 continue
@@ -3675,6 +4113,12 @@ def _scan_response(flow, sid, host, method, path, source, streamed_text=None):
                 if label == "EMAIL" and not _email_ok(orig):
                     continue
                 if label == "IBAN" and not _iban_ok(orig):
+                    continue
+                if label == "CONNSTR" and not _connstr_ok(orig, m, body):
+                    if len(exempt_conn) < _CONNSTR_EXEMPT_MAX:
+                        exempt_conn.append((m.start(), m.end()))
+                    continue
+                if label == "EMAIL" and _overlaps_exempt_conn(m.start(), m.end(), exempt_conn):
                     continue
                 if orig in fwd:
                     continue  # 本会话脱敏还原回来的值，跳过

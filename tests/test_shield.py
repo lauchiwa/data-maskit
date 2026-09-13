@@ -2994,6 +2994,7 @@ class PanelConfigTests(unittest.TestCase):
         old_sleep = panel.time.sleep
         old_detect = panel.detect_upstream
         old_emit = panel._emit_log
+        old_dump = panel._dump_crash_context
         calls = {"detect": 0, "sleep": 0}
 
         class FakeProc:
@@ -3026,6 +3027,7 @@ class PanelConfigTests(unittest.TestCase):
             panel.time.sleep = old_sleep
             panel.detect_upstream = old_detect
             panel._emit_log = old_emit
+            panel._dump_crash_context = old_dump
         self.assertEqual(calls["detect"], 0)
 
     def test_passthrough_forwards_without_masking(self):
@@ -3538,7 +3540,7 @@ class PanelConfigTests(unittest.TestCase):
         old_token = panel.API_TOKEN
         try:
             event_store._reset_writer()
-            event_store.DB_PATH = ROOT / ".test-type-filter-events.sqlite3"
+            event_store.DB_PATH = ROOT / f".test-type-filter-events-{os.getpid()}.sqlite3"
             event_store.DB_PATH.unlink(missing_ok=True)
             panel.DB_PATH = event_store.DB_PATH
             panel.API_TOKEN = "test-token"
@@ -3580,7 +3582,7 @@ class PanelConfigTests(unittest.TestCase):
         old_log = tr._log
         try:
             event_store._reset_writer()  # 换 DB_PATH 前重置 writer/建表缓存
-            event_store.DB_PATH = ROOT / ".test-transparent-events.sqlite3"
+            event_store.DB_PATH = ROOT / f".test-transparent-events-{os.getpid()}.sqlite3"
             event_store.DB_PATH.unlink(missing_ok=True)
             tr._log = lambda msg: None
 
@@ -3956,6 +3958,213 @@ class TodayStatsTests(unittest.TestCase):
             event_store.append_event({"type": "RESTORE", "ts": now})
             stats = event_store.today_stats(now=now)
             self.assertEqual(stats["tokens"], {"prompt": 160, "completion": 40})
+        finally:
+            event_store._reset_writer()
+            for p in [tmp, Path(str(tmp) + "-wal"), Path(str(tmp) + "-shm")]:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            event_store.DB_PATH = old_db
+
+    def test_prefix_stats_only_counts_masked_events_with_diagnostics(self):
+        """前缀保真度：只认带诊断字段的 MASK 事件。
+
+        分母必须是「当前版本产出的 MASK 事件」——老形态事件（无 body_rewritten）
+        进了分母会把 masks 撑大而 rewritten 恒为 0，凭空压低零改写率；
+        RESTORE 即便带同样字段也不进这张表（口径同 daily_words 只收 MASK）。
+        """
+        import tempfile
+        old_db = event_store.DB_PATH
+        tmp = Path(tempfile.mkdtemp()) / "prefix.sqlite3"
+        event_store.DB_PATH = tmp
+        event_store._reset_writer()
+        try:
+            event_store.init_db()
+            now = time.time()
+            event_store.append_event({"type": "MASK", "ts": now, "count": 1,
+                                      "body_rewritten": True, "first_diff_byte": 62,
+                                      "suffix_reused": True})
+            event_store.append_event({"type": "MASK", "ts": now, "count": 1,
+                                      "body_rewritten": True, "first_diff_byte": 68,
+                                      "suffix_reused": False})
+            # 超上限没算差异位（first_diff_byte=-1）：进分母，不进均值
+            event_store.append_event({"type": "MASK", "ts": now, "count": 1,
+                                      "body_rewritten": True, "first_diff_byte": -1})
+            # 零改写透传
+            event_store.append_event({"type": "MASK", "ts": now, "count": 0,
+                                      "body_rewritten": False, "first_diff_byte": -1})
+            # 老形态 MASK：没有诊断字段，不得进分母
+            event_store.append_event({"type": "MASK", "ts": now, "count": 9, "host": "legacy"})
+            # RESTORE 带同样字段也不进（口径同 daily_words）
+            event_store.append_event({"type": "RESTORE", "ts": now, "restored": 1,
+                                      "body_rewritten": True, "first_diff_byte": 5})
+            stats = event_store.today_stats(now=now)
+            p = stats["prefix"]
+            self.assertIsNotNone(p, "有 4 条带诊断字段的 MASK，不该返回 None")
+            self.assertEqual(p["masks"], 4, "老形态 MASK 与 RESTORE 都不该进分母")
+            self.assertEqual(p["rewritten"], 3)
+            self.assertEqual(p["clean"], 1)
+            self.assertAlmostEqual(p["clean_rate"], 0.25)
+            self.assertEqual(p["suffix_reused"], 1)
+            # 分母是 rewritten(3) 不是 masks(4)：那条零改写透传的请求没签发占位符，
+            # 算进分母会把「10 次命中 8 次复用」稀释成 8%。
+            self.assertAlmostEqual(p["reuse_rate"], 1 / 3, places=3)  # 后端 round(x, 4)
+            # 均值只基于 62/68 两个有效样本，-1 被排除
+            self.assertEqual(p["diff_samples"], 2)
+            self.assertAlmostEqual(p["avg_first_diff"], 65.0)
+            # 对照：mask_events 仍是全部 MASK（含老形态）——两张表口径不同是预期的
+            self.assertEqual(stats["mask_events"], 5)
+        finally:
+            event_store._reset_writer()
+            for p in [tmp, Path(str(tmp) + "-wal"), Path(str(tmp) + "-shm")]:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            event_store.DB_PATH = old_db
+
+    def test_prefix_stats_is_none_without_samples(self):
+        """没有 MASK 样本时给 None，不给一排 0。
+
+        「还没有样本」和「有样本但零改写率 0%」对用户是相反的两件事，
+        前端靠 null 决定显示「暂无数据」还是显示真实的 0.0%。
+        """
+        import tempfile
+        old_db = event_store.DB_PATH
+        tmp = Path(tempfile.mkdtemp()) / "prefix-empty.sqlite3"
+        event_store.DB_PATH = tmp
+        event_store._reset_writer()
+        try:
+            event_store.init_db()
+            now = time.time()
+            # 只有 RESTORE 与老形态 MASK：都不产生样本
+            event_store.append_event({"type": "RESTORE", "ts": now, "restored": 1})
+            event_store.append_event({"type": "MASK", "ts": now, "count": 3, "host": "legacy"})
+            self.assertIsNone(event_store.today_stats(now=now)["prefix"])
+            self.assertIsNone(event_store.stats_range(days=7, now=now)["prefix"])
+        finally:
+            event_store._reset_writer()
+            for p in [tmp, Path(str(tmp) + "-wal"), Path(str(tmp) + "-shm")]:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            event_store.DB_PATH = old_db
+
+    def test_prefix_stats_reuse_rate_is_none_without_rewrites(self):
+        """复用率的分母是「改写过的请求」，一个占位符都没签发时给 None 而不是 0%。
+
+        零改写透传的请求没有命中、不会调 `_remember`，suffix_reused 恒为 False ——
+        把它们算进分母会把指标稀释：100 次请求 10 次命中、8 次复用，用 masks 当
+        分母显示 8%，真实是 80%，用户会据此误判「复用机制没生效」。
+        同理 `reuse_rate` 为 None 与为 0 是两件事：前者是「没签发占位符」，
+        后者是「签发了但全是新 token」，对缓存的含义完全相反。
+        """
+        import tempfile
+        old_db = event_store.DB_PATH
+        tmp = Path(tempfile.mkdtemp()) / "prefix-reuse.sqlite3"
+        event_store.DB_PATH = tmp
+        event_store._reset_writer()
+        try:
+            event_store.init_db()
+            now = time.time()
+            for _ in range(3):
+                event_store.append_event({"type": "MASK", "ts": now, "count": 0,
+                                          "body_rewritten": False, "first_diff_byte": -1})
+            p = event_store.today_stats(now=now)["prefix"]
+            self.assertEqual(p["masks"], 3)
+            self.assertEqual(p["rewritten"], 0)
+            self.assertAlmostEqual(p["clean_rate"], 1.0)
+            self.assertIsNone(p["reuse_rate"], "没签发票据时不能报 0%，那是另一种含义")
+            self.assertIsNone(p["avg_first_diff"])
+        finally:
+            event_store._reset_writer()
+            for p in [tmp, Path(str(tmp) + "-wal"), Path(str(tmp) + "-shm")]:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            event_store.DB_PATH = old_db
+
+    def test_prefix_stats_survives_daily_stats_backfill(self):
+        """回填重放历史事件时不得再写一次 daily_prefix（只进不退的计数器会翻倍）。
+
+        正对照必须有：断言 daily_stats_migrated 真的被写上了，否则「没翻倍」
+        可能只是因为回填压根没跑，用例就成了空过。
+        """
+        import sqlite3
+        import tempfile
+        old_db = event_store.DB_PATH
+        tmp = Path(tempfile.mkdtemp()) / "prefix-backfill.sqlite3"
+        event_store.DB_PATH = tmp
+        event_store._reset_writer()
+        try:
+            event_store.init_db()
+            now = time.time()
+            # ts 早于 daily_stats_created（= init_db 时刻）→ 会被回填重放
+            event_store.append_event({"type": "MASK", "ts": now - 86400, "count": 1,
+                                      "body_rewritten": False, "first_diff_byte": -1})
+            event_store.append_event({"type": "MASK", "ts": now, "count": 1,
+                                      "body_rewritten": True, "first_diff_byte": 40})
+            before = event_store.stats_range(days=7, now=now)["prefix"]
+            self.assertEqual(before["masks"], 2, "今天 1 条 + 昨天 1 条")
+            # today_stats 内部会跑 _migrate_daily_stats 回填
+            event_store.today_stats(now=now)
+            with sqlite3.connect(str(tmp)) as con:
+                migrated = con.execute(
+                    "SELECT value FROM meta WHERE key='daily_stats_migrated'").fetchone()
+            self.assertIsNotNone(migrated, "回填没跑，这个用例就是空过")
+            after = event_store.stats_range(days=7, now=now)["prefix"]
+            self.assertEqual(after, before, "回填重放把 daily_prefix 又加了一遍")
+        finally:
+            event_store._reset_writer()
+            for p in [tmp, Path(str(tmp) + "-wal"), Path(str(tmp) + "-shm")]:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            event_store.DB_PATH = old_db
+
+    def test_prefix_stats_preserved_after_prune_and_clear(self):
+        """清日志 / 按保留期裁剪都不清 daily_prefix（纯数字计数，永久保留）。
+
+        与 `test_today_stats_tokens_preserved_after_clear` 对称：daily_tokens 有
+        对应用例，这张表没有，后续改 prune/clear 的清理清单时容易漏掉它 ——
+        漏掉的后果是用户清一次日志，前缀保真度卡就归零。
+        """
+        import tempfile
+        old_db = event_store.DB_PATH
+        tmp = Path(tempfile.mkdtemp()) / "prefix-keep.sqlite3"
+        event_store.DB_PATH = tmp
+        event_store._reset_writer()
+        try:
+            event_store.init_db()
+            now = time.time()
+            event_store.append_event({"type": "MASK", "ts": now, "count": 1,
+                                      "body_rewritten": False, "first_diff_byte": -1})
+            # 3 天前的事件：retention_days=1 的 prune 会把它删掉
+            event_store.append_event({"type": "MASK", "ts": now - 3 * 86400, "count": 1,
+                                      "body_rewritten": True, "first_diff_byte": 77,
+                                      "suffix_reused": True})
+            event_store.flush_event_queue()
+            before = event_store.stats_range(days=30, now=now)["prefix"]
+            self.assertEqual(before["masks"], 2, "今天 1 条 + 3 天前 1 条")
+            self.assertEqual(before["diff_samples"], 1)
+            self.assertAlmostEqual(before["avg_first_diff"], 77.0)
+
+            event_store.prune_events(now=now, retention_days=1)
+            self.assertEqual(
+                event_store.stats_range(days=30, now=now)["prefix"], before,
+                "prune 把 daily_prefix 一起裁了（它应同 daily_tokens 永久保留）",
+            )
+
+            event_store.clear_events()
+            event_store.flush_event_queue()
+            self.assertEqual(
+                event_store.stats_range(days=30, now=now)["prefix"], before,
+                "clear 把 daily_prefix 清了（清日志不清统计）",
+            )
         finally:
             event_store._reset_writer()
             for p in [tmp, Path(str(tmp) + "-wal"), Path(str(tmp) + "-shm")]:
@@ -4948,6 +5157,25 @@ class ModelRulesTests(unittest.TestCase):
             self.assertEqual(sent["messages"][0]["content"], "hi",
                              "注入不得破坏原有请求内容")
             self.assertEqual(flow.request.headers.get("originator"), "codex_exec")
+        finally:
+            tr._emit, tr.CAPTURE_MODE, tr.UPSTREAMS, tr._log = old
+
+    def test_model_rule_body_injection_rewrites_without_mask_hit(self):
+        """没有敏感词命中时，model_rules body 注入也必须触发请求体回写。"""
+        old = (tr._emit, tr.CAPTURE_MODE, tr.UPSTREAMS, tr._log)
+        tr._emit, tr._log = (lambda *a, **k: None), (lambda line: None)
+        try:
+            tr.CAPTURE_MODE = "reverse"
+            tr.UPSTREAMS = [self._reverse_upstream(model_rules=[
+                {"match": "m1", "headers": {},
+                 "body": {"prompt_cache_key": "model-rule-only"}}])]
+            flow = self._reverse_flow("POST", "/v1/chat/completions", json.dumps({
+                "model": "m1",
+                "messages": [{"role": "user", "content": "ordinary text"}],
+            }).encode())
+            tr.request(flow)
+            sent = json.loads(flow.request.content)
+            self.assertEqual(sent["prompt_cache_key"], "model-rule-only")
         finally:
             tr._emit, tr.CAPTURE_MODE, tr.UPSTREAMS, tr._log = old
 

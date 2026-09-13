@@ -15,7 +15,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
-import { EventTypeIcon } from '@/components/events/EventTypeIcon'
+import { EventTypeIcon, getEventTypeMeta } from '@/components/events/EventTypeIcon'
 import { CheckCircle2 } from 'lucide-react'
 import type { ShieldEvent } from '@/types/api'
 import dayjs from 'dayjs'
@@ -130,6 +130,49 @@ export function EventDetailDialog({
     [event],
   )
 
+  const stageInfo = useMemo(() => {
+    if (!event) return null
+    const meta = getEventTypeMeta(event.type)
+    switch (event.type) {
+      case 'RESTORE':
+        return {
+          label: t('detail.stageRestore'),
+          className: 'bg-emerald-600 text-white hover:bg-emerald-600',
+          desc: t('detail.stageRestoreDesc'),
+        }
+      case 'MASK':
+        return {
+          label: t('detail.stageMask'),
+          className: 'bg-blue-600 text-white hover:bg-blue-600',
+          desc: t('detail.stageMaskDesc'),
+        }
+      case 'BLOCK':
+        return {
+          label: t('evt.block'),
+          className: 'bg-red-600 text-white hover:bg-red-600',
+          desc: t('detail.stageBlockDesc'),
+        }
+      case 'ERR':
+        return {
+          label: t('evt.err'),
+          className: 'bg-red-600 text-white hover:bg-red-600',
+          desc: t('detail.stageErrDesc'),
+        }
+      case 'SCAN_WARN':
+        return {
+          label: t('evt.scanWarn'),
+          className: 'bg-amber-600 text-white hover:bg-amber-600',
+          desc: t('detail.stageScanWarnDesc'),
+        }
+      default:
+        return {
+          label: meta.labelKey ? t(meta.labelKey) : (meta.label || event.type),
+          className: 'bg-slate-600 text-white hover:bg-slate-600',
+          desc: t('detail.stageOtherDesc'),
+        }
+    }
+  }, [event, t])
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">
@@ -220,6 +263,50 @@ export function EventDetailDialog({
               </div>
             )}
 
+            {/* 顶栏链路全景图：直观告知用户本条请求是 脱敏请求(出站) 还是 还原回复(入站) 或 异常/直连 */}
+            {stageInfo && (
+              <div className="rounded-lg border bg-muted/20 p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-semibold text-muted-foreground">{t('detail.pipelineStage')}</span>
+                    <Badge
+                      className={cn(
+                        'text-xs font-mono',
+                        stageInfo.className
+                      )}
+                    >
+                      {stageInfo.label}
+                    </Badge>
+                  </div>
+                  <div className="flex items-center gap-3 text-xs">
+                    {(event.count ?? 0) > 0 && (
+                      <span className="text-blue-600 dark:text-blue-400">
+                        {t('logs.colMasked')} <strong>{event.count}</strong>
+                      </span>
+                    )}
+                    {(event.restored ?? 0) > 0 && (
+                      <span className="text-emerald-600 dark:text-emerald-400">
+                        {t('logs.colRestored')} <strong>{event.restored}</strong>
+                      </span>
+                    )}
+                    {(event.unresolved ?? 0) > 0 && (
+                      <span className="text-amber-600 dark:text-amber-400">
+                        {t('logs.colUnresolved')} <strong>{event.unresolved}</strong>
+                      </span>
+                    )}
+                    {(event.degraded ?? 0) > 0 && (
+                      <span className="text-muted-foreground">
+                        {t('logs.colDegraded')} <strong>{event.degraded}</strong>
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <p className="mt-1.5 text-[11px] text-muted-foreground leading-relaxed">
+                  {stageInfo.desc}
+                </p>
+              </div>
+            )}
+
             {/* 脱敏/还原项目对照（明文 → 占位符 / 占位符 → 明文） */}
             {event.items && event.items.length > 0 && (
               <div>
@@ -255,31 +342,31 @@ export function EventDetailDialog({
                           </div>
                           <div className="mt-2 space-y-1.5 font-mono text-xs leading-relaxed">
                             {item.original != null && (
-                              <div className="flex gap-2">
-                                <span className="w-10 shrink-0 text-muted-foreground">{t('detail.original')}</span>
-                                <span className="break-all">{item.original}</span>
+                              <div className="flex items-start gap-2">
+                                <span className="w-12 shrink-0 text-muted-foreground">{t('detail.original')}</span>
+                                <span className="break-all font-semibold text-foreground">{item.original}</span>
                               </div>
                             )}
                             {item.preview != null && (
-                              <div className="flex gap-2">
-                                <span className="w-10 shrink-0 text-muted-foreground">{t('detail.preview')}</span>
+                              <div className="flex items-start gap-2">
+                                <span className="w-12 shrink-0 text-muted-foreground">{t('detail.preview')}</span>
                                 <span className="break-all text-muted-foreground">{item.preview}</span>
                               </div>
                             )}
                             {item.tok != null && (
-                              <div className="flex gap-2">
-                                <span className="w-10 shrink-0 text-muted-foreground">{t('detail.placeholder')}</span>
-                                <span className="break-all text-blue-600 dark:text-blue-400">
+                              <div className="flex items-start gap-2">
+                                <span className="w-12 shrink-0 text-muted-foreground">{t('detail.placeholder')}</span>
+                                <span className="break-all rounded bg-blue-500/10 px-1 text-blue-600 dark:text-blue-400">
                                   {item.tok}
                                 </span>
                               </div>
                             )}
                             {item.hash != null && (
-                              <div className="flex gap-2">
-                                <span className="w-10 shrink-0 text-muted-foreground">{t('detail.hash')}</span>
-                                <span className="break-all text-muted-foreground">{item.hash}</span>
+                              <div className="flex items-start gap-2 text-muted-foreground">
+                                <span className="w-12 shrink-0">{t('detail.hash')}</span>
+                                <span className="break-all">{item.hash}</span>
                                 {item.length != null && (
-                                  <span className="text-muted-foreground">{tf('detail.length', { n: item.length })}</span>
+                                  <span className="shrink-0">({tf('detail.length', { n: item.length })})</span>
                                 )}
                               </div>
                             )}

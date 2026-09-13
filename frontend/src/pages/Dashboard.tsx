@@ -2,6 +2,7 @@
  * 控制台（对标旧版概览仪表盘）：
  * - 大状态横幅：过滤状态 + 捕获模式 + 运行时长
  * - 6 张统计卡：今日请求 / 已脱敏 / 已还原回复 / 告警(4子项) / Token(输入输出) / 今日费用估算
+ * - 前缀保真度卡：零改写透传率 / 占位符复用率 / 平均首个差异字节（MASK 事件诊断字段）
  * - 网关管理快捷操作：启停 / CA证书 / 健康检查 / 紧急恢复
  * - 核心安全防护策略：failClosed / responseScan / SSE / 流式排除 / 自启 / 自启代理
  * - 最近事件 7 列表格
@@ -10,7 +11,7 @@
 import { useMemo, useState } from 'react'
 import { useVisibility } from '@/lib/useVisibility'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import {
   ShieldCheck,
   ShieldOff,
@@ -25,6 +26,7 @@ import {
   ArrowRight,
   HelpCircle,
   Coins,
+  Gauge,
   Loader2,
   LockKeyhole,
 } from 'lucide-react'
@@ -41,7 +43,7 @@ import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
-import { cn } from '@/lib/utils'
+import { cn, formatCompactNumber, formatTokensShort } from '@/lib/utils'
 import { CRED_LABELS, maskWord } from '@/lib/sensitive-word'
 import { toast } from '@/lib/toast'
 import { useI18n } from '@/lib/i18n'
@@ -70,6 +72,7 @@ const fmtMs = (ms?: number | null) => {
 
 export default function Dashboard() {
   const queryClient = useQueryClient()
+  const navigate = useNavigate()
   const { t, tf, lang } = useI18n()
   // 页面隐藏时停止轮询；可见时自动刷新
   const { hidden } = useVisibility()
@@ -183,6 +186,10 @@ export default function Dashboard() {
 
   const tokensTotal = (stats?.tokens.prompt ?? 0) + (stats?.tokens.completion ?? 0)
 
+  // 前缀保真度：null = 本区间一条 MASK 事件都没有（空库 / 老库刚升级）。
+  // 与「有样本但零改写率 0%」必须分开渲染——前者是没数据，后者是数据很差。
+  const prefix = stats?.prefix ?? null
+
   // 最近事件：合并 MASK/RESTORE 成「一次请求一行」并取最新 10 行（与 Logs 页同口径）
   const recentMerged = useMemo(
     () => mergeMaskRestore(recentLogs?.events ?? []).slice(0, 10),
@@ -198,28 +205,51 @@ export default function Dashboard() {
     todayCostModels.length > 0 && todayPricedCount === 0
   const todayCostReady = Boolean(costData)
 
+  const unitSystem = t('stats.unitSystem') === 'si' ? 'si' : 'cjk'
+  const reqNum = formatCompactNumber(stats?.requests ?? 0, unitSystem)
+  const maskNum = formatCompactNumber(stats?.mask_events ?? 0, unitSystem)
+  const restoreNum = formatCompactNumber(stats?.restored ?? 0, unitSystem)
+  const alertNum = formatCompactNumber(stats?.alerts ?? 0, unitSystem)
+  const tokenNum = formatCompactNumber(tokensTotal, unitSystem)
+
   // 6 张统计卡（i18n）
   const statCards = [
     {
-      label: t('dash.reqToday'), value: (stats?.requests ?? 0).toLocaleString(), hint: t('dash.reqHint'),
+      label: t('dash.reqToday'),
+      value: reqNum.compact,
+      fullValue: reqNum.full,
+      isCompact: reqNum.isCompact,
+      hint: t('dash.reqHint'),
       icon: Activity, num: 'text-blue-600 dark:text-blue-400',
       iconBg: 'from-blue-500/15 to-blue-500/5 text-blue-600 dark:text-blue-400',
       to: '/logs',
     },
     {
-      label: t('dash.maskedReq'), value: (stats?.mask_events ?? 0).toLocaleString(), hint: `${t('dash.maskedHint')} ${(stats?.masked_items ?? 0).toLocaleString()}`,
+      label: t('dash.maskedReq'),
+      value: maskNum.compact,
+      fullValue: maskNum.full,
+      isCompact: maskNum.isCompact,
+      hint: `${t('dash.maskedHint')} ${formatTokensShort(stats?.masked_items ?? 0, unitSystem)}`,
+      hintTitle: `${t('dash.maskedHint')} ${(stats?.masked_items ?? 0).toLocaleString()}`,
       icon: Shield, num: 'text-emerald-600 dark:text-emerald-400',
       iconBg: 'from-emerald-500/15 to-emerald-500/5 text-emerald-600 dark:text-emerald-400',
       onClick: () => setMaskedOpen(true),
     },
     {
-      label: t('dash.restored'), value: (stats?.restored ?? 0).toLocaleString(), hint: t('dash.restoredHint'),
+      label: t('dash.restored'),
+      value: restoreNum.compact,
+      fullValue: restoreNum.full,
+      isCompact: restoreNum.isCompact,
+      hint: t('dash.restoredHint'),
       icon: ShieldCheck, num: 'text-emerald-600 dark:text-emerald-400',
       iconBg: 'from-teal-500/15 to-teal-500/5 text-teal-600 dark:text-teal-400',
       onClick: () => setRestoredOpen(true),
     },
     {
-      label: t('dash.alerts'), value: (stats?.alerts ?? 0).toLocaleString(),
+      label: t('dash.alerts'),
+      value: alertNum.compact,
+      fullValue: alertNum.full,
+      isCompact: alertNum.isCompact,
       sub: [
         { label: t('dash.blocked'), value: ((stats as Record<string, unknown> | undefined)?.by_type as Record<string, {events:number}> | undefined)?.BLOCK?.events ?? 0 },
         { label: t('dash.restoreFail'), value: stats?.restore_failed ?? 0 },
@@ -231,8 +261,12 @@ export default function Dashboard() {
       to: '/logs',
     },
     {
-      label: t('dash.tokenToday'), value: tokensTotal.toLocaleString(),
-      hint: `${t('dash.tokenHint')} ${(stats?.tokens.prompt ?? 0).toLocaleString()} · ${(stats?.tokens.completion ?? 0).toLocaleString()}`,
+      label: t('dash.tokenToday'),
+      value: tokenNum.compact,
+      fullValue: tokenNum.full,
+      isCompact: tokenNum.isCompact,
+      hint: `${t('dash.tokenHint')} ${formatTokensShort(stats?.tokens.prompt ?? 0, unitSystem)} · ${formatTokensShort(stats?.tokens.completion ?? 0, unitSystem)}`,
+      hintTitle: `${t('dash.tokenHint')} ${(stats?.tokens.prompt ?? 0).toLocaleString()} · ${(stats?.tokens.completion ?? 0).toLocaleString()}`,
       icon: Zap, num: 'text-violet-600 dark:text-violet-400',
       iconBg: 'from-violet-500/15 to-violet-500/5 text-violet-600 dark:text-violet-400',
       to: '/stats',
@@ -405,8 +439,8 @@ export default function Dashboard() {
           ))}
         </div>
       </div>
-      {/* 6 卡：2-3 列为主，宽屏(≥1536px)才一行六列，避免 1280-1440 屏拥挤 */}
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-6">
+      {/* 6 卡：2-3 列为主，配合 max-w-[1200px] 容器保持 3 列两行优雅呈现 */}
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {statCards.map((c) => {
           const interactive = !!(c.to || c.onClick)
           const card = (
@@ -432,8 +466,24 @@ export default function Dashboard() {
                     <c.icon className="h-[18px] w-[18px]" />
                   </div>
                 </div>
-                <div className={cn('mt-2.5 mb-2 text-[28px] font-bold leading-tight tabular-nums tracking-tight', c.num)}>
-                  {c.value}
+                <div
+                  className={cn('mt-2.5 mb-2 text-[28px] font-bold leading-tight tabular-nums tracking-tight truncate', c.num)}
+                  title={c.fullValue || c.value}
+                >
+                  {c.isCompact ? (
+                    <TooltipProvider delayDuration={150}>
+                      <Tooltip>
+                        <TooltipTrigger asChild className="cursor-default">
+                          <span>{c.value}</span>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          <p className="font-mono text-xs">{c.fullValue}</p>
+                        </TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
+                  ) : (
+                    c.value
+                  )}
                 </div>
                 {c.sub ? (
                   <div className="mt-auto grid grid-cols-2 gap-x-2 gap-y-0.5 border-t pt-2 text-xs text-muted-foreground" style={{ minHeight: 44 }}>
@@ -444,7 +494,7 @@ export default function Dashboard() {
                     ))}
                   </div>
                 ) : (
-                  <p className="mt-auto border-t pt-2 text-[11px] font-medium text-muted-foreground/80" style={{ minHeight: 44 }}>{c.hint}</p>
+                  <p className="mt-auto border-t pt-2 text-[11px] font-medium text-muted-foreground/80 truncate" style={{ minHeight: 44 }} title={c.hintTitle || c.hint}>{c.hint}</p>
                 )}
               </CardContent>
             </Card>
@@ -454,6 +504,78 @@ export default function Dashboard() {
             : <div key={c.label} className="h-full">{card}</div>
         })}
       </div>
+
+      {/* 前缀保真度：MASK 事件三个诊断字段（body_rewritten / first_diff_byte /
+          suffix_reused）的聚合，用来回答「上游缓存命中率掉了，是我们改了请求
+          字节还是上游自己 miss」。刻意**不塞进上面那个 6 卡网格**——它的列数
+          （2/3/6）是按 6 张卡调过的，第 7 张在 ≥1536px 宽屏上会单独落一行。
+          第一列分母是 masks（全部样本）；第二、三列分母是 rewritten（改写过的
+          请求）——`suffix_reused` 与 `first_diff_byte` 都只在回写分支才有意义，
+          零改写透传的请求没签发票据、也没有差异位，用 masks 当分母会把指标
+          稀释成「复用机制没生效」（实测 100 次请求 10 次命中、8 次复用，
+          用 masks 显示 8%，真实是 80%）。
+          `prefix` 为 null 时按 mask_events 区分两种「没有数据」：区间内压根没
+          请求 vs 有请求但都早于该统计上线（升级当天就是后者，不能说成「脱敏
+          没生效」）。 */}
+      <Card className="border bg-card shadow-[var(--shadow-card)]">
+        <CardContent className="p-5">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-sky-500/15 to-sky-500/5 text-sky-600 dark:text-sky-400">
+              <Gauge className="h-[18px] w-[18px]" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="text-[13px] font-semibold leading-5 text-foreground/80">{t('dash.prefixFidelity')}</div>
+              <div className="text-[11px] font-medium text-muted-foreground/80">{t('dash.prefixHint')}</div>
+            </div>
+            {prefix && (
+              <span className="shrink-0 rounded-full border border-sky-500/30 bg-sky-500/10 px-2.5 py-0.5 text-[11px] font-medium text-sky-600 dark:text-sky-400">
+                {tf('dash.prefixSamples', { n: prefix.masks.toLocaleString() })}
+              </span>
+            )}
+          </div>
+          <div className="mt-4 grid grid-cols-3 gap-3 border-t pt-3">
+            <div className="min-w-0">
+              <div className="truncate text-[11px] font-medium text-muted-foreground">{t('dash.prefixClean')}</div>
+              <div className="text-[20px] font-bold leading-tight tabular-nums text-sky-600 dark:text-sky-400">
+                {prefix ? `${(prefix.clean_rate * 100).toFixed(1)}%` : '—'}
+              </div>
+              <div className="truncate text-[11px] text-muted-foreground/80">
+                {prefix
+                  ? `${prefix.clean.toLocaleString()} / ${prefix.masks.toLocaleString()}`
+                  : (stats?.mask_events ?? 0) > 0
+                    ? t('dash.prefixNoSamples')
+                    : t('dash.prefixNoData')}
+              </div>
+            </div>
+            <div className="min-w-0">
+              <div className="truncate text-[11px] font-medium text-muted-foreground">{t('dash.prefixReuse')}</div>
+              <div className="text-[20px] font-bold leading-tight tabular-nums">
+                {prefix?.reuse_rate != null ? `${(prefix.reuse_rate * 100).toFixed(1)}%` : '—'}
+              </div>
+              <div className="truncate text-[11px] text-muted-foreground/80" title={t('dash.prefixReuseHint')}>
+                {prefix
+                  ? prefix.rewritten > 0
+                    ? `${prefix.suffix_reused.toLocaleString()} / ${prefix.rewritten.toLocaleString()}`
+                    : t('dash.prefixNoPlaceholder')
+                  : '—'}
+              </div>
+            </div>
+            <div className="min-w-0">
+              <div className="truncate text-[11px] font-medium text-muted-foreground">{t('dash.prefixDiff')}</div>
+              <div className="text-[20px] font-bold leading-tight tabular-nums">
+                {prefix?.avg_first_diff != null ? prefix.avg_first_diff.toFixed(1) : '—'}
+              </div>
+              <div className="truncate text-[11px] text-muted-foreground/80" title={t('dash.prefixDiffHint')}>
+                {prefix
+                  ? prefix.rewritten > 0
+                    ? `${prefix.diff_samples.toLocaleString()} / ${prefix.rewritten.toLocaleString()}`
+                    : t('dash.prefixNoRewrite')
+                  : '—'}
+              </div>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
 
 
 {/* 核心安全防护策略 */}
@@ -725,15 +847,27 @@ export default function Dashboard() {
           <div className="space-y-2">
             {(stats?.top_words ?? []).slice(0, 20).map((w) => {
               const cred = CRED_LABELS.has(w.label)
-              const display = cred || !maskedPlain ? maskWord(w.word) : w.word
+              const display = cred || !maskedPlain ? maskWord(w.word, cred) : w.word
+              const searchTerm = cred ? w.label : (w.word.startsWith('<') ? w.label : w.word)
               return (
-                <div key={`${w.label}:${w.word}`} className="flex items-center justify-between gap-3 rounded-lg border bg-muted/30 px-3 py-2 text-sm">
+                <div
+                  key={`${w.label}:${w.word}`}
+                  onClick={() => {
+                    setMaskedOpen(false)
+                    navigate(`/logs?q=${encodeURIComponent(searchTerm)}&fulltext=1`)
+                  }}
+                  className="group flex cursor-pointer items-center justify-between gap-3 rounded-lg border bg-muted/30 px-3 py-2 text-sm transition-colors hover:border-primary/40 hover:bg-muted/60"
+                  title={t('dash.clickToFilterLogs')}
+                >
                   <div className="flex min-w-0 items-center gap-2">
                     <span className="shrink-0 rounded border px-1.5 py-0.5 text-[10px] text-muted-foreground">{w.label}</span>
                     <span className="truncate font-mono text-xs" title={display}>{display}</span>
                     {cred && <LockKeyhole className="h-3 w-3 shrink-0 text-muted-foreground" aria-label={t('stats.credHint')} />}
                   </div>
-                  <span className="shrink-0 tabular-nums text-xs text-muted-foreground">×{w.count.toLocaleString()}</span>
+                  <div className="flex items-center gap-2">
+                    <span className="shrink-0 tabular-nums text-xs text-muted-foreground">×{w.count.toLocaleString()}</span>
+                    <ArrowRight className="h-3.5 w-3.5 text-muted-foreground/40 opacity-0 transition-opacity group-hover:opacity-100" />
+                  </div>
                 </div>
               )
             })}
@@ -759,14 +893,26 @@ export default function Dashboard() {
           <div className="space-y-2">
             {(restoreItems?.items ?? []).map((it, i) => {
               const display = it.cred || !restoredPlain ? it.preview : (it.original ?? it.preview)
+              const searchTerm = it.cred ? it.label : (it.original ?? it.preview)
               return (
-                <div key={it.label + i} className="flex items-center justify-between gap-3 rounded-lg border bg-muted/30 px-3 py-2 text-sm">
+                <div
+                  key={it.label + i}
+                  onClick={() => {
+                    setRestoredOpen(false)
+                    navigate(`/logs?q=${encodeURIComponent(searchTerm)}&fulltext=1`)
+                  }}
+                  className="group flex cursor-pointer items-center justify-between gap-3 rounded-lg border bg-muted/30 px-3 py-2 text-sm transition-colors hover:border-primary/40 hover:bg-muted/60"
+                  title={t('dash.clickToFilterLogs')}
+                >
                   <div className="flex min-w-0 items-center gap-2">
                     <span className="shrink-0 rounded border px-1.5 py-0.5 text-[10px] text-muted-foreground">{it.label}</span>
                     <span className="truncate font-mono text-xs" title={display}>{display}</span>
                     {it.cred && <LockKeyhole className="h-3 w-3 shrink-0 text-muted-foreground" aria-label={t('stats.credHint')} />}
                   </div>
-                  <span className="shrink-0 tabular-nums text-xs text-muted-foreground">×{it.events}</span>
+                  <div className="flex items-center gap-2">
+                    <span className="shrink-0 tabular-nums text-xs text-muted-foreground">×{it.events}</span>
+                    <ArrowRight className="h-3.5 w-3.5 text-muted-foreground/40 opacity-0 transition-opacity group-hover:opacity-100" />
+                  </div>
                 </div>
               )
             })}

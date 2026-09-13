@@ -15,7 +15,7 @@ Data Maskit 控制面板 - 本地 Flask 服务
 # 本程序基于「希望有用」的目的分发，但不附带任何担保；亦无对适销性或特定用途
 # 适用性的默示担保。详见 GNU Affero 通用公共许可证。
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
-__version__ = '0.2.9'
+__version__ = '0.2.10'
 import json
 import copy
 import hashlib
@@ -5312,7 +5312,7 @@ def serve_spa(path):
 def open_browser():
     import time as _t
     _t.sleep(1.2)
-    webbrowser.open(f"http://127.0.0.1:{PANEL_PORT}")
+    webbrowser.open(f"http://127.0.0.1:{PANEL_PORT}/#token={API_TOKEN}")
 
 
 # ========== 开机自启 ==========
