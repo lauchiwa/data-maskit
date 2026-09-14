@@ -15,7 +15,7 @@ Data Maskit 控制面板 - 本地 Flask 服务
 # 本程序基于「希望有用」的目的分发，但不附带任何担保；亦无对适销性或特定用途
 # 适用性的默示担保。详见 GNU Affero 通用公共许可证。
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
-__version__ = '0.2.10'
+__version__ = '0.2.11'
 import json
 import copy
 import hashlib
@@ -3239,6 +3239,9 @@ def normalize_config(raw, warnings=None):
     egress = {"enabled": egress_enabled, "url": egress_url}
     if egress_enabled and not any(u.get("use_proxy") for u in ups):
         warn.append("出口代理已启用，但没有任何客户端勾选「走代理」，当前不会生效")
+    proxy_ups = [u.get("name") for u in ups if u.get("use_proxy")]
+    if proxy_ups and not egress_enabled:
+        warn.append(f"客户端「{', '.join(proxy_ups)}」勾选了「走代理」，但全局出口代理尚未启用或未填地址，将以直连方式转发")
 
     return {
         "capture_mode": capture_mode,
@@ -5014,6 +5017,7 @@ def api_upstream_test():
     }
     if mode == "port" or not (running and listening):
         if running and listening:
+            result["message"] = "本地端口监听正常（未连接上游）"
             tips.append("本地端口正常。可填 API Key 后点「拉模型」或「一键聊天」做完整测试")
         return jsonify(result)
 

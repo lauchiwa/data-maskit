@@ -99,3 +99,11 @@ export function formatTokensShort(n: number, unitSystem: 'cjk' | 'si' = 'cjk'): 
   if (n >= 1e6) return `${trim(n / 1e6, 2)}M`
   return `${trim(n / 1000, 1)}k`
 }
+
+/** 字节紧凑格式化：147624.4 -> 144.2 KB */
+export function formatBytes(bytes: number | null | undefined): string {
+  if (bytes == null || isNaN(bytes)) return '—'
+  if (bytes < 1024) return `${bytes.toFixed(0)} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
+}
