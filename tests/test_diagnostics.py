@@ -11,6 +11,7 @@ export 只需保证不含还原正文，诊断包还要保证日志、崩溃现�
 端口查询一律 mock：真实 netstat 慢且结果不确定，且本机可能正跑着代理。
 """
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -163,6 +164,16 @@ class DiagnosticsPayloadTests(unittest.TestCase):
         """诊断包即便打过码也含端口/配置/错误信息，不能对无令牌请求开放。"""
         r = panel.app.test_client().get("/api/diagnostics")
         self.assertEqual(r.status_code, 403)
+
+
+def tearDownModule():
+    """删掉 _TMP。
+
+    `mkdtemp` 在 import 期就建好目录，却没有对应的清理，于是每跑一次测试就在
+    %LOCALAPPDATA%\\Temp 下永久留一个 maskit-diag-test-xxxxxxxx（实测堆了 7 个）。
+    单个目录很小，但它落在用户真实的 Temp 里、且永不回收，属于测试污染开发机。
+    """
+    shutil.rmtree(_TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":
