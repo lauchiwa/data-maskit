@@ -25,7 +25,7 @@ function fmtMB(n: number): string {
   return (n / 1024 / 1024).toFixed(1) + ' MB'
 }
 
-export function AboutUpdateCard({ version, dataRoot, running, autoInstall }: { version?: string; dataRoot?: string; running?: boolean; autoInstall?: boolean }) {
+export function AboutUpdateCard({ version, upstreamBase, dataRoot, running, autoInstall }: { version?: string; upstreamBase?: string; dataRoot?: string; running?: boolean; autoInstall?: boolean }) {
   const { t, tf } = useI18n()
   const [checking, setChecking] = useState(false)
   const [result, setResult] = useState<UpdateCheck | null>(null)
@@ -112,6 +112,15 @@ export function AboutUpdateCard({ version, dataRoot, running, autoInstall }: { v
           <span className="text-muted-foreground">{t('about.currentVersion')}</span>
           <code className="font-mono text-foreground">v{version || '—'}</code>
         </div>
+
+        {/* 上游血缘：本分支版本号走自己的 0.100.x 段，与上游 0.2.x 脉络无关，
+            所以必需在界面上直接看得到「基于哪一版上游」，否则无法判断同步进度。 */}
+        {upstreamBase && (
+          <div className="flex items-center justify-between text-xs">
+            <span className="text-muted-foreground" title={t('about.upstreamBaseHint')}>{t('about.upstreamBase')}</span>
+            <code className="font-mono text-muted-foreground">v{upstreamBase}</code>
+          </div>
+        )}
 
         {installing ? (
           <div className="space-y-2 rounded-lg border bg-muted/30 p-3">

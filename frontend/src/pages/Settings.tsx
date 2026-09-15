@@ -2329,7 +2329,7 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
         {!embeddedTab && (
         <TabsContent value="about" className="space-y-4">
           {/* 产品信息 + 在线更新（合并为一个卡片） */}
-          <AboutUpdateCard version={status?.version} dataRoot={cfg?.data_root} running={status?.proxy_running} autoInstall={autoInstallUpdate} />
+          <AboutUpdateCard version={status?.version} upstreamBase={status?.upstream_base} dataRoot={cfg?.data_root} running={status?.proxy_running} autoInstall={autoInstallUpdate} />
 
           {/* 更新日志 */}
           <Card className="border bg-card">

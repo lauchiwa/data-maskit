@@ -165,3 +165,70 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 - 打包产物位于：
   - Windows: `src-tauri\target\release\bundle\nsis\Maskit_<版本>_x64-setup.exe`；
   - macOS: `src-tauri/target/release/bundle/dmg/Maskit_<版本>_aarch64.dmg`。
+
+---
+
+## 6. 上游同步与版本血缘（本二开分支专属）
+
+本分支（`chiwalau/data-maskit`）从上游 `xiaYuTian11/maskit` 派生，长期需要持续合并上游更新。
+
+### 版本号方案
+
+**本分支版本号走独立的 `0.100.x` 段，与上游 `0.2.x` 无任何数值关系。**
+
+- `__version__`（`engine/panel.py`，唯一真相来源）= **本分支自己**的发布序号。`minor` 记功能批次，`patch` 记修复；
+- `__upstream_base__`（同文件，紧跟 `__version__`）= 本分支所基于的**上游版本**，只读元数据，不参与任何版本比较。
+
+为什么不把上游版本号编进 `__version__`：`X.Y.Z` 只有三个槽位，塞不进两套计数器。四段式 `0.2.12.1` 被 Cargo 硬拒（`unexpected character '.' after patch version number`），`0.2.13-fork.1` 按 semver 规范**优先级低于** `0.2.13`（会被判定比上游旧），`0.2.13+fork.1` 的 build metadata 在版本比较中被忽略。选 `0.100.x` 段的实际收益：上游短期到不了 `minor=100`，所以上游发任何版本都不可能在更新检查里盖过本分支构建。
+
+### 血缘在哪里看
+
+| 位置 | 看到什么 |
+|---|---|
+| 设置 → 关于卡片 | 「当前版本 v0.100.x」下方一行「上游基线 v0.2.12」 |
+| `GET /api/status` | `version` + `upstream_base` 两个字段 |
+| 诊断导出 | `app.version` + `app.upstream_base` |
+| `python scripts/check-upstream-sync.py` | 完整同步状态 + **校验声明真实性** |
+| `CHANGELOG.md` | 每个版本章节开头注明「基于上游 vX.Y.Z」 |
+
+`scripts/check-upstream-sync.py` 是唯一会**校验**而非仅展示的入口：它验证 `__upstream_base__` 声明的 tag 确实是 HEAD 的祖先。声明过期（合并了上游却忘改这一行，或写了个没合进来的版本）会导致排查问题时照着错误的上游代码找原因，所以这种情况退出码为 1。它还会预报下次合并的冲突文件（两边都改过的那些）。
+
+该脚本**不进** `scripts/verify-all.py` 门禁：它依赖 `upstream` remote 及其 tag，而 CI 的 checkout 只有 `origin`，加进门禁必然失败。这是本地维护工具。
+
+### 同步上游的标准流程
+
+```powershell
+# 0. upstream remote（用 SSH：实测 HTTPS 直连会被 Connection reset，必须挂系统代理）
+git remote add upstream git@github.com:xiaYuTian11/maskit.git
+
+# 1. 看清差距（--fetch 会先拉一次上游）
+python scripts/check-upstream-sync.py --fetch
+
+# 2. 在分支上合并，不要直接在 master 上合
+git switch -c merge/<上游版本>
+git merge upstream/master
+
+# 3. 解冲突。版本文件（panel.py / tauri.conf.json / Cargo.toml / Cargo.lock /
+#    package.json / package-lock.json）的版本号一律保留本分支的值（ours）——
+#    绝不能被上游的 0.2.x 覆盖回去，否则更新检查会判定「有新版本」并把用户
+#    降级到上游构建。
+
+# 4. 改 __upstream_base__ 为刚合进来的上游版本，然后验证声明真实性
+python scripts/check-upstream-sync.py
+
+# 5. 全量门禁
+python scripts/verify-all.py --python "<3.13 解释器>"
+
+# 6. 合回 master，按本分支自己的序号发版（patch+1 或 minor+1）
+```
+
+### 合并时必须守住的本分支改动
+
+上游每次同步都可能覆盖掉这些，合完务必逐条确认：
+
+- `src-tauri/tauri.conf.json` 的 `plugins.updater.endpoints` 指向 `chiwalau/data-maskit`，`pubkey` 是本分支自己的密钥（Key ID `8FDEF509963AB482`）。**被上游值覆盖 = 本分支构建会被上游发布覆盖掉**；
+- `engine/panel.py` 的 `__upstream_base__` 及其在 `/api/status`、诊断导出里的两处透出；
+- `frontend/src/components/settings/AboutUpdateCard.tsx` 的「上游基线」行与 `about.upstreamBase*` 两个 i18n key；
+- `scripts/generate-latest-json.py` 的 `--repo` 默认值（空串 → 回退环境变量 → 兜底本分支仓库）。
+
+更新签名私钥在 `~/.tauri/maskit-updater.key`，**永不入库**。丢失后已安装的客户端只认对应公钥，再也无法推送任何更新，只能让用户手工重装 —— 必须在仓库外另做备份。

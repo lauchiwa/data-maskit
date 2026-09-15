@@ -37,6 +37,11 @@ export interface EgressProxy {
 
 export interface ProxyStatus {
   version: string
+  /**
+   * 本二开分支所基于的上游版本（只读元数据，不参与版本比较）。
+   * version 是本分支自己的发布序号（0.100.x 段），两者独立演进。
+   */
+  upstream_base?: string
   panel_pid: number
   proxy_running: boolean
   proxy_starting?: boolean
