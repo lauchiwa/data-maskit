@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Maskit",
   "mainBinaryName": "Maskit",
-  "version": "0.2.12",
+  "version": "0.100.0",
   "identifier": "com.maskit.app",
   "build": {
     "frontendDist": "../frontend/dist",
@@ -61,9 +61,9 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI1NUNGMDc5OTdFQkIwQTIKUldTaXNPdVhlZkJjdGFsK2h5d09rcTZaaXRQL1I4V09XdVVLU0tPZDNzRGh2cGV5cUZ4c2hLcDkK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhGREVGNTA5OTYzQUI0ODIKUldTQ3REcVdDZlhlankzU0hlN1dVYnNINE00NEpBNkFkME5udXczUmpOWHV5YTBDc0o3dzQxYzgK",
       "endpoints": [
-        "https://github.com/xiaYuTian11/maskit/releases/latest/download/latest.json"
+        "https://github.com/chiwalau/data-maskit/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"

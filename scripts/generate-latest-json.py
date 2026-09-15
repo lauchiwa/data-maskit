@@ -20,7 +20,10 @@ def main():
     parser = argparse.ArgumentParser(description="生成 latest.json 更新元数据")
     parser.add_argument("dir", help="包含安装包及 .sig 文件的目录")
     parser.add_argument("--tag", default="", help="版本标签（如 v0.2.2，默认从环境变量或文件名解析）")
-    parser.add_argument("--repo", default="xiaYuTian11/maskit", help="GitHub 仓库名（owner/repo）")
+    # 默认留空，让 GITHUB_REPOSITORY 环境变量（CI 里自动注入）能真正生效；
+    # 原先默认值直接写死仓库名，args.repo 恒为真 → 下面的环境变量兜底是死代码，
+    # 本地打包出的 latest.json 会指向别人仓库的下载地址。
+    parser.add_argument("--repo", default="", help="GitHub 仓库名（owner/repo）")
     args = parser.parse_args()
 
     root = Path(args.dir).resolve()
@@ -28,7 +31,7 @@ def main():
         print(f"Directory not found: {root}", file=sys.stderr)
         return 1
 
-    repo = args.repo or os.environ.get("GITHUB_REPOSITORY", "xiaYuTian11/maskit")
+    repo = args.repo or os.environ.get("GITHUB_REPOSITORY", "chiwalau/data-maskit")
 
     # 1. 查找签名文件
     win_sigs = list(root.glob("**/*.exe.sig"))

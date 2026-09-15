@@ -15,7 +15,12 @@ Data Maskit 控制面板 - 本地 Flask 服务
 # 本程序基于「希望有用」的目的分发，但不附带任何担保；亦无对适销性或特定用途
 # 适用性的默示担保。详见 GNU Affero 通用公共许可证。
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
-__version__ = '0.2.12'
+__version__ = '0.100.0'
+# 本二开分支所基于的上游 Data Maskit 版本（上游仓库 xiaYuTian11/maskit）。
+# 与 __version__ 分开维护：__version__ 是**本分支自己**的发布序号（0.100.x 段，
+# 与上游 0.2.x 永不相撞，更新检查按段比较恒判定为更新），这里记录血缘基线。
+# 每次合并上游 tag 后同步改这一行；只读元数据，不参与任何版本比较。
+__upstream_base__ = '0.2.12'
 import json
 import codecs
 import copy
@@ -4355,6 +4360,7 @@ def api_status():
         })
     return jsonify({
         "version": __version__,
+        "upstream_base": __upstream_base__,
         "panel_pid": os.getpid(),
         "proxy_running": running,
         "proxy_starting": bool(state.get("proxy_starting")),
@@ -6069,6 +6075,7 @@ def _diagnostics_payload(error_limit=60):
 
     out["app"] = {
         "version": __version__,
+        "upstream_base": __upstream_base__,
         "platform": sys.platform,
         "os": platform.platform(),
         "arch": platform.machine(),

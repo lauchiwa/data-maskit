@@ -2,6 +2,21 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.100.0] - 2026-09-15
+
+基于上游 v0.2.12（`xiaYuTian11/maskit`）。本分支自此启用独立版本段 `0.100.x`，与上游 `0.2.x` 永不相撞。
+*Based on upstream v0.2.12 (`xiaYuTian11/maskit`). This fork now uses its own version range `0.100.x`, which can never collide with upstream's `0.2.x`.*
+
+### 变更 / Changed
+- 自动更新端点改为本分支仓库（`chiwalau/data-maskit`），并换用本分支自有的更新签名密钥对；上游发布不再可能覆盖本分支构建。
+  *Updater endpoint switched to this fork's repository (`chiwalau/data-maskit`) with its own update-signing keypair; upstream releases can no longer overwrite this fork's builds.*
+- 版本号改为本分支独立序号：`minor` 记录本分支功能批次，`patch` 记录本分支修复，均与上游脱钩。
+  *Version numbers are now owned by this fork: `minor` tracks this fork's feature batches, `patch` its fixes, both decoupled from upstream.*
+
+### 新增 / Added
+- 上游血缘基线元数据 `__upstream_base__`，经 `/api/status` 与诊断导出暴露（字段 `upstream_base`），用于确认运行中的实例基于哪个上游版本；只读，不参与版本比较。
+  *Upstream lineage baseline `__upstream_base__`, exposed via `/api/status` and diagnostics export (field `upstream_base`), to identify which upstream version a running instance is based on; read-only, never used in version comparison.*
+
 ## [0.2.12] - 2026-09-15
 
 ### 新增 / Added
