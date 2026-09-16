@@ -143,12 +143,29 @@ def main():
     print()
     print(f"上游最新 tag                    {latest or '<unknown>'}")
     print(f"本分支独有提交                  {ahead}")
-    print(f"上游领先提交（待合并）          {behind}")
+    print(f"上游 master 领先提交            {behind}")
 
-    if latest and declared_base and semver_key(latest) > semver_key(f"v{declared_base}"):
+    # 同步策略：只跟上游的「发布版」，不跟未发版的散装提交。
+    # 上游 master 平时就领先几个提交（他们边开发边提），那不构成待办；
+    # 只有当他们打出比本分支基线更新的 tag，才真正需要合。
+    should_sync = bool(
+        latest and declared_base and semver_key(latest) > semver_key(f"v{declared_base}")
+    )
+
+    if should_sync:
         warnings.append(f"上游已发布 {latest}，本分支基线仍是 v{declared_base}：可以同步了")
 
-    if behind not in ("?", "0"):
+    if behind not in ("?", "0") and not should_sync:
+        print()
+        print(f"上游 master 有 {behind} 个未发版提交 —— 按策略不合，仅供参考：")
+        code, log = git("log", "--oneline", f"HEAD..{UPSTREAM_REMOTE}/master")
+        if code == 0 and log:
+            for line in log.splitlines():
+                print(f"  {line}")
+        print()
+        print(f"等上游打出比 v{declared_base} 更新的 tag 再同步。")
+
+    if behind not in ("?", "0") and should_sync:
         print()
         print(f"待合并的上游提交（{behind} 条）：")
         code, log = git("log", "--oneline", f"HEAD..{UPSTREAM_REMOTE}/master")

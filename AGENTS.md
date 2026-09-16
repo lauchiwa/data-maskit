@@ -195,6 +195,26 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 
 该脚本**不进** `scripts/verify-all.py` 门禁：它依赖 `upstream` remote 及其 tag，而 CI 的 checkout 只有 `origin`，加进门禁必然失败。这是本地维护工具。
 
+### 同步时机：只跟上游的「发布版」
+
+**只有当上游打出比 `__upstream_base__` 更新的 tag 时才合。** 上游 `master` 平时领先几个未发版提交是常态，那些散装提交不合 —— 它们没经过上游自己的发版验证，合进来等于替上游做集成测试，而本分支的 `model_rules` 等改动跟它们叠在一起会放大冲突面。
+
+`scripts/check-upstream-sync.py` 按这条策略区分两种输出：上游只是 `master` 领先时标注「按策略不合，仅供参考」；只有出现更新的 tag 才提示「可以同步了」。两种情况退出码都是 0，唯一报错的情形仍是血缘声明造假。
+
+### 分叉面控制
+
+本分支的原则是**尽量贴近上游**，二开只做必要的。新增改动前先掂量它会不会落进冲突集 —— 判断办法：
+
+```powershell
+# 两边都相对合并基线改过的文件 = 真正的冲突集
+$mb = git merge-base master upstream/master
+git diff --name-only $mb master | Sort-Object > ours.txt
+git diff --name-only $mb upstream/master | Sort-Object > theirs.txt
+# 取交集
+```
+
+新建文件不会冲突，改上游高频文件（`engine/transparent.py`、`frontend/src/lib/i18n.tsx`、`frontend/src/pages/Settings.tsx`、`engine/panel.py`）必然反复冲突。能放进新文件的就别往上游文件里塞。
+
 ### 同步上游的标准流程
 
 ```powershell
@@ -226,9 +246,25 @@ python scripts/verify-all.py --python "<3.13 解释器>"
 
 上游每次同步都可能覆盖掉这些，合完务必逐条确认：
 
-- `src-tauri/tauri.conf.json` 的 `plugins.updater.endpoints` 指向 `chiwalau/data-maskit`，`pubkey` 是本分支自己的密钥（Key ID `8FDEF509963AB482`）。**被上游值覆盖 = 本分支构建会被上游发布覆盖掉**；
+- `src-tauri/tauri.conf.json` 的 `plugins.updater.endpoints` 与 `pubkey`（本分支自己的密钥，Key ID `8FDEF509963AB482`）。**被上游值覆盖 = 本分支构建会被上游发布覆盖掉**。注意 `endpoints` 当前值是历史遗留的失效地址（详见下节）；
 - `engine/panel.py` 的 `__upstream_base__` 及其在 `/api/status`、诊断导出里的两处透出；
 - `frontend/src/components/settings/AboutUpdateCard.tsx` 的「上游基线」行与 `about.upstreamBase*` 两个 i18n key；
 - `scripts/generate-latest-json.py` 的 `--repo` 默认值（空串 → 回退环境变量 → 兜底本分支仓库）。
 
 更新签名私钥在 `~/.tauri/maskit-updater.key`，**永不入库**。丢失后已安装的客户端只认对应公钥，再也无法推送任何更新，只能让用户手工重装 —— 必须在仓库外另做备份。
+
+### 代码托管与发布现状
+
+| remote | 地址 | 用途 |
+|---|---|---|
+| `origin` | `gitee.com:chiwalau/data-maskit` | 本分支代码，**私有** |
+| `upstream` | `github.com:xiaYuTian11/maskit` | 上游，公开 |
+
+`origin` 在 Gitee 而非 GitHub，由此有两条约束：
+
+- **`gh` CLI 对 origin 无效**（GitHub 专用），发 Release 只能走 Gitee 网页或 Gitee API v5；
+- **推 tag 到 Gitee 不触发任何构建**。`.github/workflows/` 是 GitHub Actions 专用，Gitee 不读；仓库内无 Gitee Go 的 `.workflow/` 配置。
+
+`plugins.updater.endpoints` 目前指向 `github.com/chiwalau/data-maskit`，**该仓库在 GitHub 上不存在**（匿名 404）。已安装客户端启动 8 秒后会静默检查一次更新并静默失败 —— silent 模式不弹窗，不影响脱敏功能。自动更新链路因此**当前不可用**，分发靠手工发安装包。
+
+若日后要启用自动更新，需要一个**公开**的 HTTP 端点托管 `latest.json` 与安装包（Gitee 私有仓库的附件不允许匿名下载），改端点后必须重新打包 —— 端点是编译进二进制的，改配置对已装客户端无效。伪造 `latest.json` 无法投毒：下载的包要过 `pubkey` 的 Ed25519 校验，私钥不在仓库里。
