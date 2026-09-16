@@ -170,7 +170,7 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 
 ## 6. 上游同步与版本血缘（本二开分支专属）
 
-本分支（`chiwalau/data-maskit`）从上游 `xiaYuTian11/maskit` 派生，长期需要持续合并上游更新。
+本分支（`lauchiwa/data-maskit`）从上游 `xiaYuTian11/maskit` 派生，长期需要持续合并上游更新。
 
 ### 版本号方案
 
@@ -257,14 +257,29 @@ python scripts/verify-all.py --python "<3.13 解释器>"
 
 | remote | 地址 | 用途 |
 |---|---|---|
-| `origin` | `gitee.com:chiwalau/data-maskit` | 本分支代码，**私有** |
+| `origin` | `github.com:lauchiwa/data-maskit` | 本分支代码，**私有** |
 | `upstream` | `github.com:xiaYuTian11/maskit` | 上游，公开 |
 
-`origin` 在 Gitee 而非 GitHub，由此有两条约束：
+（历史：曾用 Gitee 私有仓库作 `origin`，已弃用；曾有一个 fork 上游的公开仓库 `lauchiwa/maskit`，已删除。两者均不再引用。）
 
-- **`gh` CLI 对 origin 无效**（GitHub 专用），发 Release 只能走 Gitee 网页或 Gitee API v5；
-- **推 tag 到 Gitee 不触发任何构建**。`.github/workflows/` 是 GitHub Actions 专用，Gitee 不读；仓库内无 Gitee Go 的 `.workflow/` 配置。
+#### origin 在 GitHub 后，CI 会真的跑
 
-`plugins.updater.endpoints` 目前指向 `github.com/chiwalau/data-maskit`，**该仓库在 GitHub 上不存在**（匿名 404）。已安装客户端启动 8 秒后会静默检查一次更新并静默失败 —— silent 模式不弹窗，不影响脱敏功能。自动更新链路因此**当前不可用**，分发靠手工发安装包。
+这是从 Gitee 迁回 GitHub 最实质的行为变化：`.github/workflows/` 之前在 Gitee 上是死文件，现在会被真实触发。
 
-若日后要启用自动更新，需要一个**公开**的 HTTP 端点托管 `latest.json` 与安装包（Gitee 私有仓库的附件不允许匿名下载），改端点后必须重新打包 —— 端点是编译进二进制的，改配置对已装客户端无效。伪造 `latest.json` 无法投毒：下载的包要过 `pubkey` 的 Ed25519 校验，私钥不在仓库里。
+| workflow | 触发 | 作业 |
+|---|---|---|
+| `ci.yml` | push / PR 到 `master`、`main` | 5 个 job：python、frontend、version（ubuntu）+ rust（windows）+ rust-macos（macos） |
+| `release.yml` | push `v*` tag、手动 | 打包 windows-nsis + macos-arm64，timeout 120 分钟 |
+| `test-macos-build.yml` | 仅手动 | — |
+
+**私有仓库的 Actions 分钟数计费，且按平台倍率扣：**Linux 1×、Windows 2×、**macOS 10×**。每推一次 `master` 就跑全部 5 个 job，其中 macOS 那个按 40 分钟超时上限算相当于扣 400 分钟额度。频繁推送前先算额度，或在仓库设置里禁用不需要的 job。
+
+**推 tag 会触发 `release.yml`。** 它需要两个 secret：`MASKIT_UPDATER_PRIVATE_KEY` 与 `MASKIT_UPDATER_PRIVATE_KEY_PASSWORD`。**未配置就推 tag 的后果**：打出未签名（无 `.sig`）的安装包并留下草稿 Release，而本地那份已验签的产物可能被覆盖。要么先在 Settings → Secrets 配好密钥，要么用 `gh release create` 发本地产物（不推 tag，不触发 CI）。
+
+#### 自动更新仍不可用
+
+`plugins.updater.endpoints` 已指向 `github.com/lauchiwa/data-maskit`（即 `origin`），但**仓库是私有的，`tauri-plugin-updater` 匿名拉 `latest.json` 必定 404**。已安装客户端启动 8 秒后静默检查一次并静默失败 —— silent 模式不弹窗，不影响脱敏功能。分发靠手工发安装包。
+
+与之前不同的是失败原因：旧端点指向一个**不存在**的仓库，现在指向一个**存在但私有**的仓库。行为上都是 404，但现在这个地址归你控制 —— 不再存在外人注册同名仓库、向你的客户端投馀 `latest.json` 的可能。（即便投也装不上：包要过 `pubkey` 的 Ed25519 校验，私钥不在仓库里。）
+
+要真正启用自动更新，需要一个**允许匿名下载**的端点托管 `latest.json` 与安装包（代价是产物公开，但代码可以不公开）。改端点后**必须重新打包**：端点是编译进二进制的，改配置对已装客户端无效。

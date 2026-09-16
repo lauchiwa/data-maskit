@@ -8,8 +8,8 @@
 *Based on upstream v0.2.12 (`xiaYuTian11/maskit`). This fork now uses its own version range `0.100.x`, which can never collide with upstream's `0.2.x`.*
 
 ### 变更 / Changed
-- 自动更新端点改为本分支仓库（`chiwalau/data-maskit`），并换用本分支自有的更新签名密钥对；上游发布不再可能覆盖本分支构建。
-  *Updater endpoint switched to this fork's repository (`chiwalau/data-maskit`) with its own update-signing keypair; upstream releases can no longer overwrite this fork's builds.*
+- 自动更新端点改为本分支仓库（`lauchiwa/data-maskit`），并换用本分支自有的更新签名密钥对；上游发布不再可能覆盖本分支构建。
+  *Updater endpoint switched to this fork's repository (`lauchiwa/data-maskit`) with its own update-signing keypair; upstream releases can no longer overwrite this fork's builds.*
 - 版本号改为本分支独立序号：`minor` 记录本分支功能批次，`patch` 记录本分支修复，均与上游脱钩。
   *Version numbers are now owned by this fork: `minor` tracks this fork's feature batches, `patch` its fixes, both decoupled from upstream.*
 

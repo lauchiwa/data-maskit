@@ -31,7 +31,7 @@ def main():
         print(f"Directory not found: {root}", file=sys.stderr)
         return 1
 
-    repo = args.repo or os.environ.get("GITHUB_REPOSITORY", "chiwalau/data-maskit")
+    repo = args.repo or os.environ.get("GITHUB_REPOSITORY", "lauchiwa/data-maskit")
 
     # 1. 查找签名文件
     win_sigs = list(root.glob("**/*.exe.sig"))
