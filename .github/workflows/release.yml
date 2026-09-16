@@ -1,9 +1,10 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  # 只手动触发：推 tag 不再自动打包（私有仓库 Actions 计费，macOS 10x）。
+  # 各 job 仍带 `if: startsWith(github.ref, 'refs/tags/v')`，所以手动运行必须
+  # 把 ref 指到 tag 上才会真正干活：`gh workflow run release.yml -r v0.100.0`。
+  # 在分支上手动运行是有意的 no-op（发布只允许从不可变 tag 进行）。
   workflow_dispatch:
 
 # Release jobs opt into write permissions explicitly. A manual run on a branch is

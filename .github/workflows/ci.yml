@@ -1,10 +1,10 @@
 name: CI
 
 on:
-  push:
-    branches: [ master, main ]
-  pull_request:
-    branches: [ master, main ]
+  # 只手动触发：私有仓库 Actions 按平台倍率计费（Linux 1x / Windows 2x / macOS 10x），
+  # 每次 push master 都跑满 5 个 job 太贵。需要门禁时在 Actions 页点 Run workflow，
+  # 或 `gh workflow run ci.yml -r master`。本地门禁仍走 scripts/verify-all.py。
+  workflow_dispatch:
 
 # 只读权限：本工作流不引用任何 secret、不写回仓库
 permissions:
