@@ -37,7 +37,7 @@ interface Highlights {
 const LABEL_KEYS: Record<string, string> = {
   PHONE: 'share.labelPhone', EMAIL: 'share.labelEmail', IDCARD: 'share.labelIdcard',
   CARD: 'share.labelCard', IBAN: 'share.labelIban', PLATE: 'share.labelPlate', LANDLINE: 'share.labelLandline',
-  HKID: 'share.labelHkid', IP_PRIVATE: 'share.labelIp', IP_INTERNAL: 'share.labelIp', IP_PUBLIC: 'share.labelIpPublic', MAC: 'share.labelMac',
+  HKID: 'share.labelHkid', IP_PRIVATE: 'share.labelIp', IP_INTERNAL: 'share.labelIp', IP_PUBLIC: 'share.labelIpPublic', IPV6_PRIVATE: 'share.labelIp', MAC: 'share.labelMac',
   USCC: 'share.labelUscc', API_KEY: 'share.labelApiKey', ACCESS_KEY: 'share.labelAccessKey', JWT: 'share.labelJwt',
   TOKEN: 'share.labelToken', SECRET: 'share.labelSecret', PRIVATE_KEY: 'share.labelPrivateKey',
   CONNSTR: 'share.labelConnstr',
@@ -138,6 +138,9 @@ export function ShareCard() {
           <div className="overflow-hidden rounded-xl border">
             <canvas ref={canvasRef} className="block w-full" />
           </div>
+
+          {/* 口径标注：卡上主数字与标签分布只含代理链路，与首页口径不同，必须写出来 */}
+          <p className="text-xs text-muted-foreground">{t('stats.shareScopeProxyOnly')}</p>
 
           <div className="flex flex-wrap gap-2">
             <Button size="sm" className="gap-1.5" onClick={download}>

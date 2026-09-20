@@ -44,6 +44,13 @@ GATES = [
     {"group": "frontend", "name": "i18n dictionary parity", "cwd": "frontend", "argv": ["{node}", "../scripts/check-i18n.mjs"]},
     {"group": "frontend", "name": ".env import parser cases", "cwd": "frontend",
      "argv": ["{node}", "--experimental-strip-types", "../scripts/check-env-import.mjs"]},
+    # 浏览器扩展的静态门禁。放在 frontend 组（ci.yml 的 frontend job）只是因为
+    # 那个 job 已经把 node 装好了；扩展与前端是两套东西，别被分组名误导。
+    # 为什么必须有：extension/ 原先**没有任何自动化门禁**——python 单测碰不到它，
+    # e2e 要真浏览器且不进 verify-all。而它恰恰最脆（i18n 键拼错＝页面空文案、
+    # HTML 忘了引 shared.js＝整页 ReferenceError、run_at 写成蛇形＝动态注册静默失效）。
+    {"group": "frontend", "name": "Browser extension static checks", "cwd": "frontend",
+     "argv": ["{node}", "../scripts/check-extension.mjs"]},
     # ---- rust（ci.yml: rust job，工作目录 src-tauri/）----
     {"group": "rust", "name": "Cargo check", "cwd": "src-tauri", "argv": ["{cargo}", "check"]},
     {"group": "rust", "name": "Cargo test", "cwd": "src-tauri", "argv": ["{cargo}", "test", "--lib"]},
@@ -51,6 +58,9 @@ GATES = [
     {"group": "version", "name": "Version numbers agree", "cwd": ".", "argv": ["{python}", "scripts/check-version.py"]},
     {"group": "version", "name": "Public release audit", "cwd": ".", "argv": ["{python}", "scripts/audit-public-release.py"]},
     {"group": "version", "name": "Workflow YAML and shell syntax", "cwd": ".", "argv": ["{python}", "scripts/check-workflows.py"]},
+    # 扩展 zip 是 Release 上唯一的「网页版 AI」入口：ChatGPT / Claude 没有 Base URL 可配，
+    # 只能靠扩展把页面请求送进引擎。打包脚本坏掉＝用户下载不到扩展，且要等发版才暴露。
+    {"group": "version", "name": "Browser extension package builds", "cwd": ".", "argv": ["{python}", "scripts/pack-extension.py", "--check"]},
 ]
 
 GROUPS = ["python", "frontend", "rust", "version"]
@@ -75,7 +85,36 @@ def _expand(spec: str, python: str, node: str, npm: str, cargo: str) -> list[str
 
 
 def _resolve_python(explicit: str | None) -> str:
-    return explicit or os.environ.get("MASKIT_PYTHON") or sys.executable
+    if explicit:
+        return explicit
+    if os.environ.get("MASKIT_PYTHON"):
+        return os.environ["MASKIT_PYTHON"]
+
+    # 优先检查当前解释器是否具备核心运行依赖（flask + mitmproxy）
+    curr = sys.executable
+    try:
+        subprocess.run([curr, "-c", "import flask, mitmproxy"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return curr
+    except Exception:
+        pass
+
+    # Windows 平台：若当前解释器未装齐依赖（如全局默认 python 指向了未装库的 3.14），
+    # 尝试通过 py 启动器探测已安装的 Python 3.13 解释器；候选同样必须过依赖校验，
+    # 否则选到「存在但没装依赖」的解释器，门禁照样 ImportError，白换一趟。
+    if sys.platform == "win32":
+        try:
+            out = subprocess.check_output(["py", "-3.13", "-c", "import sys; print(sys.executable)"], text=True, stderr=subprocess.DEVNULL).strip()
+            if out and pathlib.Path(out).exists():
+                try:
+                    subprocess.run([out, "-c", "import flask, mitmproxy"], check=True,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return out
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    return curr
 
 
 def _resolve_node() -> str | None:

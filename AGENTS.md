@@ -78,7 +78,7 @@ Data Maskit 是一款专为大模型打造的**100% 本地隐私脱敏与还原�
 
 ## 4. 验证与测试流程
 
-代码变更后必须通过全量门禁。**唯一清单是 `scripts/verify-all.py`**（本地与 CI 共用，13 项）：
+代码变更后必须通过全量门禁。**唯一清单是 `scripts/verify-all.py`**（本地与 CI 共用，15 项）：
 
 ```powershell
 python scripts/verify-all.py                 # 全跑
@@ -109,13 +109,12 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 > 找不到时脚本会跳过 shell 校验并告警（CI 在 ubuntu 上必跑）。
 
 > **Windows 本地 Python 解释器**：裸 `python` 可能解析到未装 flask/mitmproxy 的版本
-> （实测 3.14），导致 python 组门禁直接 ImportError。跑本地门禁时显式指定 3.13
-> 解释器（已装齐 flask + mitmproxy + pyinstaller）：
+> （实测 3.14），导致 python 组门禁直接 ImportError。`verify-all.py` 已内置 `py -3.13`
+> 自动探测与适配；若需显式指定解释器可传 `--python` 参数或环境变量：
 > ```powershell
-> python scripts/verify-all.py --python "C:\Python313\python.exe"
+> python scripts/verify-all.py --python "D:\path\to\Python313\python.exe"
 > ```
-> 或先 `$env:MASKIT_PYTHON = "C:\Python313\python.exe"` 再直接跑；
-> 解释器路径变化时以 `py -3.13 -c "import sys; print(sys.executable)"` 的实际输出为准。
+> 或先 `$env:MASKIT_PYTHON = "D:\path\to\Python313\python.exe"` 再直接跑。
 
 ### 运行时文件约定
 
@@ -124,17 +123,32 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 - 测试样例中凭据形态的字符串必须一眼可见是伪造的（`sk-test-0000…`），真实上游 key 只能来自环境变量 `LLM_SHIELD_API_KEY`。
 - 新增任何对外网络请求必须默认关闭并登记到 `SECURITY.md` 出站清单。
 
+### 推送后必须回查 CI（本地绿 ≠ 推送后绿）
+
+本地门禁只覆盖「工作区里能被扫到的文件」。**实测事故（2026-09-19）**：`AUDIT-2026-09-19.md`
+带着一个 PEM 私钥头字面量被顺手纳入版本控制，本地门禁**全绿**（该文件当时还没 `git add`，
+而 `audit-public-release.py` 只扫 `git ls-files` 的输出 → 它看不见），推送后 CI 的 `version` job 直接红。
+
+- 只要动过「会被门禁扫到的文件」，**推送后必须回查 CI 结论**，不能拿本地结果收工。
+- **失败步骤名可能说谎**：`ci.yml` 的 `version` job 里那个步骤，`run` 块实际跑**两个**脚本
+  （`check-version.py` + `audit-public-release.py`），而步骤名只提了版本号一致性 ——
+  曾据此往「版本号不一致」的方向排查。看到失败先打开那个 `run` 块确认它到底跑了几件事。
+- 复核某个**已推送提交**的门禁状态，用 `git worktree add --detach <sha> <tmpdir>` 隔离复现，
+  不要切分支污染工作区；在隔离副本里可以放心地临时 `git add` 伪造凭据样本做反向验证。
+
 ---
 
 ## 5. 打包与发布规范
 
 - **发版前置授权红线（绝对铁律，严禁擅自发版）**：
-  - 任何 AI 助手（包括当前 Agent、任何子代理及后续会话）**严禁在未经用户明确书面授权确认的情况下执行任何发布动作**（包括但不限于：执行 `git push origin v*`、执行发版脚本 `release.ps1`、调用 GitHub API 创建 Release、修改线上 Release 状态）；
+  - 任何 AI 助手（包括当前 Agent、任何子代理及后续会话）**严禁在未经用户明确书面授权确认的情况下执行任何发布动作**（包括但不限于：执行 `git push origin v*`、执行发版脚本 `release.ps1`、调用 GitHub API 创建 Release、修改线上 Release状态）；
   - 发版前必须先完成所有本地全量门禁，并向用户展示最终变动清单与验证证据，**在用户明确发出“确认发版/发版吧”等指令后方可执行**。用户如果仅要求“检查/审计/看看”，本轮只输出报告，严禁顺手执行发版。
+  - **模型版本前置核验（用户约定，2026-09-19）**：严禁在自动化流水线中盲目外网拉取未知模型；当用户要求发版时，AI 助手在执行打包前应先主动确认当前依赖的本地语义模型（`ner_mini_zh`）是否存在官方权威重大升级；若有升级，向用户说明并在离线跑通 `test_benchmark_matrix.py` 评测矩阵后决定是否替换；若无升级，以本地已就绪模型直接构建【全功能一体包 (All-in-One)】。
 
 - **发版日志中英双语规范（强制）**：
   - 每次发版时，`CHANGELOG.md` 与 GitHub Release 说明必须提供**中英双语（Bilingual）对照**，方便海内外开发者理解变更细节；
   - 格式遵循 Keep a Changelog，重大修复与破坏性变动需附带中英文说明。
+  - **精简强制（用户约定，2026-09-15）**：CHANGELOG 条目、Release 说明、commit message 一律**每条中英各一行**，只说「改了什么、为什么」，不展开实现细节、不罗列边界用例——细节属于代码注释与测试，不属发版日志。同类小修合并为一条。禁止长篇大论。
   - **CHANGELOG 维护工作流**：
     - **开发期间**：把变更条目（中英成对）追加到 `## [Unreleased]` 下方，按已有「新增 / 修复 / 优化」分节；
     - **发版时**：把 `## [Unreleased]` 改名为 `## [<version>] - <日期>`（或新建一节并把条目移过去）；**不要留下空的 Unreleased**，否则下一次发版起点会乱；
@@ -168,13 +182,54 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 
 ---
 
-## 6. 上游同步与版本血缘（本二开分支专属）
+## 6. 文档与产物的入库边界
+
+判据只有一条：**后来者 clone 下这个仓库，还需不需要它？**
+需要 → **项目资产**，入库；只服务本机某次会话 → **本机工作产物**，忽略。
+
+### 6.1 入库（项目资产）
+
+| 文件 | 为什么 |
+|---|---|
+| `README.md` / `README_EN.md` | 项目门面 |
+| `CONTRIBUTING.md` / `CODE_OF_CONDUCT.md` / `SECURITY.md` | 协作与安全契约 |
+| `CHANGELOG.md` | 发版日志（release 流水线从它切出 Release body） |
+| `AGENTS.md` / `CLAUDE.md` | **工程规范基准**。`CLAUDE.md` 只有一行 `@AGENTS.md`，是跨工具入口 —— 不入库则 red line 在克隆体上整体丢失 |
+| `docs/*.md` | 长期参考文档 |
+
+> **`DESIGN-*.md` 刻意不入库（项目决策，2026-09-19）**：设计文档确实说明「代码为什么长成
+> 这样」、否决了哪些方案，但它写于改动之前，落地时几乎必然与最终实现有偏差；一旦入库就会
+> 被后来者当成现状读，反而误导。**代码注释与测试才是当前事实**，设计文档留在本机做决策留档。
+
+### 6.2 忽略（本机工作产物）
+
+已在 `.gitignore`：`ai-coding/`（开发规格 / 交接 / 代码评审 / 会话证据）、
+`.claude/`、`.codex/`、`.pi/`、`.pi-subagents/`、`.workbuddy-ai/`、`.workbuddy/`、
+`.mcp.json`、`PROMOTION_GUIDE.md`、`AUDIT-*.md`、`DESIGN-*.md`、`HANDOVER.md`。
+
+**共同特征**：内容是「某次会话当下的判断」，生命周期比代码短，会随代码演进迅速过期。
+留在仓库里只会让后来者读到已经失效的结论。
+
+### 6.3 已经踩过的坑
+
+| 文件 | 事故 |
+|---|---|
+| `AUDIT-2026-09-19.md` | 被 `d4edbf6` 误纳入跟踪，文中 PEM 头部字面量把 CI 的 `version` job 打红。已 `git rm --cached` + 忽略 `AUDIT-*.md` |
+| `HANDOVER.md` | 会话交接文件（自带「接棒 AI 必读」「最后更新: <时间戳>」等字段）。**已 `git rm --cached` 出库**并加入忽略 |
+
+> ⚠️ **`.gitignore` 对已跟踪文件无效。** 要让规则生效必须先 `git rm --cached <file>`
+> （本地文件保留），否则 `git status` 会一直显示它、下次 `git add -A` 又原样带进仓库 ——
+> `d4edbf6` 就是这么发生的。**新增忽略规则时必须同时确认该文件是否已被跟踪。**
+
+---
+
+## 7. 上游同步与版本血缘（本二开分支专属）
 
 本分支（`lauchiwa/data-maskit`）从上游 `xiaYuTian11/maskit` 派生，长期需要持续合并上游更新。
 
 ### 版本号方案
 
-**本分支版本号走独立的 `0.100.x` 段，与上游 `0.2.x` 无任何数值关系。**
+**本分支版本号走独立的 `0.100.x` 段，与上游 `0.3.x` 无任何数值关系。**
 
 - `__version__`（`engine/panel.py`，唯一真相来源）= **本分支自己**的发布序号。`minor` 记功能批次，`patch` 记修复；
 - `__upstream_base__`（同文件，紧跟 `__version__`）= 本分支所基于的**上游版本**，只读元数据，不参与任何版本比较。
@@ -185,7 +240,7 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 
 | 位置 | 看到什么 |
 |---|---|
-| 设置 → 关于卡片 | 「当前版本 v0.100.x」下方一行「上游基线 v0.2.12」 |
+| 设置 → 关于卡片 | 「当前版本 v0.100.x」下方一行「上游基线 v0.3.2」 |
 | `GET /api/status` | `version` + `upstream_base` 两个字段 |
 | 诊断导出 | `app.version` + `app.upstream_base` |
 | `python scripts/check-upstream-sync.py` | 完整同步状态 + **校验声明真实性** |
@@ -230,7 +285,7 @@ git merge upstream/master
 
 # 3. 解冲突。版本文件（panel.py / tauri.conf.json / Cargo.toml / Cargo.lock /
 #    package.json / package-lock.json）的版本号一律保留本分支的值（ours）——
-#    绝不能被上游的 0.2.x 覆盖回去，否则更新检查会判定「有新版本」并把用户
+#    绝不能被上游的 0.3.x 覆盖回去，否则更新检查会判定「有新版本」并把用户
 #    降级到上游构建。
 
 # 4. 改 __upstream_base__ 为刚合进来的上游版本，然后验证声明真实性

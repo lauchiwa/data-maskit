@@ -34,6 +34,7 @@ import {
   AlertCircle,
   Search,
   ChevronRight,
+  Globe,
 } from 'lucide-react'
 import { getConfig, saveConfig, saveBuiltinRules, patchConfig, testUpstream, openDataDir, restoreNetwork, getHealth, getConfigBackups, restoreConfigBackup, getPriceSyncStatus, syncPricesNow, getPriceList, type ConfigBackup, type ConfigPatch, type SaveConfigResponse } from '@/api/settings'
 import { runAudit, cancelAudit, getAuditJob, getAuditReport } from '@/api/audit'
@@ -75,6 +76,7 @@ import { EnvImportDialog } from '@/components/settings/EnvImportDialog'
 import { ModelRulesEditor } from '@/components/settings/ModelRulesEditor'
 
 import { BackgroundCard } from '@/components/settings/BackgroundCard'
+import { ExtBridgeCard } from '@/components/settings/ExtBridgeCard'
 
 // 内置规则分组（将 19 项规则按场景归类，降低视觉负荷与误伤风险）
 const BUILTIN_RULE_GROUPS: { key: string; labelKey: string; rules: string[] }[] = [
@@ -91,7 +93,7 @@ const BUILTIN_RULE_GROUPS: { key: string; labelKey: string; rules: string[] }[] 
   {
     key: 'network',
     labelKey: 'settings.words.groupNetwork',
-    rules: ['IP_PRIVATE', 'IP_INTERNAL', 'IP_PUBLIC', 'MAC'],
+    rules: ['IP_PRIVATE', 'IP_INTERNAL', 'IP_PUBLIC', 'IPV6_PRIVATE', 'MAC'],
   },
   {
     key: 'entities',
@@ -161,6 +163,27 @@ const CREDENTIAL_HEADER_NAMES = new Set([
 ])
 
 const isCredentialHeader = (k: string) => CREDENTIAL_HEADER_NAMES.has(k.trim().toLowerCase())
+
+/**
+ * NER 跳过原因 → 展示文案（审计 M7）。
+ *
+ * 键名必须与 `engine/ner_engine.py` 的 `_warn_once(...)` 调用点逐字一致；
+ * 引擎侧新增原因时这里要同步加一行，否则会退化成显示裸键名。
+ * labelKey 写成静态字面量是刻意的：`scripts/check-i18n.mjs` 只静态扫描源码里的
+ * labelKey 赋值与 t 函数调用，拼接出来的键它看不见。
+ *
+ * ⚠️ 别在本文件注释里写出「labelKey 冒号加引号字符串」或「t 括号加引号字符串」的
+ *    样例：那个门禁**不剥离注释**，会把样例当成真实引用去字典里查，然后报
+ *    「keys used in source but missing」——实测踩过一次。
+ */
+const NER_SKIP_ITEMS: { key: string; labelKey: string }[] = [
+  { key: 'too_long', labelKey: 'settings.sw.nerSkipTooLong' },
+  { key: 'budget_exhausted', labelKey: 'settings.sw.nerSkipBudget' },
+  { key: 'infer_failed', labelKey: 'settings.sw.nerSkipInfer' },
+  { key: 'deadline', labelKey: 'settings.sw.nerSkipDeadline' },
+  { key: 'init_failed', labelKey: 'settings.sw.nerSkipInit' },
+  { key: 'model_missing', labelKey: 'settings.sw.nerSkipModelMissing' },
+]
 
 function detectClientType(u: UpstreamConfig): string {
   // 按现有 paths 智能回显（/v1 或同时包含两家协议回显为通用聚合；老配置原样尊重）
@@ -608,6 +631,7 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
   // embeddedTab（独立页模式）：敏感词库/客户端管理直接渲染单个 tab，无 tab 栏）
   const defaultTab = embeddedTab ?? searchParams.get('tab') ?? 'advanced'
   const [activeTab, setActiveTab] = useState(defaultTab)
+  const [wordsSubTab, setWordsSubTab] = useState<'custom' | 'builtin'>('custom')
   // 侧边栏跳 /settings?tab=xxx 时同步 tab（defaultValue 只首次生效，已挂载后要受控切换）
   // 独立页模式不监听 searchParams（URL 保持 #/words / #/clients）
   // 注意：依赖必须是字符串值 searchParams.get('tab')，不能是 searchParams 对象——
@@ -1050,14 +1074,22 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
       <div className="flex items-end justify-between">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">
-            {embeddedTab === 'words' ? t('settings.pageTitle.words') : embeddedTab === 'clients' ? t('settings.pageTitle.clients') : t('settings.pageTitle.advanced')}
+            {embeddedTab === 'words'
+              ? t('settings.pageTitle.words')
+              : embeddedTab === 'clients'
+                ? t('settings.pageTitle.clients')
+                : embeddedTab === 'extension'
+                  ? t('settings.pageTitle.extension')
+                  : t('settings.pageTitle.advanced')}
           </h1>
           <p className="mt-1 text-sm font-medium text-muted-foreground">
             {embeddedTab === 'words'
               ? t('settings.pageSubtitle.words')
               : embeddedTab === 'clients'
                 ? t('settings.pageSubtitle.clients')
-                : t('settings.pageSubtitle.advanced')}
+                : embeddedTab === 'extension'
+                  ? t('settings.pageSubtitle.extension')
+                  : t('settings.pageSubtitle.advanced')}
           </p>
         </div>
         {/* 原来这里是一个「保存全部」按钮，onClick 是 save({})——提交一个空补丁。
@@ -1079,11 +1111,19 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
             <TabsTrigger value="advanced">{t('settings.tab.advanced')}</TabsTrigger>
             <TabsTrigger value="security">{t('settings.tab.security')}</TabsTrigger>
             <TabsTrigger value="tools">{t('settings.tab.tools')}</TabsTrigger>
+            <TabsTrigger value="appearance">{t('settings.tab.appearance')}</TabsTrigger>
             {/* 「关于」此前只有 TabsContent 没有 TabsTrigger：内容存在但点不进去，
                 只能靠 ?tab=about 这个没人知道的 URL 参数进入，等于授权激活、
                 版本与更新日志必须有明确的「关于」入口，避免内容渲染后却没有可达标签。 */}
             <TabsTrigger value="about">{t('settings.tab.about')}</TabsTrigger>
           </TabsList>
+        )}
+
+        {/* ===== 浏览器扩展（仅 embedded 独立页渲染；#/settings 不含此项） ===== */}
+        {embeddedTab === 'extension' && (
+        <TabsContent value="extension" className="space-y-4">
+          <ExtBridgeCard cfg={cfg} toggle={toggle} saving={saving} />
+        </TabsContent>
         )}
 
         {/* ===== 客户端管理（仅 embedded 独立页渲染；#/settings 不含此项） ===== */}
@@ -1120,6 +1160,22 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                   <Input className="h-7 w-24 font-mono text-xs" placeholder={t('settings.clients.pathPrefixPh')} value={testPathPrefix} onChange={(e) => setTestPathPrefix(e.target.value)} />
           </div>
 
+          {/* 网页版 AI 扩展引导 */}
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-blue-500/30 bg-blue-500/10 px-3.5 py-2.5 text-xs text-blue-700 dark:text-blue-300">
+            <div className="flex items-center gap-2">
+              <Globe className="h-4 w-4 shrink-0 text-blue-600 dark:text-blue-400" />
+              <span>{t('settings.clients.extBridgeTip')}</span>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 border-blue-500/30 bg-background text-xs text-blue-700 hover:bg-blue-500/10 dark:text-blue-300"
+              onClick={() => navigate('/extension')}
+            >
+              {t('settings.clients.goToExtBridge')}
+            </Button>
+          </div>
+
           {hasUnconfiguredEgress && (
             <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5 text-xs text-amber-700 dark:text-amber-300">
               <div className="flex items-center gap-2">
@@ -1150,7 +1206,10 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
               const isStandardOpenAI = (cType === 'openai' || (u.paths ?? []).some((p) => p === '/v1'))
                 && (u.paths ?? []).some((p) => p.startsWith('/v1'))
               const standardBaseUrl = isStandardOpenAI ? `${baseUrl}/v1` : baseUrl
-              const paths: string[] = (u.paths ?? []).length > 0 ? (u.paths as string[]) : ['/v1/chat/completions', '/v1/completions', '/v1/messages', '/v1/responses']
+              // Base URL 已含 /v1 时 path chips 不再重复渲染 /v1：同一卡片出现
+              // 「OpenAI 带 /v1」+「/v1 复制项」两个入口，用户不知道点哪个
+              const paths: string[] = ((u.paths ?? []).length > 0 ? (u.paths as string[]) : ['/v1/chat/completions', '/v1/completions', '/v1/messages', '/v1/responses'])
+                .filter((p) => !(isStandardOpenAI && p === '/v1'))
               return (
               <Card key={u.port} className="flex h-full flex-col border bg-card shadow-[var(--shadow-card)] transition-[transform,box-shadow] duration-200 hover:-translate-y-0.5 hover:shadow-[var(--shadow-card-hover)]">
                 <CardContent className="flex flex-1 flex-col gap-2.5 p-3.5">
@@ -1215,9 +1274,16 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                       )}
                     </Button>
                   </div>
-                  {/* 支持路径：点击复制带路径的完整地址 */}
+                  {/* 支持路径：点击复制带路径的完整地址。/v1 通配被 Base URL 行
+                      覆盖后 chips 可能为空（general 预设 paths 恰为 ['/v1']），
+                      但 base_path / 注入头徽章仍需展示，故按三者任一存在渲染 */}
+                  {(paths.length > 0
+                    || ((cfg?.capture_mode ?? 'reverse') !== 'reverse' && Boolean(u.base_path))
+                    || Object.keys(u.extra_headers ?? {}).length > 0) && (
                   <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="shrink-0 text-[10px] font-medium text-muted-foreground">{t('settings.clients.supportPaths')}</span>
+                    {paths.length > 0 && (
+                      <span className="shrink-0 text-[10px] font-medium text-muted-foreground">{t('settings.clients.supportPaths')}</span>
+                    )}
                     {paths.map((p) => {
                       const isCopied = !!copiedMap[`path:${u.name}:${p}`]
                       return (
@@ -1253,6 +1319,7 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                       </Badge>
                     )}
                   </div>
+                  )}
                   {testResult[u.name] && (
                     <div className={cn('truncate text-[11px]', testResult[u.name].startsWith('✓') ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400')}>
                       {testResult[u.name]}
@@ -1276,6 +1343,13 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
         {/* ===== 敏感词库（仅 embedded 独立页渲染） ===== */}
         {embeddedTab === 'words' && (
         <TabsContent value="words" className="space-y-4">
+          <Tabs value={wordsSubTab} onValueChange={(v) => setWordsSubTab(v as 'custom' | 'builtin')} className="w-full">
+            <TabsList className="mb-2">
+              <TabsTrigger value="custom">{t('words.tab.custom')}</TabsTrigger>
+              <TabsTrigger value="builtin">{t('words.tab.builtin')}</TabsTrigger>
+            </TabsList>
+
+            <TabsContent value="custom" className="space-y-4">
           <div className="flex items-center justify-between">
             <p className="text-[13px] text-muted-foreground">
               {tf('settings.words.count', { a: Object.keys(words).length, b: Object.values(words).reduce((a, b) => a + b.length, 0) })}
@@ -1552,7 +1626,9 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
               return patchSequence(steps)
             }, msg)}
           />
+            </TabsContent>
 
+            <TabsContent value="builtin" className="space-y-4">
           <Card className="border bg-card">
             <CardHeader className="flex-row items-center justify-between space-y-0">
               <div>
@@ -1657,6 +1733,8 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
               </div>
             </CardContent>
           </Card>
+            </TabsContent>
+          </Tabs>
         </TabsContent>
         )}
 
@@ -1820,9 +1898,35 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                   ['fail_closed', t('settings.sw.failClosed'), t('settings.sw.failClosedDesc')],
                   ['response_scan', t('settings.sw.responseScan'), t('settings.sw.responseScanDesc')],
                   ['auto_start_proxy', t('settings.sw.autoStart'), t('settings.sw.autoStartDesc')],
+                  ['ner_enabled', t('settings.sw.nerAi'), t('settings.sw.nerAiDesc')],
                 ] as [string, string, string][]).map(([k, label, desc]) => (
                   <SettingToggle key={k} label={label} desc={desc} checked={!!(cfg as Record<string, unknown> | undefined)?.[k]} onChange={(v) => toggle(k, v)} />
                 ))}
+                {/* NER 依赖模型文件与 onnxruntime/tokenizers：开启但不可用时必须给出原因，
+                    否则用户只看到「开了没效果」（原因由引擎 /api/status 提供）*/}
+                {!!(cfg as Record<string, unknown> | undefined)?.ner_enabled && status?.ner && !status.ner.available && (
+                  <p className="text-[11px] leading-snug text-amber-600 dark:text-amber-400">
+                    {tf('settings.sw.nerUnavailable', { reason: status.ner.reason || '—' })}
+                  </p>
+                )}
+                {/* 跳过原因计数（审计 M7）：`available` 为 true 只说明引擎能跑，
+                    **不说明每一段文本都做了识别**。`MAX_TEXT_CHARS=2000` 会让超长叶子整条
+                    跳过，预算耗尽也会中途停手——这些此前只写一条进程级日志，界面上
+                    完全看不出，用户只会觉得「开了 NER 但没效果」。
+                    只列非零项：一排 0 是噪声，不是信息。 */}
+                {!!(cfg as Record<string, unknown> | undefined)?.ner_enabled && status?.ner?.available
+                  && (() => {
+                    const skips = status.ner.skips || {}
+                    const parts = NER_SKIP_ITEMS
+                      .filter((it) => Number(skips[it.key] || 0) > 0)
+                      .map((it) => tf('settings.sw.nerSkipItem', { label: t(it.labelKey), n: Number(skips[it.key]) }))
+                    if (parts.length === 0) return null
+                    return (
+                      <p className="text-[11px] leading-snug text-amber-600 dark:text-amber-400">
+                        {tf('settings.sw.nerSkips', { detail: parts.join(' / ') })}
+                      </p>
+                    )
+                  })()}
               </div>
             </div>
             {/* 日志与隐私 */}
@@ -1831,6 +1935,10 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
               <div className="space-y-2">
                 {([
                   ['record_plaintext_words', t('settings.sw.recordPlaintext'), t('settings.sw.recordPlaintextDesc')],
+                  // ext_record_events 放这一组而不是扩展卡片：落库发生在**引擎侧**，
+                  // 开关放引擎一处生效、用户不必重装扩展；它和 record_plaintext_words
+                  // 同属「落库/隐私」语义，放一起才不会出现「一个开关出现在两处」。
+                  ['ext_record_events', t('settings.sw.extRecordEvents'), t('settings.sw.extRecordEventsDesc')],
                   ['debug', t('settings.sw.debug'), t('settings.sw.debugDesc')],
                   ['start_minimized', t('settings.sw.startMinimized'), t('settings.sw.startMinimizedDesc')],
                 ] as [string, string, string][]).map(([k, label, desc]) => (
@@ -2241,139 +2349,7 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
         </TabsContent>
         )}
 
-        {/* ===== 工具 ===== */}
-        {!embeddedTab && (
-        <TabsContent value="tools" className="space-y-4">
-          {/* 更新卡只放「关于」页一处：这里原本也渲染了一份，同一张卡出现在两个 tab，
-              用户在哪点都行反而不知道该信哪个，版本/更新日志也会各查一次接口。 */}
-
-          <Card className="border bg-card">
-            <CardHeader>
-              <CardTitle className="text-sm font-semibold">{t('settings.tools.realTest')}</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="flex flex-wrap items-end gap-2">
-                <div className="min-w-[140px]">
-                  <Label className="text-xs">{t('dash.colClient')}</Label>
-                  <Select value={demoUpstream} onValueChange={setDemoUpstream}>
-                    <SelectTrigger className="mt-1 h-8 text-xs"><SelectValue placeholder={t('settings.tools.chooseClient')} /></SelectTrigger>
-                    <SelectContent>
-                      {upstreams.map((u) => (
-                        <SelectItem key={u.name} value={u.name}>{u.name} :{u.port}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="min-w-[160px] flex-1">
-                  <Label className="text-xs">{t('settings.tools.apiKey')}</Label>
-                  <Input className="mt-1 h-8 font-mono text-xs" type="password" value={demoApiKey} onChange={(e) => setDemoApiKey(e.target.value)} placeholder={t('settings.tools.apiKeyPh')} />
-                </div>
-                <div className="min-w-[150px]">
-                  <Label className="text-xs">{t('logs.colModel')}</Label>
-                  <Input className="mt-1 h-8 font-mono text-xs" value={demoModel} onChange={(e) => setDemoModel(e.target.value)} placeholder={t('settings.tools.modelPh')} />
-                </div>
-              </div>
-              <Textarea
-                className="min-h-20 font-mono text-xs"
-                placeholder={t('settings.tools.textPh')}
-                value={demoText}
-                onChange={(e) => setDemoText(e.target.value)}
-              />
-              <div className="flex gap-2">
-                <Button size="sm" className="h-8" disabled={realTesting} onClick={async () => {
-                  if (!demoUpstream) { toast(t('settings.toast.chooseClient'), 'error'); return }
-                  if (!demoApiKey) { toast(t('settings.toast.needApiKey'), 'error'); return }
-                  const u = upstreams.find((x) => x.name === demoUpstream)
-                  if (!u) return
-                  setRealTesting(true)
-                  try {
-                    const r = await testUpstream({
-                      name: u.name, port: u.port, mode: 'chat',
-                      api_key: demoApiKey, model: demoModel || undefined,
-                      content: demoText || undefined,
-                    })
-                    setDemoResult({ ok: r.ok, masked: String(r.raw_preview ?? r.message ?? r.error ?? ''), error: r.error, items: [] })
-                    if (!r.ok) toast(r.error || t('settings.toast.testFailed'), 'error')
-                  } catch (e) { toast(tf('settings.toast.testFail', { e: String(e) }), 'error') }
-                  finally { setRealTesting(false) }
-                }}>
-                  {realTesting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
-                  {t('settings.tools.sendTest')}
-                </Button>
-                <Button size="sm" variant="outline" className="h-8" onClick={() => setDemoText(t('settings.tools.sampleText'))}>
-                  {t('settings.tools.fillSample')}
-                </Button>
-              </div>
-              <p className="text-[11px] text-muted-foreground">
-                {t('settings.tools.hint')}
-              </p>
-              {demoResult && (
-                <div className="space-y-2 rounded-lg border bg-muted/30 p-3 text-xs">
-                  {demoResult.ok ? (
-                    <>
-                      <div className="font-mono text-emerald-600 dark:text-emerald-400">
-                        <span className="text-muted-foreground">{t('settings.tools.upstreamResp')}</span>{demoResult.masked}
-                      </div>
-                    </>
-                  ) : (
-                    <div className="text-red-600 dark:text-red-400">{demoResult.error || demoResult.masked}</div>
-                  )}
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        </TabsContent>
-        )}
-
-        {/* ===== 关于 ===== */}
-        {!embeddedTab && (
-        <TabsContent value="about" className="space-y-4">
-          {/* 产品信息 + 在线更新（合并为一个卡片） */}
-          <AboutUpdateCard version={status?.version} upstreamBase={status?.upstream_base} dataRoot={cfg?.data_root} running={status?.proxy_running} autoInstall={autoInstallUpdate} />
-
-          {/* 更新日志 */}
-          <Card className="border bg-card">
-            <CardHeader>
-              <CardTitle className="text-sm font-semibold">{t('about.changelog')}</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              {siteRelease ? (
-                <>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Badge className="bg-primary/15 text-[11px] text-primary">{tf('settings.about.latestBadge', { v: siteRelease.version })}</Badge>
-                    <span className="text-[11px] text-muted-foreground">{tf('settings.about.publishedAt', { d: siteRelease.pub_date && dayjs(siteRelease.pub_date).isValid() ? dayjs(siteRelease.pub_date).format('YYYY-MM-DD') : '—' })}</span>
-                    {siteRelease.version === status?.version && (
-                      <span className="text-[11px] text-emerald-600 dark:text-emerald-400">{t('about.currentLatest')}</span>
-                    )}
-                  </div>
-                  {siteRelease.notes && (
-                    <p className="whitespace-pre-wrap rounded-lg bg-muted/40 p-3 text-xs leading-relaxed">{siteRelease.notes}</p>
-                  )}
-                  <div className="flex items-center gap-3 pt-1">
-                    <p className="text-[11px] text-muted-foreground">{t('settings.about.changelogLinkHint')}</p>
-                    <Button size="sm" variant="outline" className="h-7 gap-1 text-[11px]" onClick={openSiteChangelog}>
-                      <ExternalLink className="h-3 w-3" />{t('settings.about.viewSiteChangelog')}
-                    </Button>
-                  </div>
-                </>
-              ) : siteReleaseErr ? (
-                /* 不把原始 JS 异常（TypeError: Failed to fetch 之类）甩给用户：
-                   那串文字对使用者没有任何信息量，只会显得程序坏了。断网/服务器
-                   抽风是常态，说清「不影响使用」即可。 */
-                <p className="text-xs text-muted-foreground">
-                  {t('settings.about.changelogUnavailable')}
-                </p>
-              ) : (
-                <p className="text-xs text-muted-foreground">{t('common.loading')}</p>
-              )}
-            </CardContent>
-          </Card>
-
-          {/* 个性化背景 */}
-          <BackgroundCard />
-        </TabsContent>
-        )}
-
+        {/* ===== 安全设置 ===== */}
         {!embeddedTab && (
         <TabsContent value="security" className="space-y-4">
           {/* 配置备份与回滚 */}
@@ -2472,7 +2448,143 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
               <code className="text-[11px] text-muted-foreground">{cfg?.data_root ?? '%APPDATA%\\Maskit'}</code>
             </CardContent>
           </Card>
+        </TabsContent>
+        )}
 
+        {/* ===== 工具 ===== */}
+        {!embeddedTab && (
+        <TabsContent value="tools" className="space-y-4">
+          {/* 更新卡只放「关于」页一处：这里原本也渲染了一份，同一张卡出现在两个 tab，
+              用户在哪点都行反而不知道该信哪个，版本/更新日志也会各查一次接口。 */}
+
+          <Card className="border bg-card">
+            <CardHeader>
+              <CardTitle className="text-sm font-semibold">{t('settings.tools.realTest')}</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <div className="flex flex-wrap items-end gap-2">
+                <div className="min-w-[140px]">
+                  <Label className="text-xs">{t('dash.colClient')}</Label>
+                  <Select value={demoUpstream} onValueChange={setDemoUpstream}>
+                    <SelectTrigger className="mt-1 h-8 text-xs"><SelectValue placeholder={t('settings.tools.chooseClient')} /></SelectTrigger>
+                    <SelectContent>
+                      {upstreams.map((u) => (
+                        <SelectItem key={u.name} value={u.name}>{u.name} :{u.port}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="min-w-[160px] flex-1">
+                  <Label className="text-xs">{t('settings.tools.apiKey')}</Label>
+                  <Input className="mt-1 h-8 font-mono text-xs" type="password" value={demoApiKey} onChange={(e) => setDemoApiKey(e.target.value)} placeholder={t('settings.tools.apiKeyPh')} />
+                </div>
+                <div className="min-w-[150px]">
+                  <Label className="text-xs">{t('logs.colModel')}</Label>
+                  <Input className="mt-1 h-8 font-mono text-xs" value={demoModel} onChange={(e) => setDemoModel(e.target.value)} placeholder={t('settings.tools.modelPh')} />
+                </div>
+              </div>
+              <Textarea
+                className="min-h-20 font-mono text-xs"
+                placeholder={t('settings.tools.textPh')}
+                value={demoText}
+                onChange={(e) => setDemoText(e.target.value)}
+              />
+              <div className="flex gap-2">
+                <Button size="sm" className="h-8" disabled={realTesting} onClick={async () => {
+                  if (!demoUpstream) { toast(t('settings.toast.chooseClient'), 'error'); return }
+                  if (!demoApiKey) { toast(t('settings.toast.needApiKey'), 'error'); return }
+                  const u = upstreams.find((x) => x.name === demoUpstream)
+                  if (!u) return
+                  setRealTesting(true)
+                  try {
+                    const r = await testUpstream({
+                      name: u.name, port: u.port, mode: 'chat',
+                      api_key: demoApiKey, model: demoModel || undefined,
+                      content: demoText || undefined,
+                    })
+                    setDemoResult({ ok: r.ok, masked: String(r.raw_preview ?? r.message ?? r.error ?? ''), error: r.error, items: [] })
+                    if (!r.ok) toast(r.error || t('settings.toast.testFailed'), 'error')
+                  } catch (e) { toast(tf('settings.toast.testFail', { e: String(e) }), 'error') }
+                  finally { setRealTesting(false) }
+                }}>
+                  {realTesting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
+                  {t('settings.tools.sendTest')}
+                </Button>
+                <Button size="sm" variant="outline" className="h-8" onClick={() => setDemoText(t('settings.tools.sampleText'))}>
+                  {t('settings.tools.fillSample')}
+                </Button>
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                {t('settings.tools.hint')}
+              </p>
+              {demoResult && (
+                <div className="space-y-2 rounded-lg border bg-muted/30 p-3 text-xs">
+                  {demoResult.ok ? (
+                    <>
+                      <div className="font-mono text-emerald-600 dark:text-emerald-400">
+                        <span className="text-muted-foreground">{t('settings.tools.upstreamResp')}</span>{demoResult.masked}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="text-red-600 dark:text-red-400">{demoResult.error || demoResult.masked}</div>
+                  )}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+        )}
+
+        {/* ===== 个性化背景 ===== */}
+        {!embeddedTab && (
+        <TabsContent value="appearance" className="space-y-4">
+          <BackgroundCard />
+        </TabsContent>
+        )}
+
+        {/* ===== 关于 ===== */}
+        {!embeddedTab && (
+        <TabsContent value="about" className="space-y-4">
+          {/* 产品信息 + 在线更新（合并为一个卡片） */}
+          <AboutUpdateCard version={status?.version} upstreamBase={status?.upstream_base} dataRoot={cfg?.data_root} running={status?.proxy_running} autoInstall={autoInstallUpdate} />
+
+          {/* 更新日志 */}
+          <Card className="border bg-card">
+            <CardHeader>
+              <CardTitle className="text-sm font-semibold">{t('about.changelog')}</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              {siteRelease ? (
+                <>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge className="bg-primary/15 text-[11px] text-primary">{tf('settings.about.latestBadge', { v: siteRelease.version })}</Badge>
+                    <span className="text-[11px] text-muted-foreground">{tf('settings.about.publishedAt', { d: siteRelease.pub_date && dayjs(siteRelease.pub_date).isValid() ? dayjs(siteRelease.pub_date).format('YYYY-MM-DD') : '—' })}</span>
+                    {siteRelease.version === status?.version && (
+                      <span className="text-[11px] text-emerald-600 dark:text-emerald-400">{t('about.currentLatest')}</span>
+                    )}
+                  </div>
+                  {siteRelease.notes && (
+                    <p className="whitespace-pre-wrap rounded-lg bg-muted/40 p-3 text-xs leading-relaxed">{siteRelease.notes}</p>
+                  )}
+                  <div className="flex items-center gap-3 pt-1">
+                    <p className="text-[11px] text-muted-foreground">{t('settings.about.changelogLinkHint')}</p>
+                    <Button size="sm" variant="outline" className="h-7 gap-1 text-[11px]" onClick={openSiteChangelog}>
+                      <ExternalLink className="h-3 w-3" />{t('settings.about.viewSiteChangelog')}
+                    </Button>
+                  </div>
+                </>
+              ) : siteReleaseErr ? (
+                /* 不把原始 JS 异常（TypeError: Failed to fetch 之类）甩给用户：
+                   那串文字对使用者没有任何信息量，只会显得程序坏了。断网/服务器
+                   抽风是常态，说清「不影响使用」即可。 */
+                <p className="text-xs text-muted-foreground">
+                  {t('settings.about.changelogUnavailable')}
+                </p>
+              ) : (
+                <p className="text-xs text-muted-foreground">{t('common.loading')}</p>
+              )}
+            </CardContent>
+          </Card>
         </TabsContent>
         )}
       </Tabs>

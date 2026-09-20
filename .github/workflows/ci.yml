@@ -82,6 +82,12 @@ jobs:
       - name: .env import parser cases
         run: node --experimental-strip-types ../scripts/check-env-import.mjs
 
+      # 浏览器扩展（extension/）的静态门禁：i18n 键集一致性、shared.js 加载顺序、
+      # 驼峰 runAt、静态站点清单与 manifest 对齐、安全红线扫描。
+      # 放在本 job 只是因为这里已经装好了 node —— 扩展与前端是两套东西。
+      - name: Browser extension static checks
+        run: node ../scripts/check-extension.mjs
+
   rust:
     name: rust
     runs-on: windows-latest
@@ -159,7 +165,11 @@ jobs:
       - name: Install workflow lint dependency
         run: python -m pip install --quiet 'pyyaml>=6,<7'
 
-      - name: Version numbers must agree across panel.py / tauri.conf.json / Cargo.toml / package.json
+      # 这个步骤跑**两个**脚本，名字必须把两件事都说出来。
+      # 旧名字只写了版本号一致性，结果 audit 失败时（实测 2026-09-19：文档里引用了
+      # 一个 PEM 私钥头部字面量）报错信息指向「版本号不一致」，把人往完全错误的方向带。
+      # 步骤名是失败时唯一可见的线索，别让它说谎。
+      - name: Version numbers agree, and no credential/secret literals in tracked files
         run: |
           python scripts/check-version.py
           python scripts/audit-public-release.py
@@ -167,3 +177,8 @@ jobs:
       # CI 不 lint workflow，YAML 或 run 块写坏只在推送后（最坏是发版时）才炸
       - name: Workflow YAML and shell syntax must be valid
         run: python scripts/check-workflows.py
+
+      # 扩展 zip 是 Release 上唯一的「网页版 AI」入口（ChatGPT / Claude 没有 Base URL 可配），
+      # 打包脚本坏掉＝用户下载不到扩展。这里只验证能打出来，产物由 release.yml 上传。
+      - name: Browser extension package builds
+        run: python scripts/pack-extension.py --check

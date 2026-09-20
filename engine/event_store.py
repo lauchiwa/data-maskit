@@ -28,6 +28,13 @@ DB_PATH = _DATA_ROOT / "shield-events.sqlite3"
 LEGACY_JSONL_PATH = _DATA_ROOT / "shield-events.jsonl"
 RETENTION_DAYS = 7
 EVENT_QUEUE_MAX = 5000
+# 入口维度（ingress）的**合法取值集合**：`proxy`=CLI 代理链路（含老数据 / legacy 导入），
+# `ext`=浏览器扩展桥接链路。放在模块级是为了让写入侧的归一化与读取侧的过滤**引用同一份
+# 定义**——曾经读取侧硬编码 `'proxy'`、写入侧"有值就原样存"，两边不一致时脏值会落进
+# 一个永远筛不出来的隐形分组（详见 `_normalize_ingress`）。
+INGRESS_PROXY = "proxy"
+INGRESS_EXT = "ext"
+INGRESS_VALUES = (INGRESS_PROXY, INGRESS_EXT)
 
 _event_queue = queue.Queue(maxsize=EVENT_QUEUE_MAX)
 _writer_lock = threading.Lock()
@@ -72,6 +79,7 @@ def _connect(schema=False):
             restored INTEGER DEFAULT 0,
             status TEXT,
             http_status INTEGER,
+            ingress TEXT,
             payload TEXT NOT NULL
         )
         """
@@ -93,6 +101,17 @@ def _connect(schema=False):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_type_id ON events(type, id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_sid ON events(sid)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_count ON events(count)")
+    # 入口维度列（浏览器扩展链路）：proxy=CLI 代理链路，ext=浏览器扩展链路。
+    # 老库平滑迁移（幂等）：结构化列走的是**显式列清单**，不加列会让两条 INSERT
+    # 直接报「no such column」——那样连事件都写不进去了。
+    # 老数据留空，读取侧按 'proxy' 解读（见 _normalize_ingress / fetch_events），
+    # 避免出现 NULL 分组。
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()]
+        if "ingress" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN ingress TEXT")
+    except Exception:
+        pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS meta (
@@ -126,6 +145,11 @@ def _connect(schema=False):
     # 日统计摘要表（审计性能项）：写线程增量维护，today_stats 不再全量扫当日 payload。
     # daily_words.word 只存非凭据原文（凭据 items 无 original，落 preview 打码），
     # 与旧口径一致：有 original 用明文，无则用 preview 兜底。
+    # ⚠️ daily_words 的主键**含 ingress**：同一明文在代理链路与扩展链路都会命中，
+    #    三列主键会让两者被 ON CONFLICT 合并成一行，ingress 取谁都错 = 一个会撒谎的
+    #    维度。改主键 SQLite 不支持，所以老库要在 init_db 里**重建表**（见那段注释）。
+    # daily_stats / daily_status **不拆入口**：总量口径是「过网关必有日志」，
+    # 拆开再求和等于没拆，反而给首页数字引入第二套口径。
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS daily_stats (
@@ -155,7 +179,8 @@ def _connect(schema=False):
             label TEXT NOT NULL,
             word TEXT NOT NULL,
             cnt INTEGER DEFAULT 0,
-            PRIMARY KEY (day, label, word)
+            ingress TEXT NOT NULL DEFAULT 'proxy',
+            PRIMARY KEY (day, label, word, ingress)
         )
         """
     )
@@ -308,6 +333,10 @@ def _update_stats(conn, rec, replay=False):
         typ = str(rec.get("type") or "")
         if not typ:
             return
+        # 入口维度：写侧按 rec 取，缺省 'proxy'。**归一化不依赖写入路径**——
+        # _migrate_daily_stats 会用 payload 反查重放（老 payload 没有 ingress 键），
+        # 在这里兜一次底，重放回填出来的历史行也就自动标成 'proxy'（正确）。
+        ingress = str(rec.get("ingress") or "proxy")
         conn.execute(
             "INSERT INTO daily_stats(day, type, events, count_sum, restored) VALUES(?,?,1,?,?) "
             "ON CONFLICT(day,type) DO UPDATE SET "
@@ -370,17 +399,18 @@ def _update_stats(conn, rec, replay=False):
             #   关：只存打码 preview，库里永不出现明文。
             # 与 /api/logs 的 slim 红线不冲突——那条约束的是事件列表推送面，
             # 明文仍只经 /api/logs/detail 回源；这里是用户显式选择的统计维度。
-            # 凭据类 items 本身就没有 original（脱敏时即丢弃），永远走 preview。
-            if RECORD_PLAINTEXT_WORDS:
+            # 凭据类 items 强制绝不落原文（防 legacy 数据重放/历史残留）：恒只走 preview。
+            is_cred = bool(it.get("cred")) or lbl in CREDENTIAL_LABELS
+            if RECORD_PLAINTEXT_WORDS and not is_cred:
                 word = str(it.get("original") or it.get("preview") or "")
             else:
                 word = str(it.get("preview") or "")
             if not word:
                 word = "?"
             conn.execute(
-                "INSERT INTO daily_words(day, label, word, cnt) VALUES(?,?,?,1) "
-                "ON CONFLICT(day,label,word) DO UPDATE SET cnt=cnt+1",
-                (day, lbl, word),
+                "INSERT INTO daily_words(day, label, word, cnt, ingress) VALUES(?,?,?,1,?) "
+                "ON CONFLICT(day,label,word,ingress) DO UPDATE SET cnt=cnt+1",
+                (day, lbl, word, ingress),
             )
         # 前缀保真度：MASK 事件的三个诊断字段聚合（口径见 daily_prefix 建表注释）。
         # 两个前置条件缺一不可：
@@ -439,6 +469,41 @@ def init_db():
         if not row:
             conn.execute("DELETE FROM daily_words")
             conn.execute("INSERT INTO meta(key, value) VALUES('daily_words_pii_purged', '1')")
+        # 入口维度重建（浏览器扩展链路）：daily_words 主键原本是 (day,label,word)。
+        # 同一明文经两条链路都会命中，`ON CONFLICT` 会把两行**合并成一行**，ingress
+        # 写谁都错——那等于买了一个会撒谎的维度。SQLite 改不了主键，只能重建表：
+        # 建新表 → `INSERT … SELECT … 'proxy'` 迁移（历史行标 'proxy' 是对的：当时
+        # 还没有扩展链路）→ drop 旧表 → rename。
+        # 幂等判据用**结构**（daily_words 有没有 ingress 列），不靠 meta 标记：
+        # 标记只作留痕/可观测。绝不复用 `daily_words_pii_purged`——那属另一次语义，
+        # 混用会让那次 PII 清洗被跳过。
+        # 与既有清理的交互：保留期裁剪（DELETE … WHERE day <= ?）与 clear_events 的
+        # 清空分支都只按 day / 全表操作，重建后语义不变。
+        dw_cols = [r[1] for r in conn.execute("PRAGMA table_info(daily_words)").fetchall()]
+        if dw_cols and "ingress" not in dw_cols:
+            conn.execute("ALTER TABLE daily_words RENAME TO daily_words_pre_ingress")
+            conn.execute(
+                """
+                CREATE TABLE daily_words (
+                    day TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    word TEXT NOT NULL,
+                    cnt INTEGER DEFAULT 0,
+                    ingress TEXT NOT NULL DEFAULT 'proxy',
+                    PRIMARY KEY (day, label, word, ingress)
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO daily_words(day, label, word, cnt, ingress) "
+                "SELECT day, label, word, cnt, 'proxy' FROM daily_words_pre_ingress"
+            )
+            conn.execute("DROP TABLE daily_words_pre_ingress")
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES('daily_words_ingress_migrated', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(time.time()),),
+            )
         conn.commit()
 
 
@@ -676,17 +741,45 @@ def _enrich_source(record):
     return rec
 
 
+def _normalize_ingress(rec):
+    """入口维度归一化：`proxy`=CLI 代理链路（含老数据 / legacy 导入），`ext`=浏览器扩展链路。
+
+    事件写入有**两条** INSERT（`append_event` 的同步路径、`_append_many` 的写线程批量
+    路径），两条都在 `_enrich_source` 之后调本函数——这是天然的**唯一汇合点**，
+    归一化只做一次，保证老数据、legacy 导入、代理链路**不写也有值**，
+    读取侧不会冒出 NULL 分组。
+
+    单独成函数而不是塞进 `_enrich_source`：后者的语义是「按客户端端口反查进程写入
+    client_app」，与入口维度正交（SPEC §5.2(2) 的命名理由）。
+    也**不要**把这个字段叫 `source`：本仓库里 `source` 已被占用为「客户端 peer 信息」
+    （transparent.py 的 `_client_source` → `{client, client_host, client_port}`，
+    会被 `_emit_skip` 的 `**src` 摊平进 payload），再引入一个 source 必然出事。
+    """
+    if not rec.get("ingress"):
+        rec["ingress"] = "proxy"
+        return rec
+    # **白名单归一化（不是"有值就原样存"）**：读取侧的入口过滤是
+    # `COALESCE(ingress,'proxy') = ?` 的**精确等值**匹配，所以任何非 `proxy`/`ext`
+    # 的值（大小写不一致、`"EXTING"` 之类的笔误、上游塞进来的脏值）都会落进一个
+    # **永远筛不出来、也永远不出现在任何分组里**的隐形分组——比报错更难查。
+    # 写入是唯一汇合点，所以在这里一次性收口：不认识的值一律按 `proxy` 记
+    # （默认/多数路径），并 `lower()` 容错大小写。
+    value = str(rec.get("ingress")).strip().lower()
+    rec["ingress"] = value if value in INGRESS_VALUES else "proxy"
+    return rec
+
+
 def append_event(record):
     _ensure_db()
-    rec = _enrich_source(record)
+    rec = _normalize_ingress(_enrich_source(record))
     rec.setdefault("ts", time.time())
     payload = json.dumps(rec, ensure_ascii=False)
     with closing(_connect()) as conn:
         cur = conn.execute(
             """
             INSERT INTO events
-            (ts, type, sid, host, method, path, count, restored, status, http_status, payload)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (ts, type, sid, host, method, path, count, restored, status, http_status, ingress, payload)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 float(rec.get("ts") or time.time()),
@@ -699,6 +792,7 @@ def append_event(record):
                 _int_or_none(rec.get("restored")) or 0,
                 rec.get("status"),
                 _int_or_none(rec.get("http_status")),
+                str(rec.get("ingress") or "proxy"),
                 payload,
             ),
         )
@@ -852,14 +946,24 @@ def _audit_visibility_filter():
     return clauses, params
 
 
-def fetch_audit_events(since=0, limit=500, severity_floor=None, signal_filter=None):
-    """读取审计事件。since=id（返回 id>since 的）。severity_floor=LOW/MEDIUM/HIGH/CRITICAL。"""
+def fetch_audit_events(since=0, limit=500, severity_floor=None, signal_filter=None,
+                       include_deprecated=False):
+    """读取审计事件。since=id（返回 id>since 的）。severity_floor=LOW/MEDIUM/HIGH/CRITICAL。
+
+    include_deprecated=False（默认）按 `_audit_visibility_filter` 隐藏已撤销的判定，
+    这只适用于**给人看的列表**。安全检测的读路径（audit_engine 的探针结果聚合）
+    必须传 True：过滤加在检测路径上等于「某个信号被降噪隐藏后，风险矩阵永远看不到
+    它」，而矩阵仍会渲染成绿色——这是个假阴性。
+    """
     _ensure_db()
     since = int(since or 0)
     limit = max(1, min(int(limit or 500), 1000))
-    visibility_clauses, visibility_params = _audit_visibility_filter()
-    where = ["id > ?", *visibility_clauses]
-    params = [since, *visibility_params]
+    where = ["id > ?"]
+    params = [since]
+    if not include_deprecated:
+        visibility_clauses, visibility_params = _audit_visibility_filter()
+        where.extend(visibility_clauses)
+        params.extend(visibility_params)
     # 仅过滤 UI/API 读侧，不删除历史行：用户清空审计日志前数据库内容保持不变。
     if severity_floor:
         # CASE 计算严重度秩，避免加列
@@ -970,14 +1074,14 @@ def _append_many(records):
     _ensure_db()
     with closing(_connect()) as conn:
         for rec in records:
-            rec = _enrich_source(rec)
+            rec = _normalize_ingress(_enrich_source(rec))
             rec.setdefault("ts", time.time())
             payload = json.dumps(rec, ensure_ascii=False)
             conn.execute(
                 """
                 INSERT INTO events
-                (ts, type, sid, host, method, path, count, restored, status, http_status, payload)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (ts, type, sid, host, method, path, count, restored, status, http_status, ingress, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     float(rec.get("ts") or time.time()),
@@ -990,6 +1094,7 @@ def _append_many(records):
                     _int_or_none(rec.get("restored")) or 0,
                     rec.get("status"),
                     _int_or_none(rec.get("http_status")),
+                    str(rec.get("ingress") or "proxy"),
                     payload,
                 ),
             )
@@ -1210,6 +1315,26 @@ def fetch_event_by_id(event_id):
     return _row_to_event(row) if row else None
 
 
+def fetch_sibling_event(sid, exclude_id=None):
+    """根据 sid 取同一会话下的配对事件（例如 RESTORE 查同 sid 的 MASK，或 MASK 查 RESTORE）。"""
+    if not sid or not isinstance(sid, str):
+        return None
+    _ensure_db()
+    with closing(_connect()) as conn:
+        conn.row_factory = sqlite3.Row
+        sql = "SELECT id, payload FROM events WHERE sid = ?"
+        params = [sid]
+        if exclude_id is not None:
+            try:
+                params.append(int(exclude_id))
+                sql += " AND id != ?"
+            except (ValueError, TypeError):
+                pass
+        sql += " ORDER BY id DESC LIMIT 1"
+        row = conn.execute(sql, params).fetchone()
+    return _row_to_event(row) if row else None
+
+
 # 凭据标签：唯一定义源在 credential_labels.py（panel / transparent / 前端共用）。
 # 以前这里自己写了一份 5 元素的集合，少了 CONNSTR 与 PRIVATE_KEY —— 结果是
 # 「凭据原文永不落库」在**读路径**上失效：修复前写入的历史 RESTORE payload 里
@@ -1338,7 +1463,7 @@ def fetch_restore_items(now=None, limit=200):
 
 
 def fetch_events(since=0, limit=500, sensitive_only=False, query="", fulltext=False,
-                 event_type=None, max_limit=1000, ascending=False):
+                 event_type=None, max_limit=1000, ascending=False, ingress=None):
     """读取事件列表。
 
     since=id（返回 id>since 的，供增量轮询）；limit 约束返回条数；
@@ -1349,6 +1474,9 @@ def fetch_events(since=0, limit=500, sensitive_only=False, query="", fulltext=Fa
         本查询按 id 游标分页 + ORDER BY id，`(type, id)` 才是匹配的复合索引）。
         它与 sensitive_only 互斥且优先级更高：显式指定类型时以类型为准，否则
         「只看 SKIP」这类查询会被 sensitive_only 的 NOT IN ('SKIP','PASS') 判成空集。
+    ingress 按入口维度过滤（'proxy' / 'ext'，见 _normalize_ingress）。**老数据该列为
+        NULL 时按 'proxy' 解读**，否则升级后「只看代理链路」会漏掉升级前的全部历史。
+        过滤值非法（None/空/其它）时不过滤，保持旧调用方语义不变。
     fulltext=True 时才额外扫描 payload 大字段（LIKE 无索引，逐行读 payload 代价高，
     默认关闭；审计性能项 P0-5——搜索框默认走结构化列，全文检索由前端显式开启）。
 
@@ -1369,6 +1497,13 @@ def fetch_events(since=0, limit=500, sensitive_only=False, query="", fulltext=Fa
         # 「隐藏透传」：隐藏 PASS/SKIP（过网关但未脱敏的只读/非LLM）
         # MASK/RESTORE/BLOCK/BYPASS 即使 count=0 也显示
         where.append("type NOT IN ('SKIP', 'PASS')")
+    ing = str(ingress or "").strip().lower()
+    if ing in ("proxy", "ext"):
+        # COALESCE：老数据/legacy 导入的 ingress 为 NULL，按 'proxy' 解读。
+        # 这里不用 idx_events_*（没有 ingress 索引），但它与 id 游标条件同用，
+        # 扫描面已被 id > ? 限住，不会退化成全表。
+        where.append("COALESCE(ingress, 'proxy') = ?")
+        params.append(ing)
     q = str(query or "").strip()
     if q:
         like = f"%{q}%"
@@ -1523,6 +1658,83 @@ def _prefix_payload(masks, rewritten, reused, diff_sum, diff_n):
     }
 
 
+def _pack_word_counter(counter):
+    """把 {(label,word): cnt} 打包成 (by_label, by_label_words, top_words)。"""
+    by_label = {}
+    by_label_words = {}
+    for (lbl, w), c in counter.items():
+        by_label[lbl] = by_label.get(lbl, 0) + c
+        by_label_words.setdefault(lbl, []).append({"word": w, "count": c})
+    for lst in by_label_words.values():
+        lst.sort(key=lambda x: -x["count"])
+    top = sorted(
+        ({"label": lbl, "word": w, "count": c} for (lbl, w), c in counter.items()),
+        key=lambda x: -x["count"],
+    )[:20]
+    return by_label, by_label_words, top
+
+
+def _word_groups(rows):
+    """把 daily_words 行（label, word, cnt, ingress）拆成「全量 + 按入口分组」两套视图。
+
+    **分组同屏而不是过滤**（SPEC §5.2(3)、v2.5 拍板）：污染的根因是**量级不对称**
+    （浏览器里发的请求体 ≫ CLI 流量），不是「混在一起」这个动作本身。
+    各组各取 Top N，代理组的业务词（公司名/客户名/密钥）就不会被浏览器流量里的
+    邮箱/电话刷榜挤下去，同时两组都可见——默认只显示代理等于「我拦了但不告诉你拦了什么」。
+
+    返回 (by_label, by_label_words, top_words, by_ingress)：
+    前三个是**全量**视图（保持既有调用方语义不变），by_ingress 形如
+    {"proxy": {"by_label":…, "by_label_words":…, "top_words":…, "label_total":N}, "ext": …}。
+    ingress 为空的旧行按 'proxy' 解读，不产生 NULL 分组。
+    """
+    buckets = {}
+    for row in rows:
+        lbl = str(row[0] or "其他")
+        w = str(row[1] or "?")
+        c = int(row[2] or 0)
+        ing = str(row[3] or "proxy") or "proxy"
+        counter = buckets.setdefault(ing, {})
+        counter[(lbl, w)] = counter.get((lbl, w), 0) + c
+
+    by_ingress = {}
+    for ing, counter in buckets.items():
+        bl, blw, top = _pack_word_counter(counter)
+        by_ingress[ing] = {
+            "by_label": bl,
+            "by_label_words": blw,
+            "top_words": top,
+            "label_total": sum(bl.values()),
+        }
+
+    total_counter = {}
+    for counter in buckets.values():
+        for key, c in counter.items():
+            total_counter[key] = total_counter.get(key, 0) + c
+    by_label, by_label_words, top_list = _pack_word_counter(total_counter)
+    return by_label, by_label_words, top_list, by_ingress
+
+
+def _audit_high_count(since_ts):
+    """区间内 HIGH/CRITICAL 审计信号条数（首页/统计页「告警」口径的一部分）。
+
+    换芯、投毒、凭据外发这类发现原本只落在审计页：用户不主动翻页就永远发现不了，
+    等于白检测（2026-09-19）。这里与列表读侧用同一套降噪过滤，保证「计数里算进去的，
+    点开审计页一定看得到」——只计数不展示会让人找不到来源。
+    """
+    try:
+        _ensure_db()
+        clauses, params = _audit_visibility_filter()
+        where = " AND ".join(["ts >= ?", "severity IN ('HIGH', 'CRITICAL')", *clauses])
+        with closing(_connect()) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE " + where,
+                (float(since_ts), *params),
+            ).fetchone()
+        return int((row or [0])[0] or 0)
+    except Exception:
+        return 0
+
+
 def today_stats(now=None):
     """按本地自然日聚合今日拦截统计（仪表盘数据源）。
 
@@ -1544,7 +1756,7 @@ def today_stats(now=None):
             "SELECT status, cnt FROM daily_status WHERE day=?", (day,)
         ).fetchall()
         word_rows = conn.execute(
-            "SELECT label, word, cnt FROM daily_words WHERE day=?", (day,)
+            "SELECT label, word, cnt, ingress FROM daily_words WHERE day=?", (day,)
         ).fetchall()
         token_row = conn.execute(
             "SELECT prompt, completion FROM daily_tokens WHERE day=?", (day,)
@@ -1576,22 +1788,11 @@ def today_stats(now=None):
     restore_ok = status_map.get("restored", 0)
     restore_failed = status_map.get("unresolved", 0)
     alerts += restore_failed
+    # 审计高危并入告警口径（口径与审计页一致，见 _audit_high_count）
+    audit_high = _audit_high_count(day_start)
+    alerts += audit_high
     restore_by_status = dict(status_map)
-    by_label = {}
-    top_words = {}
-    for lbl, w, c in word_rows:
-        by_label[str(lbl)] = by_label.get(str(lbl), 0) + int(c or 0)
-        key = (str(lbl), str(w))
-        top_words[key] = top_words.get(key, 0) + int(c or 0)
-    by_label_words = {}
-    for (lbl, w), c in top_words.items():
-        by_label_words.setdefault(lbl, []).append({"word": w, "count": c})
-    for lst in by_label_words.values():
-        lst.sort(key=lambda x: -x["count"])
-    top_list = sorted(
-        ({"label": lbl, "word": w, "count": c} for (lbl, w), c in top_words.items()),
-        key=lambda x: -x["count"],
-    )[:20]
+    by_label, by_label_words, top_list, words_by_ingress = _word_groups(word_rows)
     return {
         "ok": True,
         "day_start": day_start,
@@ -1602,6 +1803,7 @@ def today_stats(now=None):
         "restore_failed": restore_failed,
         "requests": requests,
         "alerts": alerts,
+        "audit_high": audit_high,
         "tokens": tokens,
         "prefix": _prefix_payload(*(prefix_row or (0, 0, 0, 0, 0))),
         "by_type": by_type,
@@ -1609,6 +1811,7 @@ def today_stats(now=None):
         "by_label": by_label,
         "by_label_words": by_label_words,
         "top_words": top_list,
+        "words_by_ingress": words_by_ingress,
     }
 
 
@@ -1639,7 +1842,8 @@ def stats_range(days=1, now=None):
             days_list,
         ).fetchall()
         word_rows = conn.execute(
-            f"SELECT label, word, SUM(cnt) FROM daily_words WHERE day IN ({placeholders}) GROUP BY label, word",
+            f"SELECT label, word, SUM(cnt), ingress FROM daily_words WHERE day IN ({placeholders}) "
+            f"GROUP BY label, word, ingress",
             days_list,
         ).fetchall()
         token_row = conn.execute(
@@ -1672,22 +1876,11 @@ def stats_range(days=1, now=None):
     restore_ok = status_map.get("restored", 0)
     restore_failed = status_map.get("unresolved", 0)
     alerts += restore_failed
+    # 审计高危并入告警口径（口径与审计页一致，见 _audit_high_count）
+    audit_high = _audit_high_count(now - days * 86400)
+    alerts += audit_high
     restore_by_status = dict(status_map)
-    by_label = {}
-    top_words = {}
-    for lbl, w, c in word_rows:
-        by_label[str(lbl)] = by_label.get(str(lbl), 0) + int(c or 0)
-        key = (str(lbl), str(w))
-        top_words[key] = top_words.get(key, 0) + int(c or 0)
-    by_label_words = {}
-    for (lbl, w), c in top_words.items():
-        by_label_words.setdefault(lbl, []).append({"word": w, "count": c})
-    for lst in by_label_words.values():
-        lst.sort(key=lambda x: -x["count"])
-    top_list = sorted(
-        ({"label": lbl, "word": w, "count": c} for (lbl, w), c in top_words.items()),
-        key=lambda x: -x["count"],
-    )[:20]
+    by_label, by_label_words, top_list, words_by_ingress = _word_groups(word_rows)
     return {
         "ok": True,
         "day_start": day_start,
@@ -1699,6 +1892,7 @@ def stats_range(days=1, now=None):
         "restore_failed": restore_failed,
         "requests": requests,
         "alerts": alerts,
+        "audit_high": audit_high,
         "blocked": _ev("BLOCK"),
         "errs": _ev("ERR"),
         "scan_warns": _ev("SCAN_WARN"),
@@ -1709,6 +1903,7 @@ def stats_range(days=1, now=None):
         "by_label": by_label,
         "by_label_words": by_label_words,
         "top_words": top_list,
+        "words_by_ingress": words_by_ingress,
     }
 
 
@@ -1720,6 +1915,12 @@ def label_summary(days=7):
     word 是命中的原文（公司名、客户名等），卡片是要拿去分享的，
     一个字都不能带上去。
 
+    **只统计代理链路（ingress='proxy'）**（SPEC §5.2(3)）：这是全仓唯一「只看代理」
+    成立的地方——卡片是发给同行的公网物，「我拦了多少窗口里的邮箱」没有说服力，
+    而「浏览器全量拦截」曝光出去还会引出「你还在看我浏览器？」的观感与隐私误读。
+    代价是卡面总量 ≠ 首页总量，**所以卡面必须标注口径**（前端 i18n
+    `stats.shareScopeProxyOnly`），否则就是新的「数字对不上」。
+
     返回 {label: 次数}，按次数降序。
     """
     _ensure_db()
@@ -1727,7 +1928,9 @@ def label_summary(days=7):
     since_day = time.strftime("%Y-%m-%d", time.localtime(time.time() - (days - 1) * 86400))
     with closing(_connect()) as conn:
         rows = conn.execute(
-            "SELECT label, SUM(cnt) AS n FROM daily_words WHERE day >= ? GROUP BY label ORDER BY n DESC",
+            "SELECT label, SUM(cnt) AS n FROM daily_words "
+            "WHERE day >= ? AND COALESCE(ingress, 'proxy') = 'proxy' "
+            "GROUP BY label ORDER BY n DESC",
             (since_day,),
         ).fetchall()
     # _connect() 不挂 row_factory，取的是裸 tuple，别按列名索引
@@ -1765,9 +1968,11 @@ def stats_history(days=30, granularity="day"):
                    FROM events WHERE ts >= ? GROUP BY hour_bucket, type""",
                 (since,),
             ).fetchall()
-            # 审计信号事件按小时聚合
+            # 审计信号事件按小时聚合（含 HIGH/CRITICAL 计数，供告警口径与审计高危曲线）
             audit_hours = conn.execute(
-                "SELECT CAST(ts / 3600 AS INTEGER) * 3600, COUNT(*) FROM audit_events WHERE ts >= ?"
+                "SELECT CAST(ts / 3600 AS INTEGER) * 3600, COUNT(*), "
+                "SUM(CASE WHEN severity IN ('HIGH', 'CRITICAL') THEN 1 ELSE 0 END) "
+                "FROM audit_events WHERE ts >= ?"
                 + audit_visibility_sql + " GROUP BY 1",
                 (since, *audit_visibility_params),
             ).fetchall()
@@ -1785,9 +1990,13 @@ def stats_history(days=30, granularity="day"):
                 b["restored"] += cnt
             if typ in ("BLOCK", "ERR", "SCAN_WARN"):
                 b["alerts"] += cnt
-        audit_hour_map = {hb: n for hb, n in audit_hours}
+        audit_hour_map = {hb: (int(n or 0), int(hi or 0)) for hb, n, hi in audit_hours}
         for hb in sorted(buckets.keys()):
             b = buckets[hb]
+            audit_n, audit_hi = audit_hour_map.get(hb, (0, 0))
+            # 审计高危并入「告警」：与 today_stats/stats_range 同口径，
+            # 否则同一天的曲线点数与首页卡片对不上。
+            b["alerts"] += audit_hi
             result.append({
                 "ts": hb,
                 "label": time.strftime("%m-%d %H:00", time.localtime(hb)),
@@ -1795,8 +2004,8 @@ def stats_history(days=30, granularity="day"):
                 **b,
                 "tokens_prompt": 0,  # 小时粒度无 token 摘要
                 "tokens_completion": 0,
-                "audit_signals": int(audit_hour_map.get(hb, 0)),
-                "audit_high": 0,
+                "audit_signals": audit_n,
+                "audit_high": audit_hi,
             })
     else:
         # 按天聚合（优先读 daily_stats 摘要表）
@@ -1849,6 +2058,8 @@ def stats_history(days=30, granularity="day"):
             b = day_buckets.get(d, {"requests": 0, "mask_events": 0, "restored": 0, "alerts": 0})
             tk = token_map.get(d, {"prompt": 0, "completion": 0})
             ab = audit_map.get(d, {"audit_signals": 0, "audit_high": 0})
+            # 与 today_stats/stats_range 同口径：审计高危计入当日「告警」
+            b["alerts"] += ab["audit_high"]
             # 把日期字符串转时间戳（当天 0 点）
             try:
                 t_struct = time.strptime(d, "%Y-%m-%d")
@@ -1899,6 +2110,9 @@ def _today_stats_legacy_range(now=None, since=None):
     restore_ok = status_map.get("restored", 0)
     restore_failed = status_map.get("unresolved", 0)
     alerts += restore_failed
+    # 审计高危并入告警口径（口径与审计页一致，见 _audit_high_count）
+    audit_high = _audit_high_count(since)
+    alerts += audit_high
     return {
         "ok": True,
         "day_start": since,
@@ -1910,6 +2124,7 @@ def _today_stats_legacy_range(now=None, since=None):
         "restore_failed": restore_failed,
         "requests": requests,
         "alerts": alerts,
+        "audit_high": audit_high,
         "blocked": _ev("BLOCK"),
         "errs": _ev("ERR"),
         "scan_warns": _ev("SCAN_WARN"),
@@ -1922,6 +2137,9 @@ def _today_stats_legacy_range(now=None, since=None):
         "by_label": {},
         "by_label_words": {},
         "top_words": [],
+        # 该分支根本不聚合词表（连全量 top_words 都是空的），分组视图同样是空；
+        # 给空 dict 而不是缺席，前端不必为回退路径写第二个分支。
+        "words_by_ingress": {},
     }
 
 
@@ -1971,31 +2189,40 @@ def _today_stats_legacy(now=None, day_start=None):
     restore_ok = status_map.get("restored", 0)
     restore_failed = status_map.get("unresolved", 0)
     alerts += restore_failed
+    # 审计高危并入告警口径（口径与审计页一致，见 _audit_high_count）
+    audit_high = _audit_high_count(day_start or _day_start(now))
+    alerts += audit_high
     restore_by_status = dict(status_map)
-    by_label = {}
-    top_words = {}
+    # 回退路径也按入口分组：payload 里带 ingress 的新事件同样要走同屏分组，
+    # 否则「摘要表没数据」这一天里前端会因为拿不到分组而退回混算口径。
+    counters = {}
     for (pl,) in mask_payloads:
         try:
             rec = json.loads(pl)
         except Exception:
             continue
+        ing = str(rec.get("ingress") or "proxy") or "proxy"
+        counter = counters.setdefault(ing, {})
         for it in rec.get("items") or []:
             lbl = str(it.get("label") or "其他")
-            by_label[lbl] = by_label.get(lbl, 0) + 1
-            word = it.get("original")
+            is_cred = bool(it.get("cred")) or lbl in CREDENTIAL_LABELS
+            word = str(it.get("preview") or "") if is_cred else (it.get("original") or str(it.get("preview") or ""))
             if not word:
-                word = str(it.get("preview") or "") or "?"
-            key = (lbl, word)
-            top_words[key] = top_words.get(key, 0) + 1
-    by_label_words = {}
-    for (lbl, w), c in top_words.items():
-        by_label_words.setdefault(lbl, []).append({"word": w, "count": c})
-    for lst in by_label_words.values():
-        lst.sort(key=lambda x: -x["count"])
-    top_list = sorted(
-        ({"label": lbl, "word": w, "count": c} for (lbl, w), c in top_words.items()),
-        key=lambda x: -x["count"],
-    )[:20]
+                word = "?"
+            key = (lbl, str(word))
+            counter[key] = counter.get(key, 0) + 1
+    by_ingress = {}
+    for ing, counter in counters.items():
+        bl, blw, top = _pack_word_counter(counter)
+        by_ingress[ing] = {
+            "by_label": bl, "by_label_words": blw, "top_words": top,
+            "label_total": sum(bl.values()),
+        }
+    total_counter = {}
+    for counter in counters.values():
+        for key, c in counter.items():
+            total_counter[key] = total_counter.get(key, 0) + c
+    by_label, by_label_words, top_list = _pack_word_counter(total_counter)
     # legacy 路径（升级前事件无 daily_tokens 摘要）：扫当日 RESTORE payload 累加
     tokens = {"prompt": 0, "completion": 0}
     try:
@@ -2023,6 +2250,7 @@ def _today_stats_legacy(now=None, day_start=None):
         "restore_failed": restore_failed,
         "requests": requests,
         "alerts": alerts,
+        "audit_high": audit_high,
         "tokens": tokens,
         # 同 _today_stats_legacy_range：legacy 事件没有前缀诊断字段。
         "prefix": None,
@@ -2031,6 +2259,7 @@ def _today_stats_legacy(now=None, day_start=None):
         "by_label": by_label,
         "by_label_words": by_label_words,
         "top_words": top_list,
+        "words_by_ingress": by_ingress,
     }
 
 

@@ -204,6 +204,47 @@ class ShieldEngineTests(unittest.TestCase):
         masked2 = tr.mask("code " + fake, sid2)
         self.assertIn(fake, masked2)
 
+    def test_jwt_response_scan_verifies_header(self):
+        """响应侧扫描：伪三段串不得触发 SCAN_WARN，真实 JWT 正确识别。"""
+        import base64 as b64
+        header = b64.urlsafe_b64encode(b'{"alg":"HS256","typ":"JWT"}').decode().rstrip("=")
+        real = f"{header}.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        fake_head = b64.urlsafe_b64encode(b"not-json-at-all").decode().rstrip("=")
+        fake = f"{fake_head}.abcdefgh.uvwxyz123456"
+
+        events = []
+        old_emit = tr._emit
+        old_scan = tr.RESPONSE_SCAN
+        old_rules = dict(tr.BUILTIN_RULES)
+        try:
+            tr.RESPONSE_SCAN = True
+            tr.BUILTIN_RULES["JWT"] = True
+            tr._emit = lambda typ, **kw: events.append((typ, kw))
+
+            # 1. 伪造三段串：不应触发 SCAN_WARN
+            class _FakeFlow:
+                class response:
+                    content = f"data: {fake}".encode("utf-8")
+            sid = "jwt-scan-fake"
+            tr._new_session(sid)
+            tr._scan_response(_FakeFlow, sid, "api.openai.com", "POST", "/v1/chat/completions", {})
+            warns = [kw for typ, kw in events if typ == "SCAN_WARN"]
+            self.assertEqual(len(warns), 0, "伪三段串不得触发 SCAN_WARN 告警")
+
+            # 2. 真实 JWT：应触发 SCAN_WARN
+            _FakeFlow.response.content = f"token: {real}".encode("utf-8")
+            sid2 = "jwt-scan-real"
+            tr._new_session(sid2)
+            tr._scan_response(_FakeFlow, sid2, "api.openai.com", "POST", "/v1/chat/completions", {})
+            warns2 = [kw for typ, kw in events if typ == "SCAN_WARN"]
+            self.assertEqual(len(warns2), 1, "真实 JWT 必须触发 SCAN_WARN 告警")
+            jwt_items = [it for it in warns2[0]["items"] if it.get("label") == "JWT"]
+            self.assertTrue(len(jwt_items) > 0, "告警 items 中必须包含 JWT 标签")
+        finally:
+            tr._emit = old_emit
+            tr.RESPONSE_SCAN = old_scan
+            tr.BUILTIN_RULES = old_rules
+
     def test_secret_rule_no_nested_placeholder(self):
         """SECRET 嵌套占位符回归：api_key=sk-xxx 只产生 1 个占位符，
         还原后无 {{ 残留（曾前缀规则先换、SECRET 再包一层，嵌套残留）。"""
@@ -2022,6 +2063,45 @@ class ShieldEngineTests(unittest.TestCase):
             self.assertIn("13911112222", got)
         self._with_no_reload(run)
 
+    def test_response_scan_does_not_warn_on_restored_historical_pii(self):
+        """多轮对话防误报：第 2 轮请求未发 PII，模型回复还原了历史占位符，不触发 SCAN_WARN。"""
+        def run():
+            tr.CAPTURE_MODE = "reverse"
+            tr.UPSTREAMS = list(tr.DEFAULT_UPSTREAMS)
+            tr.RESPONSE_SCAN = True
+            emitted = []
+            old_emit = tr._emit
+            tr._emit = lambda typ, **kw: emitted.append((typ, kw))
+            try:
+                # 第 1 轮：脱敏手机号
+                flow1 = self._reverse_flow("/openai/v1/chat/completions", {
+                    "messages": [{"role": "user", "content": "联系人张三电话13812345678"}]
+                })
+                tr.request(flow1)
+                req_content = json.loads(flow1.request.content)["messages"][0]["content"]
+                m_tokens = tr._PLACEHOLDER_RX.findall(req_content)
+                self.assertTrue(m_tokens, "首轮必须完成脱敏生成占位符")
+                token = next(tok for tok in m_tokens if "PHONE" in tok)
+
+                # 第 2 轮：新会话/新请求，不发 PII，模型回复里引用了历史占位符
+                flow2 = self._reverse_flow("/openai/v1/chat/completions", {
+                    "messages": [{"role": "user", "content": "请告诉我张三的联系方式"}]
+                })
+                tr.request(flow2)
+                flow2.response = SimpleNamespace(
+                    headers={"content-type": "application/json"},
+                    content=json.dumps({"choices": [{"message": {"content": "张三的电话是" + token}}]}, ensure_ascii=False).encode("utf-8"),
+                )
+                tr.response(flow2)
+            finally:
+                tr._emit = old_emit
+                tr.RESPONSE_SCAN = False
+            warns = [kw for typ, kw in emitted if typ == "SCAN_WARN"]
+            self.assertEqual(len(warns), 0, "还原历史占位符绝不得误触发 SCAN_WARN")
+            got2 = json.loads(flow2.response.content)["choices"][0]["message"]["content"]
+            self.assertIn("13812345678", got2, "历史占位符必须成功还原")
+        self._with_no_reload(run)
+
     def test_filter_disabled_routes_but_does_not_mask(self):
         """过滤开关关闭：reverse 仍路由（改 host），但不脱敏，body 原样转发。"""
         def run():
@@ -3095,6 +3175,17 @@ class PanelConfigTests(unittest.TestCase):
         up_srv = http.server.HTTPServer(("127.0.0.1", 18990), FakeUp)
         threading.Thread(target=up_srv.serve_forever, daemon=True).start()
         try:
+            # 事件库隔离：透传链路会真实 enqueue PASS 事件，不隔离就会把假
+            # 事件写进开发者本机真实库（污染 /api/stats 与每日用量）。
+            old_db = event_store.DB_PATH
+            event_store.DB_PATH = Path(tempfile.mkdtemp()) / "pt-events.sqlite3"
+            event_store._reset_writer()
+
+            def _restore_db():
+                event_store._reset_writer()
+                event_store.DB_PATH = old_db
+
+            self.addCleanup(_restore_db)
             tmp = Path(tempfile.mkdtemp()) / "config.json"
             # 深拷贝：default_config() 的 upstreams 是浅拷贝，直接改 u['target']
             # 会污染共享的 shield_defaults.DEFAULT_UPSTREAMS（tr/panel 同一对象）
@@ -4732,11 +4823,15 @@ class NewRulesTests(unittest.TestCase):
         r = self._mask("序列 12 34 56 78 90 ab")
         self.assertIn("12 34 56 78 90 ab", r, "空格分隔不应命中 MAC")
 
-    # ---- USCC（默认关，手动开启验证）----
+    # ---- USCC（默认关，手动开启验证；MOD31 校验位，GB 32100-2015）----
     def test_uscc_masked_when_enabled(self):
         tr.BUILTIN_RULES["USCC"] = True
-        r = self._mask("信用代码 91110108MA01ABCD2E")
-        self.assertNotIn("91110108MA01ABCD2E", r, "USCC 应脱敏")
+        # 91100000100003962T 为真实公示码（有效 MOD31 校验位）
+        r = self._mask("信用代码 91100000100003962T")
+        self.assertNotIn("91100000100003962T", r, "有效 USCC 应脱敏")
+        # 校验位错误（尾位 A）必须原样放行：随机字母数字串误伤率压到 1/31
+        r2 = self._mask("信用代码 91100000100003962A")
+        self.assertIn("91100000100003962A", r2, "错校验位 USCC 不得误伤")
 
     # ---- re: 正则词 ----
     def test_regex_word_matches(self):
@@ -4751,13 +4846,30 @@ class NewRulesTests(unittest.TestCase):
         self.assertNotIn("张三", r, "普通词仍应生效（坏正则词被跳过）")
 
     # ---- 整词匹配 ----
-    def test_whole_word_boundary(self):
+    def test_whole_word_boundary_ascii(self):
+        """ASCII 词：整词语义必须真的成立（不是靠断言写法自证）。
+
+        旧断言是 `assertNotIn(" 手机", r)`——带前导空格，而输出里永远没有这个子串，
+        恒为真（vacuous），整词模式实际上没有任何用例守。这里改成：
+        被包裹在更长的词里 = 必须保留；独立出现 = 必须打码。
+        """
+        tr.CUSTOM_WORDS.update({"Acme": "ORG"})
+        tr.SENSITIVE_WORD_WHOLE.add("Acme")
+        r = self._mask("AcmeCorp 与 Acme 签约")
+        self.assertIn("AcmeCorp", r, "整词模式下更长的词不应被误伤")
+        self.assertNotIn("Acme 签约", r, "独立出现的词必须打码")
+
+    def test_whole_word_cjk_still_masks(self):
+        """中文词开整词匹配不得变成「永不脱敏」（漏脱敏，比误伤严重）。
+
+        汉字之间没有词边界，`手机` 两侧几乎永远是汉字：把 CJK 放进两侧边界字符类，
+        等于开了整词匹配的中文词 100% 漏打码（实测 `手机壳和手机` 一个都不打码）。
+        无分词器时中文词的「整词」无法表达，规则是退化回子串匹配。
+        """
         tr.CUSTOM_WORDS.update({"手机": "DEV"})
         tr.SENSITIVE_WORD_WHOLE.add("手机")
         r = self._mask("手机壳和手机")
-        # 整词模式：两侧加边界，'手机壳'中的手机不应命中，单独的'手机'应命中
-        self.assertIn("手机壳", r, "整词模式下子串不应误伤")
-        self.assertNotIn(" 手机", r, "独立词应命中")
+        self.assertNotIn("手机", r, "整词开关不得把中文词的脱敏关掉")
 
     # ---- 大小写不敏感 ----
     def test_case_insensitive_word(self):
@@ -5307,6 +5419,403 @@ class ModelRulesConfigTests(unittest.TestCase):
         """body 体积要有上限，避免配置里塞进巨型对象拖慢每个请求。"""
         self.assertEqual(self._norm([{"match": "m", "headers": {},
                                       "body": {"k": "z" * 40000}}]), [])
+
+
+def _ner_model_ready():
+    """模型文件 + 依赖都可用的判定（供 skipUnless 用）。"""
+    try:
+        import ner_engine
+        if not ner_engine.is_ner_available():
+            return False
+        return bool(ner_engine._init_ner())
+    except Exception:
+        return False
+
+
+_NER_MODEL_READY = _ner_model_ready()
+
+
+class NerEngineGuardrailTests(unittest.TestCase):
+    """NER 的成本护栏（与模型文件无关，CI 上必跑）。
+
+    背景：模型跑在脱敏主链路上，mask() 会对请求体每个字符串叶子各调一次。
+    没有长度上限时实测单条 10 万字符要 69 秒，直接把 mitmproxy 的事件循环冻住。
+    """
+
+    def test_length_cap_skips_and_is_visible(self):
+        import ner_engine
+        before = ner_engine.status()["skips"].get("too_long", 0)
+        ents = ner_engine.extract_entities("啊" * (ner_engine.MAX_TEXT_CHARS + 1))
+        self.assertEqual(ents, [])
+        self.assertGreater(ner_engine.status()["skips"].get("too_long", 0), before,
+                           "超长跳过必须计数/留痕，不能静默")
+
+    def test_exhausted_budget_skips_instead_of_running(self):
+        import ner_engine
+        before = ner_engine.status()["skips"].get("budget_exhausted", 0)
+        with mock.patch.object(ner_engine, "_init_ner", return_value=True):
+            ner_engine.begin_budget(0.0)
+            try:
+                ents = ner_engine.extract_entities("张小明在北京工作。")
+            finally:
+                ner_engine.end_budget()
+        self.assertEqual(ents, [])
+        self.assertGreater(ner_engine.status()["skips"].get("budget_exhausted", 0), before,
+                           "预算耗尽必须计数/留痕，不能静默")
+
+    def test_leaked_budget_window_self_heals(self):
+        """漏调 end_budget 时：预算期内按耗尽处理，但绝不永久停掉后续识别。"""
+        import ner_engine
+        ner_engine.begin_budget(0.0)
+        try:
+            self.assertIsNone(ner_engine._current_deadline(), "预算期内必须按耗尽处理")
+            # 模拟预算窗口早已过去（异常路径漏调 end_budget）
+            ner_engine.begin_budget(-120.0)
+            self.assertIsNotNone(ner_engine._current_deadline(),
+                                 "超过宽限期必须自愈，不能永久停掉识别")
+        finally:
+            ner_engine.end_budget()
+
+
+class NerEngineIntegrationTests(unittest.TestCase):
+    """本地 ONNX 实体识别（NER）与 transparent.py 脱敏还原管线的集成。
+
+    分两层：打桩用例不依赖模型（CI 必跑，锁死「实体与占位符相交不得漏明文」
+    「失败必须可见」这些与模型无关的契约）；端到端用例用 skipUnless 守卫
+    （模型 98MB 且被 .gitignore 排除，CI/干净克隆上本来就没有）。
+    """
+
+    def setUp(self):
+        tr.sessions.clear()
+        tr._RECENT_FWD.clear()
+        tr._RECENT_REV.clear()
+        tr._NER_WARNED.discard("model_missing")
+        self._old_ner = tr.NER_ENABLED
+
+    def tearDown(self):
+        tr.NER_ENABLED = self._old_ner
+
+    def _stub_ner(self, ents):
+        """打桩 ner_engine：模型可用 + 返回指定实体（与模型文件无关）。"""
+        import ner_engine
+        for patcher in (
+            mock.patch.object(ner_engine, "is_ner_available", return_value=True),
+            mock.patch.object(ner_engine, "extract_entities", return_value=ents),
+            mock.patch.object(ner_engine, "status", return_value={"available": True, "last_error": ""}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_entity_intersecting_placeholder_leaves_no_plaintext(self):
+        """实体把已有占位符包在中间时，两侧明文必须都被打码。
+
+        旧实现用 `not _PLACEHOLDER_RX.search(orig)` 整段丢弃 → 整段（含明文）原样出网。
+        """
+        text = "公司注册地：上海市浦东新区{{TERM_ab12cd}}世纪大道100号。"
+        frag = "上海市浦东新区{{TERM_ab12cd}}世纪大道100号"
+        start = text.index(frag)
+        self._stub_ner([{"type": "ADDR", "start": start, "end": start + len(frag), "text": frag}])
+        tr.NER_ENABLED = True
+        sid = "test-ner-intersect"
+        tr._new_session(sid)
+        masked = tr.mask(text, sid)
+        self.assertNotIn("上海市浦东新区", masked, "占位符相交时明文片段不得放行")
+        self.assertNotIn("世纪大道100号", masked, "占位符相交时明文片段不得放行")
+        self.assertIn("{{TERM_ab12cd}}", masked, "既有占位符必须原样保留，不得被劈开或套娃")
+        self.assertEqual(tr.restore(masked, sid, final=True), text)
+
+    def test_entity_split_by_placeholder_braces_still_masked(self):
+        """模型只吃到 `{` / `}}` 残渣（被占位符劈开的实体）时，剩余明文同样必须打码。"""
+        text = "北京市朝阳区{{TERM_ab12cd}}建国路88号院3号楼。"
+        first_end = text.index("{{TERM") + 1
+        second_start = text.index("}}建国路")
+        second_text = "}}建国路88号院3号楼"
+        self._stub_ner([
+            {"type": "ADDR", "start": 0, "end": first_end, "text": text[:first_end]},
+            {"type": "ADDR", "start": second_start, "end": second_start + len(second_text),
+             "text": second_text},
+        ])
+        tr.NER_ENABLED = True
+        sid = "test-ner-brace-split"
+        tr._new_session(sid)
+        masked = tr.mask(text, sid)
+        self.assertNotIn("北京市朝阳区", masked)
+        self.assertNotIn("建国路88号院3号楼", masked)
+        self.assertIn("{{TERM_ab12cd}}", masked)
+        self.assertEqual(tr.restore(masked, sid, final=True), text)
+
+    def test_ner_unavailable_is_reported_not_silent(self):
+        """开启 NER 但模型不可用：不改写文本，但必须留下可诊断记录。"""
+        import ner_engine
+        with mock.patch.object(ner_engine, "is_ner_available", return_value=False), \
+             mock.patch.object(ner_engine, "status", return_value={"model_dir": "/nonexistent"}):
+            tr.NER_ENABLED = True
+            sid = "test-ner-missing-model"
+            tr._new_session(sid)
+            text = "张小明在北京工作。"
+            self.assertEqual(tr.mask(text, sid), text)
+        self.assertIn("model_missing", tr._NER_WARNED,
+                      "模型缺失必须留痕，否则表现为「开了没效果」")
+
+    def test_ner_disabled_by_default(self):
+        """默认关闭 NER 时，不进行语义实体猜想，保护确定性规则边界。"""
+        old_ner = tr.NER_ENABLED
+        tr.NER_ENABLED = False
+        try:
+            sid = "test-ner-disabled"
+            tr._new_session(sid)
+            text = "张小明在北京腾讯科技公司工作。"
+            masked = tr.mask(text, sid)
+            self.assertIn("张小明", masked)
+            self.assertIn("北京腾讯科技公司", masked)
+        finally:
+            tr.NER_ENABLED = old_ner
+
+    @unittest.skipUnless(_NER_MODEL_READY, "本地 NER 模型/依赖不可用，跳过端到端用例")
+    def test_ner_entity_mask_and_restore_cycle(self):
+        tr.NER_ENABLED = True
+        sid = "test-ner-cycle"
+        tr._new_session(sid)
+        text = "请联系甲方张小明，他在北京腾讯科技公司工作，经常去北京协和医院就医，家住海淀区中关村南大街1号。"
+        masked = tr.mask(text, sid)
+        self.assertNotIn("张小明", masked)
+        self.assertIn("{{NAME_", masked)
+        self.assertIn("{{ORG_", masked)
+        restored = tr.restore(masked, sid, final=True)
+        self.assertEqual(restored, text, "NER 识别出的占位符还原后必须与原文完全一致")
+
+
+class OffsetMapTests(unittest.TestCase):
+    """OffsetMap 与 Edit 的数据契约与数学性质测试（单调坐标映射、存活区间紧致性与合成保真验证）。"""
+
+    def test_empty_identity_map(self):
+        om = tr.OffsetMap.empty(10)
+        self.assertEqual(om.src_len, 10)
+        self.assertEqual(om.dst_len, 10)
+        for i in range(10):
+            self.assertEqual(om.map_point(i), i)
+        self.assertEqual(om.map_range(2, 7), (2, 7))
+        self.assertIsNone(om.map_range(5, 5))
+        self.assertIsNone(om.map_range(7, 2))
+
+    def test_real_defect_case_spans(self):
+        """设计文档 §1.1 / §7.2.1 真实缺陷用例。"""
+        # 原文: "北京市西城区网点营业厅已关闭" (len=14)
+        # 自定义词替换 [3, 6) "西城区" -> "{{TERM_sgpctc}}" (len=15)
+        # 伤疤文本: "北京市{{TERM_sgpctc}}网点营业厅已关闭" (len=23)
+        orig = "北京市西城区网点营业厅已关闭"
+        edits = [tr.Edit(3, 6, "{{TERM_sgpctc}}")]
+        om = tr.OffsetMap(edits, len(orig))
+        self.assertEqual(om.dst_len, len("北京市{{TERM_sgpctc}}网点营业厅已关闭"))
+
+        # 模型在原文上识别: [2, 11) '市西城区网点营业厅'
+        mapped = om.map_range(2, 11)
+        self.assertEqual(mapped, (2, 23))
+
+        # 被完全覆盖的实体应返回 None
+        self.assertIsNone(om.map_range(3, 6))
+
+    def test_property_p1_p2_p3_randomized(self):
+        """2000 组随机性质测试：P1 字符保真，P2 单射，P3 区间紧致。"""
+        import random
+        rng = random.Random(20260919)
+        tokens = ["{{TERM_abcdef}}", "{{PHONE_ghijkl}}", "{{ADDR_mnopqr}}"]
+
+        for _ in range(2000):
+            n = rng.randint(1, 40)
+            text = "".join(rng.choice("abcXYZ0123中文字") for _ in range(n))
+            edits, i = [], 0
+            while i < n:
+                if rng.random() < 0.25:
+                    ln = min(rng.randint(1, 4), n - i)
+                    edits.append(tr.Edit(i, i + ln, rng.choice(tokens)))
+                    i += ln + rng.randint(0, 2)
+                else:
+                    i += 1
+
+            # 重建目标串
+            out, cursor = [], 0
+            for s, e, tok in edits:
+                out.append(text[cursor:s])
+                out.append(tok)
+                cursor = e
+            out.append(text[cursor:])
+            target = "".join(out)
+
+            om = tr.OffsetMap(edits, len(text))
+            self.assertEqual(om.dst_len, len(target))
+
+            replaced = set()
+            for s, e, _ in edits:
+                replaced.update(range(s, e))
+            survivors = [idx for idx in range(len(text)) if idx not in replaced]
+
+            # P1: 字符保真
+            for idx in survivors:
+                m = om.map_point(idx)
+                self.assertIsNotNone(m)
+                self.assertEqual(target[m], text[idx])
+
+            # P2: 单射
+            mapped = [om.map_point(idx) for idx in survivors]
+            self.assertEqual(len(set(mapped)), len(mapped))
+
+            # P3: 区间紧致
+            for _ in range(3):
+                s = rng.randint(0, len(text))
+                e = rng.randint(s, len(text))
+                inside = [idx for idx in survivors if s <= idx < e]
+                got = om.map_range(s, e)
+                if not inside:
+                    self.assertIsNone(got)
+                else:
+                    want = (min(om.map_point(idx) for idx in inside),
+                            max(om.map_point(idx) for idx in inside) + 1)
+                    self.assertEqual(got, want)
+
+    def test_compose_multi_step_randomized(self):
+        """多步 OffsetMap.compose 后的映射依然保持 P1/P2/P3。"""
+        import random
+        rng = random.Random(20260920)
+        tokens = ["{{TERM_abcdef}}", "{{PHONE_ghijkl}}", "{{ADDR_mnopqr}}"]
+
+        for _ in range(1000):
+            steps = rng.randint(1, 4)
+            n = rng.randint(5, 35)
+            orig = "".join(rng.choice("abcXYZ0123中文字") for _ in range(n))
+            curr = orig
+            om_total = tr.OffsetMap.empty(len(orig))
+
+            for _ in range(steps):
+                edits, i = [], 0
+                while i < len(curr):
+                    if rng.random() < 0.2:
+                        ln = min(rng.randint(1, 3), len(curr) - i)
+                        edits.append(tr.Edit(i, i + ln, rng.choice(tokens)))
+                        i += ln + rng.randint(0, 2)
+                    else:
+                        i += 1
+                out, cursor = [], 0
+                for s, e, tok in edits:
+                    out.append(curr[cursor:s])
+                    out.append(tok)
+                    cursor = e
+                out.append(curr[cursor:])
+                next_text = "".join(out)
+                om_step = tr.OffsetMap(edits, len(curr))
+                om_total = om_total.compose(om_step)
+                curr = next_text
+
+            self.assertEqual(om_total.dst_len, len(curr))
+
+            survivors = []
+            for i in range(len(orig)):
+                p = om_total.map_point(i)
+                if p is not None:
+                    self.assertEqual(curr[p], orig[i])
+                    survivors.append(i)
+
+            mapped = [om_total.map_point(i) for i in survivors]
+            self.assertEqual(len(set(mapped)), len(mapped))
+
+    def test_offset_map_inverted_edit_rejected(self):
+        """OffsetMap 必须拒绝倒置区间（end < start）或负数起点的 Edit。"""
+        with self.assertRaises(ValueError) as ctx:
+            tr.OffsetMap([tr.Edit(8, 5, "{{X}}")], 15)
+        self.assertIn("Edit 区间非法", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx:
+            tr.OffsetMap([tr.Edit(-1, 5, "{{X}}")], 15)
+        self.assertIn("Edit 区间非法", str(ctx.exception))
+
+    def test_offset_map_overlapping_edits_rejected(self):
+        """OffsetMap 必须拒绝重叠的 Edit 序列，防止构造出非法映射。"""
+        edits = [
+            tr.Edit(2, 6, "{{A}}"),
+            tr.Edit(5, 8, "{{B}}"),
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            tr.OffsetMap(edits, 15)
+        self.assertIn("Edit 重叠", str(ctx.exception))
+
+    def test_offset_map_out_of_bounds_rejected(self):
+        """OffsetMap 必须拒绝超出 src_len 边界的 Edit。"""
+        edits = [tr.Edit(5, 12, "{{A}}")]
+        with self.assertRaises(ValueError) as ctx:
+            tr.OffsetMap(edits, 10)
+        self.assertIn("Edit 越界", str(ctx.exception))
+
+    def test_offset_map_compose_dimension_mismatch_rejected(self):
+        """OffsetMap.compose 尺寸不匹配时必须抛出 ValueError。"""
+        om1 = tr.OffsetMap([tr.Edit(0, 5, "{{A}}")], 10)  # dst_len = 5 - 5 + len("{{A}}") + 5 = 10 - 5 + 7 = 12
+        om2 = tr.OffsetMap.empty(20)                      # src_len = 20 != 12
+        with self.assertRaises(ValueError) as ctx:
+            om1.compose(om2)
+        self.assertIn("尺寸不匹配", str(ctx.exception))
+
+
+class MaskBySpansContractTests(unittest.TestCase):
+    """_mask_by_spans 的数据契约与边界性质测试。"""
+
+    def test_non_overlapping_spans_replaced_cleanly(self):
+        text = "0123456789"
+        spans = [(1, 3, "{{A}}"), (6, 8, "{{B}}")]
+        out = tr._mask_by_spans(text, spans)
+        self.assertEqual(out, "0{{A}}345{{B}}89")
+
+    def test_overlapping_spans_second_span_skipped_entirely(self):
+        """后序重叠区间必须被整段丢弃，防止将绑定完整原词的占位符截断替换导致还原时重复吐字。"""
+        text = "0123456789"
+        # span1 覆盖 [1, 5)，span2 覆盖 [3, 8)
+        spans = [(1, 5, "{{FIRST}}"), (3, 8, "{{SECOND}}")]
+        out = tr._mask_by_spans(text, spans)
+        self.assertEqual(out, "0{{FIRST}}56789", "重叠的第二项必须被跳过，不可产生截断替换")
+
+    def test_empty_or_none_spans(self):
+        text = "hello world"
+        self.assertEqual(tr._mask_by_spans(text, []), text)
+        self.assertEqual(tr._mask_by_spans(text, None), text)
+
+
+class MaskExcludingPlaceholdersEdTests(unittest.TestCase):
+    """_mask_excluding_placeholders_ed 与 Edit 生成的契约测试。"""
+
+    def test_no_placeholder_simple_replace(self):
+        rx = re.compile(r"apple")
+        text, edits = tr._mask_excluding_placeholders_ed("one apple two apples", rx, lambda m: "{{FRUIT_abcdef}}")
+        self.assertEqual(text, "one {{FRUIT_abcdef}} two {{FRUIT_abcdef}}s")
+        self.assertEqual(len(edits), 2)
+        self.assertEqual(edits[0], tr.Edit(4, 9, "{{FRUIT_abcdef}}"))
+        self.assertEqual(edits[1], tr.Edit(14, 19, "{{FRUIT_abcdef}}"))
+
+    def test_existing_placeholders_are_preserved_and_skipped(self):
+        rx = re.compile(r"\bcat\b")
+        inp = "a {{TERM_abcdef}} cat and a cat"
+        text, edits = tr._mask_excluding_placeholders_ed(inp, rx, lambda m: "{{ANIMAL_ghijkl}}")
+        self.assertEqual(text, "a {{TERM_abcdef}} {{ANIMAL_ghijkl}} and a {{ANIMAL_ghijkl}}")
+        self.assertEqual(len(edits), 2)
+        self.assertEqual(edits[0], tr.Edit(18, 21, "{{ANIMAL_ghijkl}}"))
+        self.assertEqual(edits[1], tr.Edit(28, 31, "{{ANIMAL_ghijkl}}"))
+
+    def test_group_idx_partial_replace_captures_correct_span(self):
+        rx = re.compile(r"Bearer\s+([a-zA-Z0-9]+)")
+        def _sub(m):
+            gs, ge = m.span(1)
+            return m.group(0)[:gs - m.start()] + "{{KEY_abcdef}}" + m.group(0)[ge - m.start():]
+
+        inp = "header Bearer secret123 end"
+        text, edits = tr._mask_excluding_placeholders_ed(inp, rx, _sub, group_idx=1)
+        self.assertEqual(text, "header Bearer {{KEY_abcdef}} end")
+        self.assertEqual(len(edits), 1)
+        # Edit 必须精确覆盖 group 1 的 span [14, 23)，token 为 {{KEY_abcdef}}
+        self.assertEqual(edits[0], tr.Edit(14, 23, "{{KEY_abcdef}}"))
+
+    def test_no_match_returns_same_text_and_empty_edits(self):
+        rx = re.compile(r"nomatch")
+        inp = "nothing to see here"
+        text, edits = tr._mask_excluding_placeholders_ed(inp, rx, lambda m: "x")
+        self.assertEqual(text, inp)
+        self.assertEqual(edits, [])
 
 
 if __name__ == "__main__":

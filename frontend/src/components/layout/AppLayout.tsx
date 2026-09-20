@@ -26,6 +26,7 @@ import {
   Languages,
   AlertTriangle,
   X,
+  Globe,
 } from 'lucide-react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { getStatus, startProxy, stopProxy } from '@/api/proxy'
@@ -49,14 +50,16 @@ import { useI18n } from '@/lib/i18n'
 import { isTauri } from '@/lib/shield-fetch'
 import { checkUpdate, updateTrayProxyStatus } from '@/lib/tauri'
 import { useNavigate, useLocation } from 'react-router-dom'
+import { getStoredWallpaperConfig } from '@/lib/wallpaper'
 
 // 导航项：label 用 i18n key（t('nav.' + key)），随语言切换
 const NAV_ITEMS = [
   { to: '/', key: 'dashboard', icon: LayoutDashboard },
   { to: '/logs', key: 'logs', icon: FileText },
   { to: '/stats', key: 'stats', icon: BarChart3 },
-  { to: '/words', key: 'words', icon: ScanSearch },
   { to: '/clients', key: 'clients', icon: Network },
+  { to: '/extension', key: 'extension', icon: Globe },
+  { to: '/words', key: 'words', icon: ScanSearch },
   { to: '/audit', key: 'audit', icon: ShieldCheck },
   { to: '/settings', key: 'settings', icon: Settings },
 ]
@@ -96,22 +99,27 @@ export function AppLayout({ children }: { children: ReactNode }) {
   // 页面隐藏时停止所有轮询（WebView2 后台不再渲染/请求），可见时自动刷新
   const { hidden } = useVisibility()
 
-  // 个性化背景：localStorage 存图（URL/base64/内置名）+ 透明度，纯前端偏好不进后端配置
-  const [bgImage, setBgImage] = useState<string>(() => {
-    try { return localStorage.getItem('shield_bg_image') || '' } catch { return '' }
-  })
-  const [bgOpacity, setBgOpacity] = useState<number>(() => {
-    try { return Number(localStorage.getItem('shield_bg_opacity')) || 0 } catch { return 0 }
-  })
+  // 个性化背景：统一由 getStoredWallpaperConfig 获取（未配置全新启动自动启用旗舰流光，支持跨窗口即时响应）
+  const [wallpaperConfig, setWallpaperConfig] = useState(() => getStoredWallpaperConfig())
+  const { bgImage, bgOpacity, bgBlur, cardOpacity } = wallpaperConfig
+
   // 跨窗口/跨标签同步：设置页改了背景，其他打开的页面即时刷新
   useEffect(() => {
     const onStorage = (e: StorageEvent) => {
-      if (e.key === 'shield_bg_image') setBgImage(e.newValue || '')
-      if (e.key === 'shield_bg_opacity') setBgOpacity(Number(e.newValue) || 0)
+      if (
+        e.key === 'shield_bg_image' ||
+        e.key === 'shield_bg_opacity' ||
+        e.key === 'shield_bg_blur' ||
+        e.key === 'shield_card_opacity'
+      ) {
+        setWallpaperConfig(getStoredWallpaperConfig())
+      }
     }
     window.addEventListener('storage', onStorage)
     return () => window.removeEventListener('storage', onStorage)
   }, [])
+
+  const hasCustomBg = Boolean(bgImage && bgOpacity > 0)
 
   const [checkingUpdate, setCheckingUpdate] = useState(false)
   const [proxyBusy, setProxyBusy] = useState(false)
@@ -246,6 +254,7 @@ export function AppLayout({ children }: { children: ReactNode }) {
     if (p === '/stats') return t('nav.stats')
     if (p === '/words') return t('nav.words')
     if (p === '/clients') return t('nav.clients')
+    if (p === '/extension') return t('nav.extension')
     if (p === '/audit') return t('nav.audit')
     if (p === '/settings') return t('nav.settings')
     return t('layout.appName')
@@ -279,15 +288,24 @@ export function AppLayout({ children }: { children: ReactNode }) {
     }
   }
 
+  // 真正引擎异常判定：若代理正在运行（isRunning 为 true）或状态接口能正常返回，
+  // 说明引擎与代理真实存活可用，此时启动初期的瞬态 last_error 不应误报「引擎异常」红灯。
+  const showEngineError = Boolean(engineError && !isRunning && !status?.proxy_running)
+
   return (
-    <div className="flex h-screen overflow-hidden bg-background text-foreground">
-      {/* 个性化背景层：在所有内容之下，透明度由用户控制 */}
+    <div
+      className={cn('flex h-screen overflow-hidden bg-background text-foreground', hasCustomBg && 'has-custom-bg')}
+      style={hasCustomBg ? ({ '--card-opacity': (cardOpacity / 100).toString() } as React.CSSProperties) : undefined}
+    >
+      {/* 个性化背景层：在所有内容之下，透明度与高斯模糊由用户控制 */}
       {bgImage && bgOpacity > 0 && (
         <div
-          className="pointer-events-none fixed inset-0 z-0 bg-cover bg-center bg-no-repeat"
+          className="pointer-events-none fixed inset-0 z-0 bg-cover bg-center bg-no-repeat transition-[filter,transform,opacity] duration-300"
           style={{
             backgroundImage: `url("${bgImage}")`,
             opacity: bgOpacity / 100,
+            filter: bgBlur > 0 ? `blur(${bgBlur}px)` : undefined,
+            transform: bgBlur > 0 ? 'scale(1.04)' : undefined,
           }}
         />
       )}
@@ -385,7 +403,7 @@ export function AppLayout({ children }: { children: ReactNode }) {
               <span
                 className={cn(
                   'relative inline-flex h-2.5 w-2.5 rounded-full',
-                  engineError
+                  showEngineError
                     ? 'bg-red-500 shadow-[0_0_8px_hsl(0_72%_51%/0.6)] animate-pulse'
                     : isStarting || isStopping
                       ? 'bg-amber-400 shadow-[0_0_8px_hsl(38_92%_50%/0.5)] animate-pulse'
@@ -396,7 +414,7 @@ export function AppLayout({ children }: { children: ReactNode }) {
               />
             </span>
             <span className="text-[13px] font-medium text-foreground">
-              {engineError
+              {showEngineError
                 ? t('layout.engineErr')
                 : isStarting
                   ? t('layout.startingProxy')

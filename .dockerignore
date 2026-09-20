@@ -22,6 +22,7 @@ shield-env-backup.json
 model_prices_cache.json
 diagnostics-*.json
 engine/config.json
+# 冒烟测试语料/脚本（根目录），不是运行时资产。
 _smoke_data/
 ai-coding/
 frontend/.playwright-cli/
@@ -45,6 +46,7 @@ htmlcov/
 dist/
 dist_engine/
 build_engine/
+dist_extension/
 src-tauri/
 docs/
 tests/

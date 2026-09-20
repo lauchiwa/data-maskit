@@ -61,25 +61,31 @@ When using **Cursor, Claude Code, Codex, Pi, OpenCode, ChatGPT, or any AI coding
 ## ✨ Highlights & Feature Overview
 
 ### 🛡️ 1. Deep Masking with Multi-turn Consistency
-- **19 Built-in Scanner Rules**: API Keys/Tokens, PEM keys, DB connection strings, phone numbers, ID cards, emails, credit cards, private IPs;
-- **Custom Wordlists & Regex**: Categorized custom dictionary for names, codenames, and proprietary business terms; full regex support;
+- **20+ Built-in Scanner Rules**: API Keys/Tokens, PEM keys, DB connection strings, phone numbers, ID cards, emails, credit cards, private IPv4/IPv6, USCC unified social credit codes, and more;
+- **Custom Wordlists & Regex**: Categorized custom dictionary for names, codenames, and proprietary business terms; full regex support with resident deterministic placeholders;
 - **Sliding-window Placeholder Reuse**: Placeholders remain consistent across long conversations. "Alice" is assigned the exact same token in turn 1 and turn 20, preserving model reasoning consistency.
 
-### ⚡ 2. Millisecond SSE Stream Takeover (Native Typewriter Flow)
-- Intercepts `text/event-stream` chunk by chunk;
+### 🤖 2. Local AI Entity Recognition (NER Semantic Model)
+- **Unstructured Free-Text Protection**: Built-in lightweight local ONNX model detects Chinese person names (NAME), organizations (ORG), and detailed physical addresses (ADDR) where regex rules fall short;
+- **Clean Original Extraction + Monotonic OffsetMap**: Extracts entities from the clean original context and translates coordinates back to the mutated text via a monotonic `OffsetMap`, completely eliminating plaintext fragment leakage caused by context truncation;
+- **100% Offline Local Inference**: Runs entirely inside your local process without any external network calls; toggleable in Settings.
+
+### 🌐 3. Browser Extension Ecosystem (Web AI Privacy)
+- **Seamless Web AI Protection**: Dedicated Chrome & Edge MV3 extension for **ChatGPT, Claude, Kimi, Doubao, Qwen**, and other web-based AI platforms;
+- **Local Masking + Typewriter Stream Restoration**: Prompts sent from web tabs are masked locally before departure, and model responses are restored in real-time typewriter stream right inside the web chat UI; 18+ preset AI sites with one-click authorization.
+
+### ⚡ 4. Millisecond SSE Stream Takeover (Native Typewriter Flow)
+- Intercepts `text/event-stream` chunk by chunk with incremental restoration;
 - Automatically reassembles split tokens across chunk boundaries, **maintaining native typewriter responsiveness without lag**.
 
-### 🔌 3. No Root CA Installation + Native Fallback Passthrough (Never Breaks Your API)
+### 🔌 5. No Root CA Installation + Native Fallback Passthrough (Never Breaks Your API)
 - **Multi-port Reverse Proxy**: Dedicated local ports per model channel (e.g. `18701` for OpenAI, `18703` for Anthropic). Change `base_url` to local port without installing untrusted self-signed root CAs;
 - **Fallback Passthrough Guarantee**: If the proxy is stopped or closed, ports automatically fallback to raw transparent passthrough. **Your coding tools will never experience unexpected connection dropouts!**
 
-### 📊 4. Real-time Logs, Security Audit & Cost Tracking
+### 📊 6. Real-time Logs, Security Audit & Cost Tracking
 - Inspect full request/response diffs with one-click highlight mode;
-- Detect prompt leaks, model-swapping, and destructive commands;
+- **Passive Security Audit & Prompt Injection Detection**: Monitors upstream model responses and detects prompt extraction attempts, credential exfiltration instructions, and destructive command patterns;
 - Live token usage & model pricing cost estimation.
-
-### 🔒 5. 100% Local Execution, Zero Telemetry
-- All masking and unmasking happen inside your local process. No analytics, tracking SDKs, or cloud telemetry.
 
 ---
 
@@ -149,6 +155,18 @@ print(response.choices[0].message.content)
 4. **Masking Paths**: simply enter `/v1` (prefix matching automatically covers `/v1/chat/completions`, `/v1/models`, etc.);
 5. Save, then set your AI tool's Base URL to `http://127.0.0.1:18709/v1`!
 
+### 6. Browser Extension (ChatGPT, Claude & Web AI)
+
+Web-based AI platforms cannot configure an API Base URL. Use Maskit's browser extension for fully automated masking and stream unmasking:
+
+1. **Install Extension**: Download `Maskit_<version>_extension.zip` from [Releases](https://github.com/xiaYuTian11/maskit/releases/latest) and extract it. In Chrome/Edge, open `chrome://extensions` → toggle **Developer mode** → click **Load unpacked** and select the extracted folder (source users can directly load the `extension/` directory);
+2. **Connect to Engine**: In Maskit desktop dashboard `Settings → Browser Extension`, enable the extension bridge and copy your **Access Token** into the extension's settings popup;
+3. **Enable Sites**: Toggle target platforms (e.g. `chatgpt.com`, `claude.ai`, with 18+ preset sites supported and custom URL support).
+
+> 💡 **Status & Troubleshooting**:
+> - Extension icon popup clearly displays current state: Green (Protected), Yellow (Engine offline, passthrough), Red (Invalid token or bridge disabled);
+> - Extension events are logged in the dashboard's "Event Logs" and can be filtered by ingress (Proxy Link vs Browser Extension).
+
 ---
 
 ## 🚀 Download & Deployment
@@ -216,6 +234,30 @@ Open `http://<server-ip>:5801` directly in your browser and enter your configure
 > }
 > ```
 
+#### Advanced: Single-Port Mode (one proxy port for Docker)
+
+Prefer not to map one port per client? Use **single-port prefix mode**: all clients share port 5802 and are distinguished by path prefix. In the console's "Clients" page, each client's **Path Prefix (base_path)** becomes the path part of the client's `base_url`:
+
+```bash
+docker run -d \
+  --name maskit \
+  --restart unless-stopped \
+  -p 127.0.0.1:5801:5801 \
+  -p 127.0.0.1:5802:5802 \
+  -v maskit_data:/data \
+  -e MASKIT_PANEL_TOKEN="YourSecretToken123456" \
+  ghcr.io/xiayutian11/maskit:latest
+```
+
+Given two clients (path prefixes `/openai` and `/anthropic`), point external tools at:
+
+| Client | Base URL |
+|---|---|
+| OpenAI protocol (prefix `/openai`) | `http://<server-ip>:5802/openai/v1` |
+| Anthropic protocol (prefix `/anthropic`) | `http://<server-ip>:5802/anthropic` |
+
+> 💡 **Multi-port vs single-port**: multi-port (18701+) gives each client a dedicated port and the shortest `base_url` — ideal for local personal use; single-port maps just 5802 — ideal when container ports are constrained or you route everything through one Nginx prefix. Both modes coexist: prefix routing on 5802 and each client's dedicated port work simultaneously.
+
 ---
 
 ### Option C: Run from Source
@@ -234,6 +276,8 @@ python engine/panel.py
 # 3. Frontend dev server (Vite hot-reload, recommended)
 cd frontend && npm run dev
 ```
+
+> 💡 **Testing Tip**: Run `python scripts/verify-all.py` for the complete 15-item test suite (unit tests, build, lint, version consistency, public release audit). If working on the browser extension, run `python tests/e2e_ext_bridge.py` for end-to-end browser tests.
 
 ---
 

@@ -78,9 +78,25 @@ export interface ProxyStatus {
   start_minimized: boolean
   auto_start_proxy: boolean
   audit: Record<string, unknown>
+  /**
+   * 语义实体识别（NER）状态：enabled 是开关，available/initialized 是实际可用性。
+   *
+   * `skips` 是「开启了但这段没做识别」的原因计数（`too_long` / `budget_exhausted` /
+   * `infer_failed` / `deadline` / `init_failed` / `model_missing`）。纯整数、不含原文。
+   * 不透出它的话，「开了 NER，长文本全跳过」在界面上完全看不出（审计 M7）。
+   */
+  ner?: {
+    enabled: boolean
+    available: boolean
+    initialized: boolean
+    reason: string
+    skips?: Record<string, number>
+  }
   needs_ca: boolean
   wizard_recommended: boolean
   last_error: string
+  /** MASKIT_PANEL_TOKEN 太短/非 ASCII 被忽略（面板改用随机 token），前端弹一次性提醒 */
+  panel_token_env_rejected?: boolean
 }
 
 // ========== 事件（/api/logs） ==========
@@ -153,6 +169,11 @@ export interface ShieldEvent {
   model?: string
   client_app?: string | number
   upstream?: string
+  /**
+   * 入口维度：`proxy`=CLI 代理链路，`ext`=浏览器扩展链路。
+   * **老数据/导入事件该列为空，读取时按 `proxy` 解读**（不要渲染成"—"）。
+   */
+  ingress?: 'proxy' | 'ext'
   reason?: string
   msg?: string
   seq: number
@@ -226,7 +247,22 @@ export interface TodayStats {
   prefix?: PrefixStats | null
   by_label: Record<string, number>
   top_words: { label: string; word: string; count: number }[]
+  /**
+   * 词表**按入口分组**的同一份数据（key: `proxy` / `ext`）。分组同屏而非过滤：
+   * 浏览器扩展链路的量级远大于 CLI，混算会把邮箱/电话这类高频词刷上榜，
+   * 压掉用户真正关心的业务密钥词；分组后各组各取 Top N，两组都可见。
+   */
+  words_by_ingress?: Record<string, IngressWordGroup>
   [key: string]: unknown
+}
+
+/** 单个入口（proxy=CLI 代理链路 / ext=浏览器扩展链路）的词表视图。 */
+export interface IngressWordGroup {
+  by_label: Record<string, number>
+  by_label_words: Record<string, { word: string; count: number }[]>
+  top_words: { label: string; word: string; count: number }[]
+  /** 该入口下的命中总数（组头计数；与 top_words 的 Top N 截断无关） */
+  label_total: number
 }
 
 // ========== 配置（/api/config） ==========
@@ -263,6 +299,17 @@ export interface ShieldConfig {
   session_ttl?: number
   diagnostic_unmatched?: boolean
   http2?: boolean
+  /** 浏览器扩展链路总开关（默认关）。关闭时三个 /api/ext/* 端点 403 `ext_bridge_disabled` */
+  ext_bridge_enabled?: boolean
+  /**
+   * 扩展访问令牌。**面板只回显，不进任何日志/导出/诊断包**。
+   * 轮换即扩展失效（403 invalid_token → 直通、未脱敏）直到用户在扩展设置里更新。
+   */
+  ext_token?: string
+  /** 引擎不可达时扩展侧是否阻断（默认关=直通）。**只管 (B) 类**，(A) 类无开关 */
+  ext_block_when_engine_down?: boolean
+  /** 扩展链路是否写入本地事件库与统计（默认 true）。只管落库，不管脱敏 */
+  ext_record_events?: boolean
   target_domains?: string[]
   api_paths?: string[]
   wizard_done?: boolean
