@@ -2,6 +2,21 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.101.0] - 2026-09-20
+
+基于上游 v0.3.2（`xiaYuTian11/maskit`）。上游 `0.3.x` 的全部变更见下方对应章节，本节只记录本分支自身的处理。
+*Based on upstream v0.3.2 (`xiaYuTian11/maskit`). All upstream `0.3.x` changes are listed in their own sections below; this section records only what this fork did.*
+
+### 新增 / Added
+- 同步上游 `0.3.0`–`0.3.2`：本地 ONNX 语义实体识别（NER，配置项 `ner_enabled`，默认关）、浏览器扩展桥接（保护 ChatGPT / Claude 等网页版 AI）、毛玻璃界面重构、透传兜底层加固与 IPv6/USCC 内置规则。
+  *Synced upstream `0.3.0`–`0.3.2`: local ONNX entity recognition (NER, config key `ner_enabled`, off by default), browser-extension bridge (protects web AI such as ChatGPT and Claude), frosted-glass UI rework, hardened passthrough fallback, and built-in IPv6/USCC rules.*
+
+### 说明 / Notes
+- NER 模型（约 98MB）不随仓库分发，需放入 `engine/models/ner_mini_zh/`；缺失时引擎照常工作，仅语义识别不可用，界面与健康检查会说明原因，本地打包会降级为「轻量规则包」并告警。
+  *The NER model (~98MB) is not shipped in the repository and must be placed in `engine/models/ner_mini_zh/`; without it the engine runs normally with semantic recognition unavailable, the UI and health check state why, and local packaging degrades to a rules-only build with a warning.*
+- 语义识别依赖 `onnxruntime` 与 `tokenizers`（已加入 `requirements.txt`）；未安装时同上，为惰性降级而非启动失败。
+  *Semantic recognition requires `onnxruntime` and `tokenizers` (added to `requirements.txt`); when absent the behaviour is the same lazy degradation rather than a startup failure.*
+
 ## [0.100.0] - 2026-09-15
 
 基于上游 v0.2.12（`xiaYuTian11/maskit`）。本分支自此启用独立版本段 `0.100.x`，与上游 `0.2.x` 永不相撞。

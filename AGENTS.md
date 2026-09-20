@@ -229,18 +229,18 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 
 ### 版本号方案
 
-**本分支版本号走独立的 `0.100.x` 段，与上游 `0.3.x` 无任何数值关系。**
+**本分支版本号走独立的 `0.1xx.x` 段（`minor ≥ 100`），与上游 `0.3.x` 无任何数值关系。**
 
 - `__version__`（`engine/panel.py`，唯一真相来源）= **本分支自己**的发布序号。`minor` 记功能批次，`patch` 记修复；
 - `__upstream_base__`（同文件，紧跟 `__version__`）= 本分支所基于的**上游版本**，只读元数据，不参与任何版本比较。
 
-为什么不把上游版本号编进 `__version__`：`X.Y.Z` 只有三个槽位，塞不进两套计数器。四段式 `0.2.12.1` 被 Cargo 硬拒（`unexpected character '.' after patch version number`），`0.2.13-fork.1` 按 semver 规范**优先级低于** `0.2.13`（会被判定比上游旧），`0.2.13+fork.1` 的 build metadata 在版本比较中被忽略。选 `0.100.x` 段的实际收益：上游短期到不了 `minor=100`，所以上游发任何版本都不可能在更新检查里盖过本分支构建。
+为什么不把上游版本号编进 `__version__`：`X.Y.Z` 只有三个槽位，塞不进两套计数器。四段式 `0.2.12.1` 被 Cargo 硬拒（`unexpected character '.' after patch version number`），`0.2.13-fork.1` 按 semver 规范**优先级低于** `0.2.13`（会被判定比上游旧），`0.2.13+fork.1` 的 build metadata 在版本比较中被忽略。选 `minor ≥ 100` 的实际收益：上游短期到不了 `minor=100`，所以上游发任何版本都不可能在更新检查里盖过本分支构建。每次同步上游后按功能批次 `minor+1`（`0.100` → `0.101` → …），纯修复则 `patch+1`。
 
 ### 血缘在哪里看
 
 | 位置 | 看到什么 |
 |---|---|
-| 设置 → 关于卡片 | 「当前版本 v0.100.x」下方一行「上游基线 v0.3.2」 |
+| 设置 → 关于卡片 | 「当前版本 v0.1xx.x」下方一行「上游基线 v0.3.2」 |
 | `GET /api/status` | `version` + `upstream_base` 两个字段 |
 | 诊断导出 | `app.version` + `app.upstream_base` |
 | `python scripts/check-upstream-sync.py` | 完整同步状态 + **校验声明真实性** |
