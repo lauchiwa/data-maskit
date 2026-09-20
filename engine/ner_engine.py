@@ -13,6 +13,7 @@ Data Maskit - 本地高精度 ONNX 实体识别（NER）引擎
 from __future__ import annotations
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -31,6 +32,9 @@ _ID2LABEL = {}
 _INITIALIZED = False
 _INIT_FAILED = False
 _LAST_ERROR = ""
+# 实际生效的 onnxruntime 推理线程数（_init_ner 里按 MASKIT_NER_THREADS 解析后写入）。
+# 暴露到 status()：部署方能核对「配额与线程是否对齐」，排查同机 CPU 争用。
+_NER_THREADS = 0
 
 # ── 成本护栏 ──────────────────────────────────────────────────────────────────
 # 单条文本长度上限：超过即跳过语义识别并留一次日志。宁可这一条不做识别，
@@ -187,6 +191,7 @@ def status() -> Dict:
         "model_dir": str(_MODEL_DIR),
         "max_text_chars": MAX_TEXT_CHARS,
         "call_budget_s": CALL_BUDGET_S,
+        "intra_op_num_threads": _NER_THREADS,
         "cache_size": len(_CACHE),
         "skips": dict(_SKIP_STATS),
     }
@@ -218,9 +223,20 @@ def _init_ner():
             cfg = json.load(f)
         _ID2LABEL = cfg.get("id2label", {})
 
-        # 4 线程 CPU 推理。实测约 0.25ms/字（含分块与后处理），见模块头部成本模型。
+        # CPU 推理线程数。实测约 0.25ms/字（4 线程，含分块与后处理），见模块头部成本模型。
+        # ⚠️ 默认从 4 降到 2：onnxruntime 会占满 intra_op_num_threads 个核到 100%。当
+        # maskit 与吃「整机 CPU」的服务（如 new-api 的过载保护）同机时，占满全核会触发
+        # 对方限流/拒服务。默认 2 给同机邻居留核；可用 MASKIT_NER_THREADS 覆盖（部署方按
+        # 机器核数与容器 cpus 配额自行调整，二者对齐可免 CFS 调度停顿）。取值下限 1。
+        try:
+            _ner_threads = int(os.environ.get("MASKIT_NER_THREADS", "2"))
+        except ValueError:
+            _ner_threads = 2
+        _ner_threads = max(1, _ner_threads)
+        global _NER_THREADS
+        _NER_THREADS = _ner_threads
         opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 4
+        opts.intra_op_num_threads = _ner_threads
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
         _SESSION = ort.InferenceSession(str(model_path), sess_options=opts, providers=["CPUExecutionProvider"])

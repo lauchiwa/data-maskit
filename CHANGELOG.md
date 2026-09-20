@@ -2,6 +2,19 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.101.1] - 2026-09-21
+
+基于上游 v0.3.2（`xiaYuTian11/maskit`），仅本分支自身修复，无上游同步。
+*Based on upstream v0.3.2 (`xiaYuTian11/maskit`); fork-only fix, no upstream sync.*
+
+### 修复 / Bug Fixes
+- NER 推理线程数由写死的 `4` 改为可配置环境变量 `MASKIT_NER_THREADS`（默认 `2`，下限 `1`）。此前 onnxruntime 会占满 `intra_op_num_threads` 个核到 100%，当 maskit 与读「整机 CPU」做过载保护的服务（如 new-api）同机时，占满全核会触发对方对所有请求返回 503。默认降到 2 给同机邻居留核；部署方可按机器核数与容器 `cpus` 配额自行覆盖，二者对齐可免 CFS 调度停顿。
+  *NER inference thread count changed from a hardcoded `4` to the configurable env var `MASKIT_NER_THREADS` (default `2`, floor `1`). Previously onnxruntime saturated `intra_op_num_threads` cores to 100%; when maskit shares a host with a service whose overload guard reads system-wide CPU (e.g. new-api), pegging all cores tripped that guard into returning 503 for every request. The default is lowered to 2 to leave cores for co-located neighbours; deployers can override it to match the host core count and the container `cpus` quota (aligning the two avoids CFS throttling stalls).*
+
+### 新增 / Added
+- `ner_engine.status()`（经 `/api/status` 暴露）新增 `intra_op_num_threads` 字段，回显 NER 会话实际生效的线程数（未初始化时为 `0`），便于确认线程配置是否按预期生效。
+  *`ner_engine.status()` (exposed via `/api/status`) now reports `intra_op_num_threads`, the thread count the NER session actually uses (`0` before initialization), making it easy to confirm the thread config took effect.*
+
 ## [0.101.0] - 2026-09-20
 
 基于上游 v0.3.2（`xiaYuTian11/maskit`）。上游 `0.3.x` 的全部变更见下方对应章节，本节只记录本分支自身的处理。
