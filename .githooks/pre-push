@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# ── pre-push：公开发布门禁（本仓已 public，push 前最后一道关）──
+# 本仓库自 2026-09-20 起为 PUBLIC。凡是 push 出去的内容都会立刻对全世界可见，
+# 且写进不可变的 git 历史——即便事后删除，也已被爬虫/clone 抓走。所以本地必须
+# 有一道「推之前」的拦截，而不能只依赖 CI（CI 拦下时东西已经在 GitHub 上了）。
+#
+# 判据：直接复用仓库自带的公开发布门禁 scripts/audit-public-release.py。
+# 它检查：运行时残留文件入库、*.pem/.key/.p12/.pfx 凭据文件、Google/AWS/GitHub
+# token 与 PEM 私钥块字面量、开发机本地路径、ASCII 控制字符、workflow action 未
+# 固定到 40 位 SHA、npm 元数据漂移、compose 端口未显式绑定 host。
+#
+# 安装（一次性，换机后需重做——.git/hooks 不入版本控制）：
+#   git config core.hooksPath .githooks
+#
+# 跳过单次：git push --no-verify        长期关闭：SKIP_PUBLISH_AUDIT=1 git push
+#
+# ⚠️ 设计取舍（与本仓 deploy 仓 pre-push 同源）：前置条件缺失（无 python3 / 找不到
+#    门禁脚本）时【提示并放行】，只有门禁真正判定 FAILED 时才拦截。否则会退化成
+#    一个逼人天天 --no-verify 的摆设，而一旦养成 --no-verify 的习惯，hook 等于不存在。
+
+set -uo pipefail
+
+[ -n "${SKIP_PUBLISH_AUDIT:-}" ] && { echo "ℹ️  公开发布门禁已跳过（SKIP_PUBLISH_AUDIT=1）"; exit 0; }
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+AUDIT="$REPO_ROOT/scripts/audit-public-release.py"
+
+# ── 前置检查：不满足就放行（附原因），不阻断 push ──
+skip() { echo "ℹ️  公开发布门禁已跳过：$1"; echo "   （非阻断。补齐后再 push 会自动重跑）"; exit 0; }
+
+command -v python3 >/dev/null 2>&1 || skip "未安装 python3"
+[ -f "$AUDIT" ] || skip "未找到门禁脚本（$AUDIT）"
+
+echo "▶ 运行公开发布门禁 audit-public-release.py ..."
+if python3 "$AUDIT"; then
+  echo "✅ 公开发布门禁通过，允许 push"
+  exit 0
+else
+  status=$?
+  echo "" >&2
+  echo "❌ 公开发布门禁未通过——push 已拦截。" >&2
+  echo "   本仓库是 PUBLIC，上面列出的问题一旦 push 即公开且入历史。" >&2
+  echo "   请先修掉（多为：敏感文件误入库 / 密钥字面量 / 运行时残留）。" >&2
+  echo "" >&2
+  echo "   确需强推（自负风险）：git push --no-verify" >&2
+  exit "$status"
+fi
