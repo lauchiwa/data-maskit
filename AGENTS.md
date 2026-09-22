@@ -312,13 +312,31 @@ python scripts/check-upstream-sync.py
 python scripts/verify-all.py --python "<3.13 解释器>"
 
 # 6. 合回 master，按本分支自己的序号发版（patch+1 或 minor+1）
+
+# 7. **每次发版必须打 tag**（annotated），哪怕不推送、不走 release.yml
+git tag -a v0.1xx.x -m "发布 v0.1xx.x"
 ```
+
+#### 发版必打 tag：漏打会让发版说明谎报「扩展无改动」
+
+**实测错报（v0.102.0）**：`v0.101.0`、`v0.101.1` 当时都只改了版本号、没打 tag。
+`scripts/render-release-notes.py` 用 `git describe --tags --abbrev=0 HEAD^` 找「上一个版本」，
+而合并上游会把上游的 tag（`v0.4.0`）一起带进本分支历史 —— 它距离 HEAD 只有 20 个提交，
+比本分支上一个真 tag `v0.100.0`（31 个）更近，于是 `describe` 挑中了**上游的** tag。
+接着 `git diff v0.4.0 HEAD -- extension/` 恒为空（上游那批扩展改动正是从这个 tag 合进来的），
+发版说明于是印出「✅ 扩展无改动，无需重新加载」。
+
+后果不是文案瑕疵：**扩展代码变了而用户没重载，扩展会静默失效**（网页版 AI 的请求不再进引擎，
+等于不脱敏出网）。
+
+只要每次发版都打上本分支的 tag，`describe` 就一定先挑到本分支自己的 tag，判定自然正确。
+这也是为什么这条规则与「是否推送 / 是否走 CI 发版」无关 —— 它保护的是**下一次**发版的判定。
 
 ### 合并时必须守住的本分支改动
 
 上游每次同步都可能覆盖掉这些，合完务必逐条确认：
 
-- `src-tauri/tauri.conf.json` 的 `plugins.updater.endpoints` 与 `pubkey`（本分支自己的密钥，Key ID `8FDEF509963AB482`）。**被上游值覆盖 = 本分支构建会被上游发布覆盖掉**。注意 `endpoints` 当前值是历史遗留的失效地址（详见下节）；
+- `src-tauri/tauri.conf.json` 的 `plugins.updater.endpoints` 与 `pubkey`（本分支自己的密钥，Key ID `8FDEF509963AB482`）。**被上游值覆盖 = 本分支构建会被上游发布覆盖掉**；
 - `engine/panel.py` 的 `__upstream_base__` 及其在 `/api/status`、诊断导出里的两处透出；
 - `frontend/src/components/settings/AboutUpdateCard.tsx` 的「上游基线」行与 `about.upstreamBase*` 两个 i18n key；
 - `scripts/generate-latest-json.py` 的 `--repo` 默认值（空串 → 回退环境变量 → 兜底本分支仓库）。
