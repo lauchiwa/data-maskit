@@ -329,7 +329,7 @@ python scripts/verify-all.py --python "<3.13 解释器>"
 
 | remote | 地址 | 用途 |
 |---|---|---|
-| `origin` | `github.com:lauchiwa/data-maskit` | 本分支代码，**私有** |
+| `origin` | `github.com:lauchiwa/data-maskit` | 本分支代码，**公开**（2026-09 由私有转公开） |
 | `upstream` | `github.com:xiaYuTian11/maskit` | 上游，公开 |
 
 （历史：曾用 Gitee 私有仓库作 `origin`，已弃用；曾有一个 fork 上游的公开仓库 `lauchiwa/maskit`，已删除。两者均不再引用。）
@@ -344,14 +344,24 @@ python scripts/verify-all.py --python "<3.13 解释器>"
 | `release.yml` | push `v*` tag、手动 | 打包 windows-nsis + macos-arm64，timeout 120 分钟 |
 | `test-macos-build.yml` | 仅手动 | — |
 
-**私有仓库的 Actions 分钟数计费，且按平台倍率扣：**Linux 1×、Windows 2×、**macOS 10×**。每推一次 `master` 就跑全部 5 个 job，其中 macOS 那个按 40 分钟超时上限算相当于扣 400 分钟额度。频繁推送前先算额度，或在仓库设置里禁用不需要的 job。
+**Actions 分钟数不再是约束。**`origin` 转公开后，标准 GitHub-hosted runner（Linux / Windows / macOS 全部）免费且不限量，私有仓库那套「Linux 1×、Windows 2×、macOS 10× 倍率 + 2000 分钟额度」对本仓库已不适用。推送前不需要再算额度。
+
+两个仍然收费的例外，本仓库目前都没碰到：**larger runners** 在公开仓库也照常计费（`ci.yml` / `release.yml` 用的都是标准 runner），以及 2026-03-01 起 self-hosted runner 的 $0.002/min 平台费 —— 该费用同样豁免公开仓库。
 
 **推 tag 会触发 `release.yml`。** 它需要两个 secret：`MASKIT_UPDATER_PRIVATE_KEY` 与 `MASKIT_UPDATER_PRIVATE_KEY_PASSWORD`。**未配置就推 tag 的后果**：打出未签名（无 `.sig`）的安装包并留下草稿 Release，而本地那份已验签的产物可能被覆盖。要么先在 Settings → Secrets 配好密钥，要么用 `gh release create` 发本地产物（不推 tag，不触发 CI）。
 
-#### 自动更新仍不可用
+#### 自动更新：阻塞原因已消除，但尚未打通
 
-`plugins.updater.endpoints` 已指向 `github.com/lauchiwa/data-maskit`（即 `origin`），但**仓库是私有的，`tauri-plugin-updater` 匿名拉 `latest.json` 必定 404**。已安装客户端启动 8 秒后静默检查一次并静默失败 —— silent 模式不弹窗，不影响脱敏功能。分发靠手工发安装包。
+历史上这里的结论是「必定 404，因为仓库私有」。**`origin` 转公开后这个阻塞不存在了** —— `plugins.updater.endpoints` 指向的
+`github.com/lauchiwa/data-maskit/releases/latest/download/latest.json` 现在允许匿名下载，`tauri-plugin-updater` 能真的取到。
 
-与之前不同的是失败原因：旧端点指向一个**不存在**的仓库，现在指向一个**存在但私有**的仓库。行为上都是 404，但现在这个地址归你控制 —— 不再存在外人注册同名仓库、向你的客户端投馀 `latest.json` 的可能。（即便投也装不上：包要过 `pubkey` 的 Ed25519 校验，私钥不在仓库里。）
+剩下的前置条件只有一条：**得先有一个带 `latest.json` 的正式 Release**。当前远端 0 个 Release，所以行为暂时仍是 404 —— 已安装客户端启动 8 秒后静默检查一次并静默失败，silent 模式不弹窗，不影响脱敏功能。
 
-要真正启用自动更新，需要一个**允许匿名下载**的端点托管 `latest.json` 与安装包（代价是产物公开，但代码可以不公开）。改端点后**必须重新打包**：端点是编译进二进制的，改配置对已装客户端无效。
+打通需要：
+
+1. 在 Settings → Secrets 配好 `MASKIT_UPDATER_PRIVATE_KEY` 与 `MASKIT_UPDATER_PRIVATE_KEY_PASSWORD`（**当前未配置**，私钥在 `~/.tauri/maskit-updater.key`）；
+2. 推一个 `v*` tag 让 `release.yml` 打出带 `.sig` 的产物与 `latest.json`，并把草稿 Release 转正式。
+
+端点本身**不需要**再改，所以也不需要为此重新打包 —— 端点是编译进二进制的，已装客户端认的就是这个地址。反过来说，将来若要换端点，则必须重新打包，改配置对已装客户端无效。
+
+安全性不受转公开影响：投毒的包装不上，产物要过 `pubkey` 的 Ed25519 校验，而私钥不在仓库里。
