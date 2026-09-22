@@ -41,13 +41,13 @@
   // ─── postMessage 桥（nonce 校验） ───
   const pending = new Map();
   const bridge = {
-    call(action, payload) {
+    call(action, payload, timeoutMs = BRIDGE_TIMEOUT_MS) {
       return new Promise((resolve) => {
         const nonce = (crypto.randomUUID && crypto.randomUUID()) || String(Math.random()).slice(2);
         const timer = setTimeout(() => {
           pending.delete(nonce);
           resolve(null);                       // 超时按 (B) 直通处理
-        }, BRIDGE_TIMEOUT_MS);
+        }, timeoutMs);
         pending.set(nonce, { resolve, timer });
         window.postMessage({ type: 'MASKIT_BRIDGE_REQ', nonce, action, payload }, location.origin);
       });
@@ -55,6 +55,29 @@
     notify(action, payload) {
       window.postMessage({ type: 'MASKIT_BRIDGE_REQ', nonce: null, action, payload }, location.origin);
     },
+  };
+
+  // ─── mask 的专用调用：更长超时 + 一次重试 ───
+  //
+  // `mask` 是整条链路上**唯一**「桥超时 = 明文出网」的调用：桥一超时，MAIN 侧拿不到
+  // `r.sid` 会走 (B) 分支把**原始请求体**发出去（未脱敏），而且**整条响应也不会被还原**
+  // （`sid` 为空 → 不包 wrapResponse）。restore 超时只是少还原几个字，代价完全不同。
+  //
+  // 3s 对 mask 太紧：引擎侧 `/api/ext/*` 走一把全局锁串行（`panel._EXT_LOCK`），
+  // 多标签页并发、或 NER 冷启动时，单次 mask 超过 3s 很正常。这里给 6s，并在失败时
+  // 重试一次。重试成功的第一个 sid 会在引擎侧成为孤儿会话，由会话 TTL 自然回收。
+  const MASK_TIMEOUT_MS = 6000;
+  const maskOnce = (text) => bridge.call('mask', { text }, MASK_TIMEOUT_MS);
+  const callMask = async (text) => {
+    // ⚠️ `blocking`（引擎 413 超限 / 503 管线失败 / 400 参数错）是**确定性拒绝**，
+    // **绝不重试**：重试只会拿同一份负载再打一次，既慢又白烧。它必须原样上抛给
+    // 调用点去 `throw new TypeError('Failed to fetch')`，走 fail-closed
+    // —— 宁可页面报网络错误，也绝不放行未脱敏明文出网。
+    const first = await maskOnce(text);
+    if (first && first.blocking) return first;
+    if (first) return first;
+    // 桥超时/失败 → 重试一次（覆盖引擎全局锁排队与 NER 冷启动的偶发超时）。
+    return await maskOnce(text);
   };
   window.addEventListener('message', (e) => {
     if (e.origin !== location.origin) return;
@@ -82,15 +105,17 @@
   // 同站限定是关键：埋点几乎全是跨域（clarity.ms / sentry.io / volces.com / 百度统计…），
   // 一条「不同站就不碰」就能滤掉绝大部分噪声，而 AI 站点的对话请求基本都在本站或子域。
   const LLM_PATH_HINTS = [
-    /\/api\/.*conversation/i, /\/backend-api\//i, /\/(v1\/)?(chat|completions|messages|responses)/i,
-    // ── 下面四条是 2026-09-16 真机逐站验证补的 ──
-    // 前三条的 `--` 分割的 RPC 形态（Gemini/Grok/Poe）与 `/rest/sse/`（Perplexity）
-    // 一个关键词都不带，不补的话这四站**整站静默未脱敏**：页面完全正常，
-    // 只是内容裸着发出去了——这是最难被发现的一类失败。
+    /\/api\/.*conversation/i,
+    /\/backend-api\//i,
+    /\/(?:v[0-9]+\/)?(?:chat|completions?|messages|responses)/i, // completions? 兼容单复数，覆盖 Claude/DeepSeek/Kimi 等
+    /\/samantha\/chat\//i,                                        // 豆包（Doubao）
+    /\/api\/(?:v[0-9]+\/)?chat\//i,                               // Kimi / 通义千问等
     /\/_\/BardChatUi\//i,   // Google Gemini（含 StreamGenerate / batchexecute）
     /\/app-chat\//i,        // Grok（xAI）：/rest/app-chat/conversations/…
     /\/rest\/sse\//i,       // Perplexity：/rest/sse/perplexity_ask
     /\/api\/gql/i,          // Poe：GraphQL 端点 /api/gql_POST
+    // ── 文件/附件上传端点（ChatGPT / Claude / 各主流 Web AI / 豆包） ──
+    /\/(?:api|backend-api|alice|v[0-9]+)\/.*(?:upload|files?|attachment|resource|convert|doc)/i,
   ];
 
   /**
@@ -143,14 +168,18 @@
   // 广泛模式开关由 SW 下发（chrome.storage 在 MAIN world 不可用）。默认 false（精准对话模式）。
   // 且**只问一次**并缓存——每个请求都问一次 storage 不划算，而这个值改了刷新页面就生效。
   let wideModePromise = null;
-  const getWideMode = () => {
+  const getWideMode = async () => {
     if (!wideModePromise) {
-      wideModePromise = bridge.call('config', {}).then((r) => {
-        const w = r && typeof r.wideMode === 'boolean' ? r.wideMode : false;
-        return { wideMode: w };
-      }).catch(() => ({ wideMode: false }));
+      wideModePromise = bridge.call('config', {})
+        .then((r) => (r && typeof r.wideMode === 'boolean' ? { wideMode: r.wideMode } : null))
+        .catch(() => null);
     }
-    return wideModePromise;
+    const res = await wideModePromise;
+    if (!res) {
+      wideModePromise = null;          // 拿不到就重试，不把「未知」固化成「精准模式」
+      return { wideMode: false };      // 本次仍按精准模式（保守），但不写进缓存
+    }
+    return res;
   };
 
   // ─── 可打码 body 判定（成对原则的落地点） ───
@@ -163,11 +192,104 @@
   const MULTIPART_CT = /^multipart\/form-data/i;
   const isMaskableBody = (req) => MASKABLE_CT.test((req.headers.get('content-type') || '').trim());
   const isMultipart = (req) => MULTIPART_CT.test((req.headers.get('content-type') || '').trim());
+
+  /**
+   * 上报「该打码、却打不开 body」的请求，让它出现在事件页，而不是无声消失。
+   *
+   * 为什么必须上报：`isUrlMaskable && !isMaskableBody` 是本系统唯一的**无感知漏脱敏**
+   * —— URL 命中对话白名单说明我们判断它该脱敏，content-type 不在可打码集合又说明
+   * 我们根本没读到内容。结果是用户以为内容被保护，实际原样明文出网，而页面上
+   * 毫无异常。实测（2026-09-20）尚无站点走到这一支；一旦某站改用 x-protobuf
+   * 或二进制 JSON 提交对话，就会整站静默漏掉，届时唯一的线索就是这条上报。
+   *
+   * 只送元数据（上游 path / content-type），**绝不送正文**：这条链路的意义恰恰是
+   * 「我们没能处理它」，把正文带过去等于把已经漏出去的明文再抄一份。
+   * 上报失败一律静默——它只是可观测性，绝不能反过来影响请求本身。
+   */
+  const reportUnsupportedBody = (url, ct) => {
+    try {
+      let path = String(url || '');
+      try { path = new URL(url, location.href).pathname; } catch (e) { /* 非法 URL 就用原串 */ }
+      bridge.call('warn', { path: path.slice(0, 200), content_type: String(ct || '').slice(0, 80) }, 2000)
+        .catch(() => {});
+    } catch (e) { /* 上报绝不影响请求 */ }
+  };
   const initBodyIsText = (init) => !!init && typeof init.body === 'string';
   const initBodyIsURLSearchParams = (init) =>
     !!init && typeof URLSearchParams !== 'undefined' && init.body instanceof URLSearchParams;
   const initBodyIsFormData = (init) =>
     !!init && typeof FormData !== 'undefined' && init.body instanceof FormData;
+  const initBodyIsBlob = (init) =>
+    !!init && typeof Blob !== 'undefined' && init.body instanceof Blob;
+  const initBodyIsArrayBuffer = (init) =>
+    !!init && (init.body instanceof ArrayBuffer || (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(init.body)));
+
+  // ─── 文件/存储桶与上传端点判定 ───
+  const STORAGE_OR_UPLOAD_HOSTS = [
+    /\.oaiusercontent\.com$/i,
+    /\.s3[.-][a-z0-9-]+\.amazonaws\.com$/i,
+    /\.s3\.amazonaws\.com$/i,
+    /\.blob\.core\.windows\.net$/i,
+    /\.storage\.googleapis\.com$/i,
+    /\.aliyuncs\.com$/i,
+    /\.myqcloud\.com$/i,
+    /\.volces\.com$/i,
+    /\.volccdn\.com$/i,
+    /claude\.ai$/i,
+    /chatgpt\.com$/i,
+    /doubao\.com$/i,
+    /deepseek\.com$/i,
+  ];
+
+  const isUploadOrStorageUrl = (url) => {
+    let u;
+    try {
+      u = new URL(url, location.href);
+    } catch (e) {
+      return false;
+    }
+    if (STORAGE_OR_UPLOAD_HOSTS.some((rx) => rx.test(u.hostname))) return true;
+    if (LLM_PATH_HINTS.some((rx) => rx.test(u.pathname))) return true;
+    return false;
+  };
+
+  /** 是否该对文件/附件类请求打码（包含跨域对象存储桶直传）。 */
+  const shouldMaskFileUrl = (url, wide) => {
+    return shouldMaskUrl(url, wide) || isUploadOrStorageUrl(url);
+  };
+
+  /**
+   * 这次 init 的 body 是否会真的被读一遍（而不是直接丢下不管）。
+   *
+   * 用途只有一个：init 路径（`fetch(url, { body })`）下，判断「URL 命中对话白名单，
+   * 但我们压根没读过这个 body」—— 那就是无感知漏脱敏，必须留痕。
+   * 注意 Blob 的门槛是 isUploadOrStorageUrl（与 maskSingleFile 的调用条件同源）：
+   * 即使在 LLM 路径上，maskSingleFile 也会实际读取并判定它，属于「处理过」，不算静默；
+   * 真正没被读过的只有未枚举的形态（ReadableStream / Document…）。
+   */
+  const initBodyWillBeHandled = (init, url) =>
+    !!init && (
+      typeof init.body === 'string'
+      || (typeof URLSearchParams !== 'undefined' && init.body instanceof URLSearchParams)
+      || (typeof FormData !== 'undefined' && init.body instanceof FormData)
+      || (typeof Blob !== 'undefined' && init.body instanceof Blob && isUploadOrStorageUrl(url))
+      || initBodyIsArrayBuffer(init)
+    );
+
+  // ─── Office 二进制格式清单 ───
+  //
+  // ⚠️ 必须定义在 `isMaskableTextAttachment` **之前**，并被它**优先排除**。
+  // 原因：Office 的 MIME 是 `application/vnd.openxmlformats-officedocument...`，
+  // 其中 `openxmlformats` 含子串 `xml` —— 任何 `type.includes('xml')` 式的子串匹配
+  // 都会把 docx/xlsx/pptx 全部误判成文本附件（真机实测，见下方判定函数注释）。
+  const OOXML_FILE_EXTS = new Set(['docx', 'xlsx', 'pptx', 'wps', 'et', 'dps', 'doc', 'xls']);
+
+  // 旧版 Office（OLE 复合二进制，.doc / .xls）：内容不是 ZIP，无法像 OOXML 那样解包改文本。
+  // 引擎对它们的「转换」是**有损重建**（丢图片/表格/样式，二进制碎片还会混入正文），因此
+  // 默认已关闭；关闭时这几个扩展名原样上行 = **完全不受保护**。单独列出只为给用户一条
+  // 明确的提示（「请另存为 .docx / .xlsx」），否则用户看到的只是笼统的「附件不脱敏」，
+  // 根本不知道该换格式。
+  const LEGACY_OFFICE_EXTS = new Set(['doc', 'xls']);
 
   // ─── 文本类文件扩展名与单文件上限（支持拖拽上传脱敏） ───
   const TEXT_FILE_EXTS = new Set([
@@ -180,6 +302,15 @@
   ]);
   const MAX_TEXT_FILE_SIZE = 8 * 1024 * 1024; // 8MB 单文件上限
 
+  /** 明确属于文本的 `application/*` 类型。**精确列举，禁止子串匹配**（理由见下方判定函数）。 */
+  const TEXT_APP_MIMES = new Set([
+    'application/json', 'application/x-ndjson', 'application/ndjson', 'application/jsonl',
+    'application/xml', 'application/xhtml+xml', 'application/x-yaml', 'application/yaml',
+    'application/toml', 'application/sql', 'application/javascript', 'application/x-javascript',
+    'application/ecmascript', 'application/x-sh', 'application/x-httpd-php',
+    'application/x-latex', 'application/x-tex', 'application/rtf',
+  ]);
+
   const isMaskableTextAttachment = (v) => {
     if (!v || typeof v !== 'object') return false;
     const size = typeof v.size === 'number' ? v.size : 0;
@@ -187,20 +318,21 @@
     const name = String(v.name || '').trim();
     if (name.includes('.')) {
       const ext = name.split('.').pop().toLowerCase();
+      // Office 二进制**必须先排除**：它的 MIME 含 `openxmlformats` 子串，走 MIME 判定必被误判。
+      if (OOXML_FILE_EXTS.has(ext)) return false;
       if (TEXT_FILE_EXTS.has(ext)) return true;
     }
-    const type = String(v.type || '').toLowerCase();
-    if (type.startsWith('text/')) return true;
-    if (
-      type.includes('json') ||
-      type.includes('xml') ||
-      type.includes('yaml') ||
-      type.includes('javascript') ||
-      type.includes('typescript')
-    ) {
-      return true;
-    }
-    return false;
+    // MIME 兜底只认**精确**文本类型，禁止子串匹配。
+    //
+    // 旧写法 `type.includes('json'|'xml'|'yaml')` 是本仓库最隐蔽的一处误判：
+    // `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`（xlsx）与
+    // docx/pptx 的 MIME 全都含 `xml` → 全部被当成文本附件 → `file.text()` 把二进制 zip
+    // 按 UTF-8 解码（非法字节变 U+FFFD）再编码回写，文件当场损坏。
+    // 真机实测：6488 字节的 xlsx 经此路径变成 11044 字节的非 zip，上传到
+    // ChatGPT/Claude 表现为「附件解析失败」，而扩展侧一切"正常"、无任何告警。
+    const type = String(v.type || '').toLowerCase().split(';')[0].trim();
+    if (!name || !type) return false;
+    return type.startsWith('text/') || TEXT_APP_MIMES.has(type);
   };
 
   /** 附件是否是图片（仅用于「未脱敏文件里有图片」的诚实提示）。 */
@@ -209,17 +341,85 @@
     return !!(v && typeof v.type === 'string' && v.type.startsWith('image/'));
   };
 
-  // ─── Office OpenXML 格式识别与二进制/Base64 互转 ───
-  const OOXML_FILE_EXTS = new Set(['docx', 'xlsx', 'pptx', 'wps', 'et', 'dps']);
-  const isOOXMLAttachment = (v) => {
+  // ─── 文本附件的「等长对齐」 ───
+  //
+  // 真机实测（2026-09-20）：上游（ChatGPT `/backend-api/files/process_upload_stream`）
+  // 按**上传前声明的字节数**校验实收字节数，差一个字节就回 `file_size_mismatch`
+  // 把整个附件拒收。Office 分支能过，是因为引擎侧 `_pad_zip_to_size` 把重压缩后的
+  // zip 补回了原始大小；文本分支没有对应机制，脱敏一改长度（占位符 `{{LABEL_后缀}}`
+  // 通常比手机号、短密钥长）上传就失败 —— 真机表现就是「Excel / Word 能传，txt 传不了」。
+  //
+  // 这里在扩展侧补上同样的对齐语义：
+  //   ① 脱敏后更短 → 尾部补空格（空白对 LLM 无副作用，也不引入任何新语义）
+  //   ② 恰好等长 → 直接用
+  //   ③ 脱敏后更长 → 无法缩短。**放弃脱敏、原样上传**，宁可不上码也不能让用户
+  //      传不了文件。注意这不是「静默跳过」：返回 masked=false，调用方会把它
+  //      计入 unmaskedCount 并在提示里如实体现，不会谎报成已保护。
+  const TEXT_ENCODER = new TextEncoder();
+
+  function alignTextToSize(maskedContent, originalContent, orig) {
+    const changed = maskedContent !== originalContent;
+    // 目标长度取**文件对象自身的 size**（= 站点向服务端声明的那个数），
+    // 而不是重新编码后的长度：原始文件若是非 UTF-8 编码，两者会不相等，
+    // 那时只有 orig.size 才是服务端真正比对的基准。
+    const target = (orig && typeof orig.size === 'number' && orig.size > 0)
+      ? orig.size
+      : TEXT_ENCODER.encode(originalContent).length;
+    const maskedBytes = TEXT_ENCODER.encode(maskedContent).length;
+    if (maskedBytes === target) {
+      return { content: maskedContent, masked: changed };
+    }
+    if (maskedBytes < target) {
+      return { content: maskedContent + ' '.repeat(target - maskedBytes), masked: changed };
+    }
+    return { content: originalContent, masked: false };
+  }
+
+  // ─── Office 格式识别与二进制/Base64 互转 ───
+  // `OOXML_FILE_EXTS` 定义见上方（必须先于文本判定生效，理由见其注释）。
+  const OOXML_MIME_MAP = {
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+    'application/msword': 'doc',
+    'application/vnd.ms-excel': 'xls',
+    'application/vnd.ms-powerpoint': 'pptx',
+  };
+
+  function resolveFileExt(v, urlHint) {
+    if (v && typeof v.name === 'string' && v.name.includes('.')) {
+      return v.name.split('.').pop().toLowerCase().trim();
+    }
+    if (v && typeof v.type === 'string') {
+      const mime = v.type.toLowerCase().split(';')[0].trim();
+      if (OOXML_MIME_MAP[mime]) return OOXML_MIME_MAP[mime];
+      if (mime === 'text/plain') return 'txt';
+      if (mime === 'text/csv') return 'csv';
+      if (mime === 'text/markdown') return 'md';
+      if (mime === 'application/json') return 'json';
+    }
+    if (urlHint) {
+      try {
+        const p = new URL(urlHint, location.href).pathname;
+        if (p.includes('.')) return p.split('.').pop().toLowerCase().trim();
+      } catch (e) { /* ignore */ }
+    }
+    return '';
+  }
+
+  const isOOXMLAttachment = (v, urlHint) => {
     if (!v || typeof v !== 'object') return false;
     const size = typeof v.size === 'number' ? v.size : 0;
     if (size <= 0 || size > MAX_OOXML_BYTES) return false;  // 上限见 MAX_OOXML_BYTES 注释
-    const name = String(v.name || '').trim();
-    if (!name.includes('.')) return false;
-    const ext = name.split('.').pop().toLowerCase();
+    const ext = resolveFileExt(v, urlHint);
     return OOXML_FILE_EXTS.has(ext);
   };
+
+  /** 快速检查二进制前4字节是否为 ZIP 魔数 PK\x03\x04 */
+  function isZipMagic(bytes) {
+    if (!bytes || bytes.length < 4) return false;
+    return bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04;
+  }
 
   function arrayBufferToBase64(buffer) {
     const bytes = new Uint8Array(buffer);
@@ -239,6 +439,8 @@
     }
     return bytes;
   }
+
+
 
   /**
    * multipart 打码：文本字段、常见文本附件与 Office 文档（.docx/.xlsx/.pptx）打码，其它二进制/图片原样透传。
@@ -265,6 +467,10 @@
       if (typeof v === 'string') {
         items.push({ kind: 'string', key: k, value: v });
         texts.push(v);
+      } else if (isOOXMLAttachment(v)) {
+        // Office 二进制**必须排在文本判定之前**：文本分支会把二进制按 UTF-8 读坏
+        // （见 `isMaskableTextAttachment` 注释）。顺序反了 = Office 打码永不生效。
+        items.push({ kind: 'ooxmlFile', key: k, file: v });
       } else if (isMaskableTextAttachment(v)) {
         let content = null;
         try {
@@ -278,8 +484,20 @@
         } else {
           items.push({ kind: 'raw', key: k, value: v });
         }
-      } else if (isOOXMLAttachment(v)) {
-        items.push({ kind: 'ooxmlFile', key: k, file: v });
+      } else if (v && typeof v === 'object' && typeof v.slice === 'function' && v.size > 0 && v.size <= MAX_OOXML_BYTES) {
+        // ZIP 魔数兜底：即使文件名被抹除或 MIME 类型为二进制流，只要前4字节为 PK\x03\x04 即按 OOXML 处理
+        let isZip = false;
+        try {
+          const headBuf = await v.slice(0, 4).arrayBuffer();
+          isZip = isZipMagic(new Uint8Array(headBuf));
+        } catch (e) {
+          isZip = false;
+        }
+        if (isZip) {
+          items.push({ kind: 'ooxmlFile', key: k, file: v });
+        } else {
+          items.push({ kind: 'raw', key: k, value: v });
+        }
       } else {
         items.push({ kind: 'raw', key: k, value: v });
       }
@@ -301,14 +519,17 @@
 
     let sid = null;
     let parts = [];
+    // 任一字符串字段/附件被真正改写？用于零触碰判定（一个敏感值都没命中就不重建请求）。
+    let textChanged = false;
     if (texts.length > 0) {
       const joined = texts.join(FIELD_SEP);
       if (joined) {
-        const r = await bridge.call('mask', { text: joined });
+        const r = await callMask(joined);
         if (r && r.blocking) return { blocking: true };  // (A) 无条件阻断，交给调用方抛
         if (r && r.ok) {
           sid = r.sid;
           parts = String(r.masked_text || '').split(FIELD_SEP);
+          if (String(r.masked_text || '') !== joined) textChanged = true;
         }
       }
     }
@@ -321,18 +542,26 @@
       } else if (item.kind === 'textFile') {
         const orig = item.file;
         if (parts.length === texts.length) {
-          const maskedContent = parts[textIdx++];
+          const maskedContent = parts[textIdx];
+          const originalContent = texts[textIdx];
+          textIdx++;
+          // 脱敏后必须与原始文件**等字节数**，否则上游按声明的 file_size 校验会拒收
+          // （见 alignTextToSize 注释：这是「Excel / Word 能传、txt 传不了」的根因）。
+          const aligned = alignTextToSize(maskedContent, originalContent, orig);
           let replacement;
           if (typeof File !== 'undefined' && orig instanceof File) {
-            replacement = new File([maskedContent], orig.name, {
+            replacement = new File([aligned.content], orig.name, {
               type: orig.type || 'text/plain',
               lastModified: orig.lastModified || Date.now(),
             });
           } else {
-            replacement = new Blob([maskedContent], { type: (orig && orig.type) || 'text/plain' });
+            replacement = new Blob([aligned.content], { type: (orig && orig.type) || 'text/plain' });
           }
           out.append(item.key, replacement, (orig && orig.name) || 'attachment.txt');
-          item.masked = true;                     // 只有真的换了内容才算已脱敏
+          // 内容**真的变了**才算已脱敏：引擎没命中敏感词时会原样回传，
+          // 那时报成已脱敏，就是把「未保护」包装成「已保护」。
+          // 对齐失败（脱敏后反而更长）时 aligned.masked 恒为 false，同样如实计入未脱敏。
+          if (aligned.masked) item.masked = true;
         } else {
           out.append(item.key, orig, orig && orig.name);
         }
@@ -342,29 +571,39 @@
         try {
           const buf = await orig.arrayBuffer();
           const b64 = arrayBufferToBase64(buf);
-          const r = await bridge.call('mask_file', { filename: orig.name, base64: b64, sid });
+          const fName = (orig && typeof orig.name === 'string' && orig.name) || 'attachment';
+          const r = await bridge.call('mask_file', { filename: fName, base64: b64, sid });
           if (r && r.blocking) return { blocking: true };  // (A) 必须立即阻断，严禁把未脱敏原文件漏传出网
           if (r && r.ok && r.base64) {
             sid = sid || r.sid;
             const bytes = base64ToUint8Array(r.base64);
+            let defaultMime = 'application/octet-stream';
+            const fExt = resolveFileExt(orig, '');
+            if (fExt === 'xlsx') defaultMime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+            else if (fExt === 'docx') defaultMime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+            else if (fExt === 'pptx') defaultMime = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+
             let replacement;
             if (typeof File !== 'undefined' && orig instanceof File) {
-              replacement = new File([bytes], orig.name, {
-                type: orig.type || 'application/octet-stream',
+              replacement = new File([bytes], fName, {
+                type: orig.type || defaultMime,
                 lastModified: orig.lastModified || Date.now(),
               });
             } else {
-              replacement = new Blob([bytes], { type: (orig && orig.type) || 'application/octet-stream' });
+              replacement = new Blob([bytes], { type: (orig && orig.type) || defaultMime });
             }
-            out.append(item.key, replacement, orig.name);
-            item.masked = true;                   // 解包-替换-封包全部成功才算已脱敏
+            out.append(item.key, replacement, fName);
+            // 引擎在「无敏感信息」或「体积无法对齐而放弃脱敏」时会原样回传字节，
+            // 只有 hit_count > 0 才说明内容真被改写过，才敢报「已脱敏」。
+            if (typeof r.hit_count === 'number' && r.hit_count > 0) item.masked = true;
             replaced = true;
           }
         } catch (e) {
+          console.warn('[Maskit Bridge] OOXML mask error:', e);
           replaced = false;
         }
         if (!replaced) {
-          out.append(item.key, orig, orig && orig.name);
+          out.append(item.key, orig, (orig && orig.name) || 'attachment.xlsx');
         }
       } else {
         out.append(item.key, item.value, item.value && item.value.name);
@@ -378,6 +617,9 @@
     let maskedCount = 0;
     let unmaskedCount = 0;
     let hasUnmaskedImage = false;
+    // 未脱敏的旧版 Office 文件单独计数：它们不是「漏了」而是「这类格式做不到」，
+    // 提示语与普通附件完全不同（要引导用户另存为 .docx / .xlsx）。
+    let legacyUnmaskedCount = 0;
     for (const item of items) {
       if (item.kind === 'string') continue;
       if (item.masked) {
@@ -385,6 +627,9 @@
       } else {
         unmaskedCount++;
         if (isImageItem(item)) hasUnmaskedImage = true;
+        if (item.kind === 'ooxmlFile' && LEGACY_OFFICE_EXTS.has(resolveFileExt(item.file, ''))) {
+          legacyUnmaskedCount++;
+        }
       }
     }
     if (unmaskedCount > 0 || maskedCount > 0) {
@@ -393,9 +638,132 @@
         image: hasUnmaskedImage,
         count: unmaskedCount,
         maskedCount: maskedCount,
+        legacyCount: legacyUnmaskedCount,
       });
     }
-    return { body: out, sid: sid };
+    // 零触碰原则（与文本 / Blob 分支一致）：一个敏感值都没命中时**不要重建 FormData**——
+    // 重建会换掉 boundary、改变请求字节指纹，对签名敏感的站点是纯风险而收益为零。
+    // 返回 null = 调用方原样放行原始请求（顺带也就不存在「需要还原的响应」）。
+    // 主域（claude.ai / chatgpt.com …）被整体当作上传域，所以这里能拦下域内**所有**
+    // FormData POST，零触碰也因此变成了必要而非可选项。
+    if (!textChanged && maskedCount === 0) return null;
+    return { body: out, sid: sid, masked: true };
+  }
+
+  /**
+   * 单文件（Blob / File）直传打码：覆盖对象存储直传（S3 / OSS / OAI）与单文件 POST/PUT。
+   * 支持 Office 文档（.docx / .xlsx / .pptx）与常见文本附件（.txt / .csv / .json 等）。
+   */
+  async function maskSingleFile(blob, urlHint) {
+    if (!blob || typeof Blob === 'undefined' || !(blob instanceof Blob)) return null;
+
+    let ext = resolveFileExt(blob, urlHint);
+    let isOOXML = OOXML_FILE_EXTS.has(ext);
+    let isText = isMaskableTextAttachment(blob);
+
+    // ZIP 魔数兜底：当没有明确扩展名或 MIME 类型为通用的 application/octet-stream 时，
+    // 检查前4字节是否为 PK\x03\x04 (ZIP)。若符合且大小在合法范围内，则强制按 OOXML 处理。
+    if (!isOOXML && !isText && blob.size > 4 && blob.size <= MAX_OOXML_BYTES) {
+      try {
+        const headBuf = await blob.slice(0, 4).arrayBuffer();
+        if (isZipMagic(new Uint8Array(headBuf))) {
+          isOOXML = true;
+          // 真实格式未知：**不猜 xlsx**。ext 留空后 filename 退化为 'attachment.bin'，
+          // 由引擎按 ZIP 内部结构（xl/ / word/ / ppt/）嗅探真实格式。
+          // 猜成 xlsx 会让 docx/pptx 被按 xlsx 解析、一个条目都匹配不上 → hits=0 → 静默不脱敏。
+          ext = '';
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    if (!isOOXML && !isText) {
+      if (blob.type && blob.type.startsWith('image/')) {
+        bridge.notify('note', { kind: 'attachment', image: true, count: 1, maskedCount: 0 });
+      }
+      return null;
+    }
+
+    const filename = (blob && typeof blob.name === 'string' && blob.name)
+      || (ext ? `attachment.${ext}` : 'attachment.bin');
+
+    // 1. Office 文档处理分支
+    if (isOOXML) {
+      if (blob.size > MAX_OOXML_BYTES) {
+        bridge.notify('note', { kind: 'attachment', image: false, count: 1, maskedCount: 0 });
+        return null;
+      }
+      try {
+        const buf = await blob.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        if (!isZipMagic(bytes)) return null;
+
+        let defaultMime = 'application/octet-stream';
+        if (ext === 'xlsx') defaultMime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+        else if (ext === 'docx') defaultMime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+        else if (ext === 'pptx') defaultMime = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+
+        const b64 = arrayBufferToBase64(buf);
+        const r = await bridge.call('mask_file', { filename, base64: b64 });
+        if (r && r.blocking) return { blocking: true };
+        if (r && r.ok && r.base64) {
+          // 引擎在「无敏感信息」或「体积无法对齐而放弃脱敏」时会**原样回传**字节。
+          // 那种情况下既不重建请求（保持零触碰，不动站点的签名相关字节），
+          // 也绝不报「已脱敏」——把「未保护」说成「已保护」是最危险的一类谎报。
+          if (!(typeof r.hit_count === 'number' && r.hit_count > 0)) return null;
+          const maskedBytes = base64ToUint8Array(r.base64);
+          let replacement;
+          if (typeof File !== 'undefined' && blob instanceof File) {
+            replacement = new File([maskedBytes], filename, {
+              type: blob.type || defaultMime,
+              lastModified: blob.lastModified || Date.now(),
+            });
+          } else {
+            replacement = new Blob([maskedBytes], { type: blob.type || defaultMime });
+          }
+          bridge.notify('note', { kind: 'attachment', image: false, count: 0, maskedCount: 1 });
+          return { body: replacement, sid: r.sid, masked: true };
+        }
+      } catch (e) {
+        return null;
+      }
+      return null;
+    }
+
+    // 2. 文本类附件处理分支
+    if (isText) {
+      try {
+        const content = await blob.text();
+        if (content && content.length > 0) {
+          const r = await callMask(content);
+          if (r && r.blocking) return { blocking: true };
+          if (r && r.ok && typeof r.masked_text === 'string') {
+            // 无命中时引擎原样回传：不重建请求（零触碰）、不报「已脱敏」。
+            if (r.masked_text === content) return null;
+            // 与 multipart 分支同一套对齐语义：脱敏后字节数必须与原始文件一致，
+            // 否则上游按声明的 file_size 校验会拒收（见 alignTextToSize 注释）。
+            const aligned = alignTextToSize(r.masked_text, content, blob);
+            // 对齐失败（脱敏后反而更长）：宁可不上码，也不能让用户的文件传不上去。
+            // 这里返回 null = 完全不碰请求，站点看到的是原始文件，与「未脱敏」一致。
+            if (!aligned.masked) return null;
+            let replacement;
+            if (typeof File !== 'undefined' && blob instanceof File) {
+              replacement = new File([aligned.content], filename, {
+                type: blob.type || 'text/plain',
+                lastModified: blob.lastModified || Date.now(),
+              });
+            } else {
+              replacement = new Blob([aligned.content], { type: blob.type || 'text/plain' });
+            }
+            bridge.notify('note', { kind: 'attachment', image: false, count: 0, maskedCount: 1 });
+            return { body: replacement, sid: r.sid, masked: true };
+          }
+        }
+      } catch (e) {
+        return null;
+      }
+    }
+
+    return null;
   }
 
   // ─── escape 由引擎按槽位判定 ───
@@ -436,7 +804,10 @@
     }
 
     const cfg = await getWideMode();
-    if (!shouldMaskUrl(url, cfg.wideMode)) {
+    const isUrlMaskable = shouldMaskUrl(url, cfg.wideMode);
+    const isFileUrlMaskable = shouldMaskFileUrl(url, cfg.wideMode);
+
+    if (!isUrlMaskable && !isFileUrlMaskable) {
       // 不打码不包装（成对原则）。窄模式下记一条「未命中对话接口的 POST」供反馈——
       // 广泛模式不记：它本就把同站 POST 全收了，记下来的全是跨域埋点，纯噪音。
       if (!cfg.wideMode) {
@@ -453,35 +824,66 @@
 
     let sid = null;
     if (isReq) {
-      // ── multipart：文本字段打码，文件原样 ──
+      // ── multipart：文本字段打码，文件打码 ──
       if (isMultipart(resource)) {
         const fd = await resource.clone().formData().catch(() => null);
         if (fd) {
           const m = await maskMultipart(fd);
           if (m && m.blocking) throw new TypeError('Failed to fetch');   // (A)
           if (m) {
-            // 必须删掉 content-type：旧值是**旧 boundary**，留着上游按不存在的分隔线
-            // 切分实体 → 400。新 FormData 由 fetch 自动补正确的 boundary。
+            // 必须删掉 content-type（旧 boundary）和 content-length（打码后体积已变）
             const h = new Headers(resource.headers);
             h.delete('content-type');
+            h.delete('content-length');
             resource = new Request(resource, { body: m.body, headers: h, signal: resource.signal });
-            return wrapResponse(await origFetch.call(this, resource), m.sid);
+            const res = await origFetch.call(this, resource);
+            // 文件上传响应为普通 JSON 元数据，绝不可走 wrapResponse（避免删除 Content-Length 或插入 TransformStream）
+            return (m.sid && m.masked) ? wrapResponse(res, m.sid) : res;
           }
         }
         return origFetch.apply(this, args);
       }
+
+      // ── 单文件直传（仅当请求发往上传/存储桶端点时，识别 Blob 附件）──
+      if (isUploadOrStorageUrl(url)) {
+        const ct = (resource.headers.get('content-type') || '').toLowerCase();
+        if (ct.includes('application/') || ct.includes('text/') || ct === '') {
+          const cloned = resource.clone();
+          const blob = await cloned.blob().catch(() => null);
+          if (blob && (isOOXMLAttachment(blob, url) || isMaskableTextAttachment(blob))) {
+            const m = await maskSingleFile(blob, url);
+            if (m && m.blocking) throw new TypeError('Failed to fetch');
+            if (m && m.masked) {
+              const h = new Headers(resource.headers);
+              h.delete('content-length');
+              resource = new Request(resource, { body: m.body, headers: h, signal: resource.signal });
+              return origFetch.call(this, resource);
+            }
+          }
+        }
+      }
+
       // 其它非文本 body（Blob / ReadableStream / ArrayBuffer）：读成字符串再回写会破坏
       // 原有语义，一律原样放行。
-      if (!isMaskableBody(resource)) return origFetch.apply(this, args);
+      //
+      // ⚠️ 但「URL 命中对话白名单」+「body 打不开」= 无感知漏脱敏（见
+      // reportUnsupportedBody 注释）。这一支必须留痕，且判定要在放行**之前**做：
+      // 一旦先 return，就没有任何地方能知道这次明文出网了。
+      // 注意 multipart 在上面（isMultipart 分支）已经 return，走不到这里。
+      if (isUrlMaskable && !isMaskableBody(resource)) {
+        reportUnsupportedBody(url, resource.headers.get('content-type') || '');
+      }
+      if (!isMaskableBody(resource) || !isUrlMaskable) return origFetch.apply(this, args);
       const raw = await resource.clone().text();
       if (raw.length > minLen) {
-        const r = await bridge.call('mask', { text: raw });
+        const r = await callMask(raw);
         if (r && r.ok) {
           sid = r.sid;
-          // 显式带上 signal —— `new Request(old, {body})` **不会**继承旧 signal，
-          // 页面 AbortController.abort() 后底层请求不再被取消（init 分支因 {...init}
-          // 天然保留）。与「重构造丢内部标志」同族。
-          resource = new Request(resource, { body: r.masked_text, signal: resource.signal });
+          // 零触碰原则：只有当内容确实被替换脱敏时，才重新构造 Request。
+          // 若内容未变，保留原生 resource 对象，防止破坏字节跳动/豆包等严格的风控签名（a_bogus）。
+          if (r.masked_text !== raw) {
+            resource = new Request(resource, { body: r.masked_text, signal: resource.signal });
+          }
         } else if (r && r.blocking) {
           throw new TypeError('Failed to fetch');      // (A) 无条件阻断
         }
@@ -500,18 +902,89 @@
       if (m) {
         const h = new Headers((init && init.headers) || {});
         h.delete('content-type');
+        h.delete('content-length');
         reqInit = { ...init, body: m.body, headers: h };
-        return wrapResponse(await origFetch.call(this, url, reqInit), m.sid);
+        const res = await origFetch.call(this, url, reqInit);
+        return (m.sid && m.masked) ? wrapResponse(res, m.sid) : res;
       }
-    } else if ((initBodyIsText(init) || isUrlParams) && (isUrlParams ? init.body.toString().length : init.body.length) > minLen) {
+    } else if (initBodyIsBlob(init) && isUploadOrStorageUrl(url)) {
+      const m = await maskSingleFile(init.body, url);
+      if (m && m.blocking) throw new TypeError('Failed to fetch');
+      if (m && m.masked) {
+        const h = new Headers((init && init.headers) || {});
+        h.delete('content-length');
+        reqInit = { ...init, body: m.body, headers: h };
+        const res = await origFetch.call(this, url, reqInit);
+        return m.sid ? wrapResponse(res, m.sid) : res;
+      }
+    } else if (initBodyIsArrayBuffer(init)) {
+      let isZip = false;
+      const bytes = init.body instanceof ArrayBuffer ? new Uint8Array(init.body) : new Uint8Array(init.body.buffer, init.body.byteOffset, init.body.byteLength);
+      if (bytes.length > 4 && isZipMagic(bytes)) {
+        isZip = true;
+      }
+      if (isZip && isFileUrlMaskable) {
+        // ── ArrayBuffer 格式的 Office 文档直传 ──
+        // 桥调用单独兜底（解析/桥异常 → r=null，即 (B) 原样放行），但 **blocking 判定必须
+        // 留在 try 之外**：它是 throw，若写在 try 内会被同一个 catch 静默吞掉，引擎明确
+        // 要求的阻断就落回下面的明文直发（同函数其它 blocking 点都在 catch 外）。
+        let r = null;
+        try {
+          const b64 = arrayBufferToBase64(bytes.buffer);
+          // 传无扩展名的通用名，让引擎按 ZIP 内部结构（xl/ / word/ / ppt/）嗅探真实格式。
+          // 写死 'attachment.xlsx' 会让嗅探分支永不执行：docx/pptx 被按 xlsx 解析，
+          // 一个条目都匹配不上 → hits=0 → 扩展判成「无敏感信息」而静默不脱敏。
+          r = await bridge.call('mask_file', { filename: 'attachment', base64: b64 });
+        } catch (e) { r = null; /* 桥不可用 → (B) 原样放行 */ }
+        if (r && r.blocking) throw new TypeError('Failed to fetch');   // (A) 必须阻断
+        if (r && r.ok && r.base64) {
+          const maskedBytes = base64ToUint8Array(r.base64);
+          const h = new Headers((init && init.headers) || {});
+          h.delete('content-length');
+          reqInit = { ...init, body: maskedBytes, headers: h };
+          return origFetch.call(this, url, reqInit);
+        }
+      } else if (isUrlMaskable) {
+        // ── 字节跳动/豆包 WebAssembly 文本内存字节数组脱敏分支 ──
+        let rawText = null;
+        let r = null;
+        try {
+          rawText = new TextDecoder().decode(init.body);
+        } catch (e) { rawText = null; /* 非文本字节 → (B) 原样放行 */ }
+        if (rawText && rawText.length > minLen) {
+          try {
+            r = await callMask(rawText);
+          } catch (e) { r = null; }
+        }
+        if (r && r.blocking) throw new TypeError('Failed to fetch');   // (A) 必须阻断
+        if (r && r.ok) {
+          sid = r.sid;
+          if (r.masked_text !== rawText) {
+            const enc = new TextEncoder();
+            const maskedBytes = enc.encode(r.masked_text);
+            reqInit = { ...init, body: maskedBytes };
+          }
+        }
+      }
+    } else if ((initBodyIsText(init) || isUrlParams) && isUrlMaskable && (isUrlParams ? init.body.toString().length : init.body.length) > minLen) {
       const textToMask = isUrlParams ? init.body.toString() : init.body;
-      const r = await bridge.call('mask', { text: textToMask });
+      const r = await callMask(textToMask);
       if (r && r.ok) {
         sid = r.sid;
-        reqInit = { ...init, body: isUrlParams ? new URLSearchParams(r.masked_text) : r.masked_text };
+        // 零触碰原则：未命中敏感词时不改写 init 对象，保护签名完整性
+        if (r.masked_text !== textToMask) {
+          reqInit = { ...init, body: isUrlParams ? new URLSearchParams(r.masked_text) : r.masked_text };
+        }
       } else if (r && r.blocking) {
         throw new TypeError('Failed to fetch');        // (A)
       }
+    }
+    // 未枚举/处理不了的 body 形态（Blob 发往非上传 URL、ReadableStream、Document…）：
+    // 原样放行，但 **URL 命中对话白名单时必须留痕** —— 与 isReq 路径
+    // （`isUrlMaskable && !isMaskableBody`）同一条原则：判定要在放行**之前**做，
+    // 否则没有任何地方能知道这次是明文出网。此前 init 路径一个上报点也没有。
+    if (isUrlMaskable && !initBodyWillBeHandled(init, url)) {
+      reportUnsupportedBody(url, new Headers((init && init.headers) || {}).get('content-type') || '');
     }
     return sid
       ? wrapResponse(await origFetch.call(this, url, reqInit), sid)
@@ -582,5 +1055,398 @@
     return wrapped;
   };
 
-  // XHR hook：v1 不做（v1.1 完整范围项）。v1 阶段 XHR 请求整体透传（成对原则）。
+  // ─── XMLHttpRequest hook ───
+  //
+  // 注：文本类 mask 的调用点都顺手记下引擎回的 sid（`if (r && r.ok && r.sid) ctx.sid = r.sid`）。
+  // 响应侧还原必须用**同一个 sid**（映射挂在它下面），而这个 sid 只有 mask 响应里才有；
+  // 文件类分支不记 —— 那是二进制响应，不走文本还原。
+  // 桥要求阻断（引擎 413/503/400）时，给页面一个**完整**的失败事件链。
+  //
+  // ⚠️ 只派 `error` 是不够的：原生 XHR 在失败时**一定同时**派发 `loadend`，而 axios
+  // 正是靠 `onloadend` 收尾的 —— 少这一个事件，axios 永远停在 pending（实测：页面卡满
+  // 30s 超时，用户看到的是「转圈不停」，比报错更糟）。事件必须走 `dispatchEvent`
+  // （MaskitXHR 已把它接到页面注册表上），不能直接调页面的 handler。
+  const failXHR = (xhr) => {
+    xhr.dispatchEvent(new ProgressEvent('error'));
+    xhr.dispatchEvent(new ProgressEvent('loadend'));
+  };
+
+  const origXHROpen = window.XMLHttpRequest.prototype.open;
+  const origXHRSend = window.XMLHttpRequest.prototype.send;
+  const origXHRSetRequestHeader = window.XMLHttpRequest.prototype.setRequestHeader;
+  const origXHRAbort = window.XMLHttpRequest.prototype.abort;
+
+  window.XMLHttpRequest.prototype.open = function (method, url, async, user, password) {
+    const isAsync = async !== false;
+    this._maskit = {
+      method: String(method || 'GET').toUpperCase(),
+      url: String(url || ''),
+      headers: {},
+      isAsync: isAsync,
+      aborted: false,
+    };
+    return origXHROpen.apply(this, arguments);
+  };
+
+  window.XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+    if (this._maskit && this._maskit.headers) {
+      this._maskit.headers[String(name || '').toLowerCase()] = String(value || '');
+    }
+    return origXHRSetRequestHeader.apply(this, arguments);
+  };
+
+  window.XMLHttpRequest.prototype.abort = function () {
+    if (this._maskit) {
+      this._maskit.aborted = true;
+    }
+    return origXHRAbort.apply(this, arguments);
+  };
+
+  window.XMLHttpRequest.prototype.send = function (body) {
+    const ctx = this._maskit;
+    if (!ctx || (ctx.method !== 'POST' && ctx.method !== 'PUT' && ctx.method !== 'PATCH') || !body) {
+      return origXHRSend.apply(this, arguments);
+    }
+
+    if (!ctx.isAsync) {
+      // 同步 XHR 做不了脱敏：打码必须异步问引擎，而 sync XHR 不能用 await。
+      // **但不能静默**：URL 命中对话/上传白名单时这就是一次无感知漏脱敏（正文明文出网），
+      // 必须留痕。用窄模式判据（不依赖异步的 wideMode），宁可少报也不能一声不响。
+      if (shouldMaskUrl(ctx.url, false) || isUploadOrStorageUrl(ctx.url)) {
+        reportUnsupportedBody(ctx.url, (ctx.headers && ctx.headers['content-type']) || '');
+      }
+      return origXHRSend.apply(this, arguments);
+    }
+
+    const xhr = this;
+    const isFormData = typeof FormData !== 'undefined' && body instanceof FormData;
+    const isBlob = typeof Blob !== 'undefined' && body instanceof Blob;
+    const isString = typeof body === 'string' && body.length > MIN_MASKABLE_LEN;
+    const isArrayBuf = typeof ArrayBuffer !== 'undefined' && (body instanceof ArrayBuffer || ArrayBuffer.isView(body));
+    // fetch 路径早就显式处理了 URLSearchParams，XHR 之前直接放行 → 这类表单编码 body
+    // 会静默未脱敏（同样命中对话白名单时也一声不响）。
+    const isUrlParams = typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams;
+
+    if (!isFormData && !isBlob && !isString && !isArrayBuf && !isUrlParams) {
+      // 没枚举到的 body 形态：原样放行，但命中白名单时留痕（与 fetch 路径同一条原则）。
+      if (shouldMaskUrl(ctx.url, false) || isUploadOrStorageUrl(ctx.url)) {
+        reportUnsupportedBody(ctx.url, (ctx.headers && ctx.headers['content-type']) || '');
+      }
+      return origXHRSend.apply(this, arguments);
+    }
+
+    const processAndSend = async () => {
+      try {
+        const cfg = await getWideMode();
+        const isUrlMaskable = shouldMaskUrl(ctx.url, cfg.wideMode);
+        const isFileUrlMaskable = shouldMaskFileUrl(ctx.url, cfg.wideMode);
+
+        if (!isUrlMaskable && !isFileUrlMaskable) {
+          if (!ctx.aborted) origXHRSend.call(xhr, body);
+          return;
+        }
+
+        let sendBody = body;
+        if (isFormData) {
+          const m = await maskMultipart(body);
+          if (ctx.aborted) return;
+          if (m && m.blocking) {
+            failXHR(xhr);
+            return;
+          }
+          if (m && m.body) {
+            sendBody = m.body;
+          }
+        } else if (isBlob && isFileUrlMaskable) {
+          const m = await maskSingleFile(body, ctx.url);
+          if (ctx.aborted) return;
+          if (m && m.blocking) {
+            failXHR(xhr);
+            return;
+          }
+          if (m && m.masked) {
+            sendBody = m.body;
+          }
+        } else if (isArrayBuf && (isUrlMaskable || isFileUrlMaskable)) {
+          let isZip = false;
+          const bytes = body instanceof ArrayBuffer ? new Uint8Array(body) : new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+          if (bytes.length > 4 && isZipMagic(bytes)) {
+            isZip = true;
+          }
+          if (isZip && isFileUrlMaskable) {
+            try {
+              const b64 = arrayBufferToBase64(bytes.buffer);
+              const r = await bridge.call('mask_file', { filename: 'attachment', base64: b64 });
+              if (ctx.aborted) return;
+              if (r && r.blocking) {
+                failXHR(xhr);
+                return;
+              }
+              if (r && r.ok && r.base64) {
+                sendBody = base64ToUint8Array(r.base64);
+              }
+            } catch (e) { /* ignore */ }
+          } else if (isUrlMaskable) {
+            try {
+              const dec = new TextDecoder();
+              const rawText = dec.decode(body);
+              if (rawText && rawText.length > MIN_MASKABLE_LEN) {
+                const r = await callMask(rawText);
+                if (ctx.aborted) return;
+                if (r && r.blocking) {
+                  failXHR(xhr);
+                  return;
+                }
+                if (r && r.ok && r.sid) ctx.sid = r.sid;
+                if (r && r.ok && r.masked_text && r.masked_text !== rawText) {
+                  sendBody = new TextEncoder().encode(r.masked_text);
+                }
+              }
+            } catch (e) { /* ignore */ }
+          }
+        } else if (isUrlParams && isUrlMaskable) {
+          const textToMask = body.toString();
+          if (textToMask.length > MIN_MASKABLE_LEN) {
+            const r = await callMask(textToMask);
+            if (ctx.aborted) return;
+            if (r && r.blocking) {
+              failXHR(xhr);
+              return;
+            }
+            if (r && r.ok && r.sid) ctx.sid = r.sid;
+            // 与 fetch 路径同一套做法：重新构造 URLSearchParams（不要拼字符串），
+            // 否则编码可能与原文不一致（空格 / `+` 等）。
+            if (r && r.ok && r.masked_text && r.masked_text !== textToMask) {
+              sendBody = new URLSearchParams(r.masked_text);
+            }
+          }
+        } else if (isString && isUrlMaskable) {
+          const r = await callMask(body);
+          if (ctx.aborted) return;
+          if (r && r.blocking) {
+            failXHR(xhr);
+            return;
+          }
+          if (r && r.ok && r.sid) ctx.sid = r.sid;
+          if (r && r.ok && r.masked_text) {
+            sendBody = r.masked_text;
+          }
+        }
+
+        if (ctx.aborted) return;
+        // 响应侧还原：仅当拿到 sid、且响应是文本型时启用（见 MaskitXHR）。
+        // 这里曾是「XHR 只脱敏不还原」的已知限制 —— 直接改原生实例确实做不到
+        // （`responseText` 是同步 getter，而还原要异步问引擎），但换成**继承 +
+        // 截获事件派发**就做得到：先还原完，再把事件交给页面。
+        if (ctx.sid && typeof xhr.__mkSetupRestore === 'function') {
+          xhr.__mkSetupRestore(ctx.sid);
+        }
+        origXHRSend.call(xhr, sendBody);
+      } catch (err) {
+        if (!ctx.aborted) {
+          origXHRSend.call(xhr, body);
+        }
+      }
+    };
+
+    processAndSend();
+  };
+
+  // ─── XHR 响应侧还原（MaskitXHR）────────────────────────────────────────────
+  //
+  // 【为什么以前算「已知限制」】`responseText` / `response` 是**同步** getter，而还原
+  // 必须异步问引擎（占位符→原文的映射只在引擎侧）。直接改原生实例的文本做不到。
+  //
+  // 【现在怎么做到】换个位置下手：**继承**原生 XHR，并把页面的 `addEventListener`
+  // 与 `on*` 全部截获到自己的表里 —— 页面因此**根本没注册到原生实例**上，原生事件
+  // 只有我们自己的内部监听收得到。于是「什么时候把事件交给页面」由我们决定：
+  // 先异步还原，再派发。页面（axios 就是在 `onprogress` 里读 `responseText`）读到的
+  // 已经是还原后的文本。
+  //
+  // 【安全边界不变】映射仍然只存在于引擎侧，MAIN world 拿到的只有还原结果，与 fetch
+  // 路径完全一致。分帧同样交给引擎（`stream_id` + `final`，与 `wrapResponse` 共用同一套
+  // `restore_stream_chunk`），这里只喂**新增**的原生文本增量，绝不自己切 SSE 帧 ——
+  // 跨 chunk 被切开的占位符由引擎缓冲拼回来。
+  //
+  // 【绝不碰的场合】`responseType` 不是 text/'' 的、没拿到 sid 的，全部原样透传；
+  // 还原失败/超时也恒透传（少还原一个 chunk，绝不能让用户的流卡住）。
+  const RESTORE_TIMEOUT_MS = 2500;
+  const XHR_EVENT_TYPES = [
+    'readystatechange', 'progress', 'load', 'loadstart', 'loadend', 'error', 'abort', 'timeout',
+  ];
+  const OrigXHR = window.XMLHttpRequest;
+  const nativeXHRAddEventListener = OrigXHR.prototype.addEventListener;
+  const nativeXHRRemoveEventListener = OrigXHR.prototype.removeEventListener;
+  const nativeXHRResponseTextGet = Object.getOwnPropertyDescriptor(OrigXHR.prototype, 'responseText').get;
+  const nativeXHRResponseGet = Object.getOwnPropertyDescriptor(OrigXHR.prototype, 'response').get;
+
+  class MaskitXHR extends OrigXHR {
+    constructor() {
+      super();
+      this.__mkListeners = new Map();       // 页面注册的监听器：type -> [{fn, once}]
+      this.__mkOn = Object.create(null);    // 页面的 on* 属性
+      this.__mkRestore = null;              // 仅当本次请求需要还原时才有值
+      // 用**原生** addEventListener 注册内部监听（绕过下面的重写），保证原生事件
+      // 一定被我们收到、而页面永远拿不到「未还原」的那一份。
+      for (const evType of XHR_EVENT_TYPES) {
+        nativeXHRAddEventListener.call(this, evType, (ev) => { this.__mkOnNative(evType, ev); });
+      }
+    }
+
+    // ── 页面注册面：全部截获，不落到原生实例上 ──
+    addEventListener(type, fn, opts) {
+      if (!fn || !this.__mkListeners) return nativeXHRAddEventListener.call(this, type, fn, opts);
+      const t = String(type);
+      const arr = this.__mkListeners.get(t) || [];
+      arr.push({ fn, once: !!(opts && typeof opts === 'object' && opts.once) });
+      this.__mkListeners.set(t, arr);
+    }
+
+    removeEventListener(type, fn) {
+      if (!this.__mkListeners) return nativeXHRRemoveEventListener.call(this, type, fn);
+      const t = String(type);
+      const arr = this.__mkListeners.get(t);
+      if (arr) this.__mkListeners.set(t, arr.filter((it) => it.fn !== fn));
+    }
+
+    // 我们在阻断分支里用的 `dispatchEvent(new ProgressEvent('error'))` 也必须走这张表
+    // （否则页面注册的 onerror 收不到，阻断就成了静默失败）；页面主动派发同理。
+    // 这里**不调** super：原生事件不经过本方法，不存在重复派发。
+    dispatchEvent(ev) {
+      if (!ev || !this.__mkListeners) return super.dispatchEvent(ev);
+      this.__mkFire(String(ev.type), ev);
+      return true;
+    }
+
+    __mkSetupRestore(sid) {
+      if (this.__mkRestore) return;
+      let rt = '';
+      try { rt = String(this.responseType || ''); } catch (e) { return; }
+      if (rt !== '' && rt !== 'text') return;      // json/blob/arraybuffer：不是文本，不碰
+      this.__mkRestore = {
+        sid,
+        streamId: (crypto.randomUUID && crypto.randomUUID()) || String(Math.random()).slice(2),
+        rawLen: 0,          // 已喂给引擎的**原生**文本长度（还原后长度会变，所以按原生算）
+        restored: '',       // 累积的还原结果 —— 即页面读到的内容
+        contentType: '',
+        finalSent: false,
+        failStreak: 0,      // 连续失败计数（成功即归零）
+        degraded: false,    // 本次流已放弃还原，全部按原生文本透传
+        chain: Promise.resolve(),
+      };
+    }
+
+    __mkOnNative(evType, ev) {
+      const st = this.__mkRestore;
+      if (!st) { this.__mkFire(evType, ev); return; }   // 不还原：同步转发，零时序变化
+      // 串行化：progress 会连着来，必须让还原按顺序完成，否则结果会错位。
+      st.chain = st.chain.then(() => this.__mkHandle(evType, ev)).catch(() => { this.__mkFire(evType, ev); });
+    }
+
+    async __mkHandle(evType, ev) {
+      const st = this.__mkRestore;
+      if (!st) { this.__mkFire(evType, ev); return; }
+      const isFinal = evType === 'loadend' || this.readyState === 4;
+      try { await this.__mkPull(st, isFinal); } catch (e) { /* 还原失败恒透传 */ }
+      this.__mkFire(evType, ev);
+    }
+
+    async __mkPull(st, isFinal) {
+      let raw = '';
+      // 直接调**原生** getter：我们自己的 getter 返回的是还原后的文本，不是引擎要的口径。
+      try { raw = nativeXHRResponseTextGet.call(this) || ''; } catch (e) { return; }
+      const delta = raw.length > st.rawLen ? raw.slice(st.rawLen) : '';
+      if (!delta && !isFinal) return;
+      if (isFinal && st.finalSent) return;
+      if (isFinal) st.finalSent = true;
+      st.rawLen = raw.length;
+      if (!st.contentType) {
+        try { st.contentType = (this.getResponseHeader('content-type') || '').toLowerCase(); } catch (e) { /* ignore */ }
+      }
+      // 引擎挂了 / 超时：**连续两次**失败就把本次流降级为纯透传。
+      //
+      // 只失败一次还可能是引擎忙（偶发），但若不降级，每个 chunk 都要等满
+      // RESTORE_TIMEOUT_MS —— 一条 200 chunk 的流就是 500 秒，用户的流被我们拖死。
+      // 那比少还原几个字严重得多（同 fetch 路径「宁可少还原，绝不卡住流」的口径）。
+      // 失败一次也**不缓存失败结果**：下一 chunk 仍然试，只是不无限等。
+      if (st.degraded) { st.restored += delta; return; }
+      const r = await bridge.call('restore', {
+        sid: st.sid, stream_id: st.streamId, text: delta, final: !!isFinal, content_type: st.contentType,
+      }, RESTORE_TIMEOUT_MS);
+      if (r && r.ok) {
+        st.failStreak = 0;
+        st.restored += (typeof r.text === 'string' ? r.text : delta);
+        return;
+      }
+      st.failStreak += 1;
+      if (st.failStreak >= 2) st.degraded = true;
+      st.restored += delta;     // 还原失败恒透传（与 fetch 路径同口径）
+    }
+
+    __mkFire(evType, ev) {
+      const list = this.__mkListeners && this.__mkListeners.get(evType);
+      if (list && list.length) {
+        for (const item of list.slice()) {
+          if (item.once) this.removeEventListener(evType, item.fn);
+          // 页面自己的异常不该吃掉同事件上的其它监听（原生行为也是这样）。
+          try { item.fn.call(this, ev); } catch (e) { /* ignore */ }
+        }
+      }
+      const on = this.__mkOn && this.__mkOn[evType];
+      if (typeof on === 'function') {
+        try { on.call(this, ev); } catch (e) { /* ignore */ }
+      }
+    }
+  }
+
+  // on* 属性：原生的是原型上的 setter/getter，直接覆盖成我们的表（含 get 回读）。
+  for (const evType of XHR_EVENT_TYPES) {
+    Object.defineProperty(MaskitXHR.prototype, 'on' + evType, {
+      configurable: true,
+      get() { return this.__mkOn ? this.__mkOn[evType] : null; },
+      set(fn) {
+        if (!this.__mkOn) return;
+        if (typeof fn === 'function') this.__mkOn[evType] = fn;
+        else delete this.__mkOn[evType];
+      },
+    });
+  }
+
+  Object.defineProperty(MaskitXHR.prototype, 'responseText', {
+    configurable: true,
+    get() {
+      const st = this.__mkRestore;
+      if (!st) return nativeXHRResponseTextGet.call(this);
+      // 先过一遍原生 getter：readyState < 3 或 responseType 非 text 时它会按规范抛
+      // InvalidStateError，这个语义必须保留（库靠它判断状态）。
+      nativeXHRResponseTextGet.call(this);
+      return st.restored;
+    },
+  });
+
+  Object.defineProperty(MaskitXHR.prototype, 'response', {
+    configurable: true,
+    get() {
+      const st = this.__mkRestore;
+      if (!st) return nativeXHRResponseGet.call(this);
+      let rt = '';
+      try { rt = String(this.responseType || ''); } catch (e) { rt = 'x'; }
+      if (rt === '' || rt === 'text') return st.restored;
+      return nativeXHRResponseGet.call(this);
+    },
+  });
+
+  // 替换全局构造器。bridge-main 是 document_start 注入，页面脚本必然在这之后解析，
+  // 所以页面拿到的是 MaskitXHR；`instanceof XMLHttpRequest` 仍然成立（继承）。
+  //
+  // 【作用域收窄（2026-09-21 回归修复）】**只在 DeepSeek 替换**。
+  // 原生 XHR 事件是**同步**派发的，而本构造器把页面监听全部截获、改成「先异步还原再派发」
+  // —— 这对**每一个** XHR 请求都加了一层时序包装，任何依赖同步时序的页面代码都可能出错。
+  // 实测：ChatGPT / Claude 这两个此前已验证可用的站点因此出现异常。
+  // XHR 响应还原目前只为 DeepSeek（axios 在 onprogress 里读 responseText）落地，
+  // 所以其余站点一律保持原生构造器，零副作用。以后要扩站点，先在那个站点真机验证。
+  const XHR_RESTORE_HOSTS = /(^|\.)deepseek\.com$/i;
+  if (XHR_RESTORE_HOSTS.test(location.hostname)) {
+    window.XMLHttpRequest = MaskitXHR;
+  }
 })();

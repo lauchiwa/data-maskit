@@ -10,7 +10,7 @@
 
 'use strict';
 
-const { siteCovers, unsupportedReason } = self.MASKIT_SHARED;
+const { siteCovers, unsupportedReason, EXT_PROTOCOL_VERSION } = self.MASKIT_SHARED;
 
 const I18N = {
   zh: {
@@ -25,6 +25,8 @@ const I18N = {
     statusOk: '引擎正常',
     statusDown: '引擎未运行，已直通 {n}s',
     statusBlocked: '引擎异常，已阻断',
+    protoWarn:
+      '扩展与客户端协议不匹配（扩展 v{p} ⇄ 客户端 v{e}）。脱敏行为可能已不正确，请重新加载扩展。',
     statusInvalidToken: 'token 失效，请到设置更新',
     statusInvalidTokenHold: 'token 失效，请到设置更新（已降速重试中）',
     statusDisabledPanel: '扩展已关闭（面板开关）',
@@ -47,6 +49,8 @@ const I18N = {
     attachText: '本页上传了 {n} 个文件。文件内容不会脱敏，只有文字字段会被打码。',
     attachTextImg: '本页上传了 {n} 个文件（含图片）。图片与附件里的内容不会脱敏，只有文字字段会被打码。',
     attachTextMasked: '本页上传了 {n} 个文本文件，文件内敏感信息已自动完成打码脱敏。',
+    attachTextLegacy:
+      '本页上传了 {n} 个旧版 Office 文件（.doc / .xls）：这类格式无法在不破坏文件的前提下脱敏，已原样上传（内容未打码）。请另存为 .docx / .xlsx 后再上传。',
     refreshBtn: '刷新',
     optionsBtn: '设置',
     colTime: '时间',
@@ -68,6 +72,8 @@ const I18N = {
     statusOk: 'Engine OK',
     statusDown: 'Engine not running, passthrough {n}s',
     statusBlocked: 'Engine error, blocking',
+    protoWarn:
+      'Extension/client protocol mismatch (extension v{p} ⇄ client v{e}). Masking may be incorrect — reload the extension.',
     statusInvalidToken: 'Token invalid, update it in settings',
     statusInvalidTokenHold: 'Token invalid — update it in settings (retrying at low rate)',
     statusDisabledPanel: 'Extension bridge disabled (panel switch)',
@@ -90,6 +96,8 @@ const I18N = {
     attachText: 'This page uploaded {n} file(s). File contents are NOT masked — only text fields are.',
     attachTextImg: 'This page uploaded {n} file(s), including images. Image and attachment contents are NOT masked — only text fields are.',
     attachTextMasked: 'This page uploaded {n} text file(s); sensitive data inside has been masked.',
+    attachTextLegacy:
+      'This page uploaded {n} legacy Office file(s) (.doc / .xls). These formats cannot be masked without destroying the file, so they were uploaded as-is (NOT masked). Please save them as .docx / .xlsx and upload again.',
     refreshBtn: 'Refresh',
     optionsBtn: 'Settings',
     colTime: 'Time',
@@ -310,13 +318,38 @@ function renderAttach(snap) {
   const box = $('attachBox');
   box.hidden = !rec;
   if (!rec) return;
-  if (rec.count > 0) {
+  if (rec.legacyCount > 0) {
+    // 旧版 Office 优先提示：它的处置建议与其他「附件不脱敏」不同（要换格式再传），
+    // 混在笼统提示里用户不知道下一步该做什么。
+    $('attachText').textContent = t('attachTextLegacy', { n: rec.legacyCount });
+  } else if (rec.count > 0) {
     $('attachText').textContent = t(rec.image ? 'attachTextImg' : 'attachText', { n: rec.count });
   } else if (rec.maskedCount > 0) {
     $('attachText').textContent = t('attachTextMasked', { n: rec.maskedCount });
   } else {
     box.hidden = true;
   }
+}
+
+/**
+ * 协议不匹配告警。
+ *
+ * 【为什么不复用上面那行状态】状态行表达的是「引擎可达 / 不可达 / 已阻断」，而协议
+ * 不匹配恰恰发生在**引擎完全正常**的时候——塞进状态行等于把「引擎是好的」说成
+ * 「引擎有问题」，直接误导排查方向。
+ *
+ * 触发条件的本质：客户端改了 `/api/ext/*` 的契约，而用户没重载扩展。此时脱敏语义
+ * 可能已经不对（例如某字段被改名，扩展读到 undefined 却当成空值继续跑）。
+ */
+function renderProto(snap) {
+  const box = $('protoBox');
+  const mismatch = !!(snap && snap.protoMismatch);
+  box.hidden = !mismatch;
+  if (!mismatch) return;
+  const engineProto = (snap && snap.engineProtocol != null) ? snap.engineProtocol : '?';
+  $('protoText').textContent = t('protoWarn', {
+    p: String(EXT_PROTOCOL_VERSION), e: String(engineProto),
+  });
 }
 
 function render(snap) {
@@ -340,6 +373,7 @@ function render(snap) {
 
   renderStatus(snap);
   renderGuide(snap);
+  renderProto(snap);
   renderAttach(snap);
   renderRecent(snap);
   renderUnmatched(snap);

@@ -427,6 +427,188 @@ if (!maskSites.length) {
   }
 }
 
+// `callMask()` 是 mask 的封装（6s 超时 + 一次重试，定义见 bridge-main.js）。
+// 封装内部已判 blocking，但**调用点**仍必须各自判 —— 否则调用点会把一个非 ok 的
+// 结果当成成功继续往下走。这里把封装调用点一并纳入扫描，避免新增一层抽象之后
+// 把原来的红线检查架空。
+const callMaskSites = [...mainSrc.matchAll(/\bcallMask\(/g)]
+for (const site of callMaskSites) {
+  if (!/\bblocking\b/.test(mainSrc.slice(site.index, site.index + 600))) {
+    fail('bridge-main.js 的 callMask() 调用点没判 blocking —— 引擎 413/503 时会把' +
+      '未脱敏原文直接放行出网，违背 fail-closed 红线')
+  }
+}
+
+// ── 响应还原判据不得用「URL 是否属上传域」 ───────────────────────────────
+// `STORAGE_OR_UPLOAD_HOSTS` 里含 claude.ai / chatgpt.com / doubao.com / deepseek.com
+// 四个**主域**（为了兜住路径不带 upload/files 关键字的附件端点，属有意为之的保守匹配），
+// 于是 `isUploadOrStorageUrl(url)` 在这些站点上**恒为 true**。拿它的**否定形式**当还原
+// 判据（曾经写成 `(m.sid && !isUploadOrStorageUrl(url)) ? wrapResponse(...) : res`），
+// 结果是主站上走 FormData / Blob 分支的请求**永不还原**，页面永久停在裸 `{{...}}`。
+// 唯一正确的判据是「body 是否真被改写」（`m.masked`）。
+const badJudge = [...mainSrc.matchAll(/!\s*isUploadOrStorageUrl\s*\(/g)]
+if (badJudge.length) {
+  fail(`bridge-main.js 里有 ${badJudge.length} 处用 !isUploadOrStorageUrl(url) 作判据 —— ` +
+    '该函数对四个主域恒为 true，会让主站的 FormData/Blob 请求永不还原；' +
+    '还原判据必须是 m.masked（body 真被改写）')
+}
+
+// ── getWideMode 失败必须清缓存 ─────────────────────────────────────────────
+// `wideModePromise` 是赋值即缓存。若失败（SW 冷启动时的 config 桥超时）也留在缓存里，
+// 该标签页**整个生命周期**都会按精准模式跑 —— 表现为「有些站点完全不脱敏」，
+// 且只有手动刷新页面才能恢复（真机上极易被误判成引擎坏了）。
+// 因此缓存重置（`wideModePromise = null`）至少要有两处：初始化 + 失败回退。
+const wmResets = [...mainSrc.matchAll(/wideModePromise\s*=\s*null/g)].length
+if (wmResets < 2) {
+  fail('bridge-main.js 的 getWideMode 失败时没有清缓存（wideModePromise = null）——' +
+    'SW 冷启动首次 config 桥失败会让整页永久降级为精准模式，只能刷新页面才能恢复')
+}
+
+// ── 旧版 Office（.doc / .xls）不得被静默转换，也不得静默放行 ────────────────
+// 背景：引擎对 .doc/.xls 的所谓「转换」是**有损重建** —— 用 decode('utf-16le') 从 OLE
+// 二进制里捞可读字符串，再塞进手写的极简 OOXML 骨架。实测后果：图片/表格结构/样式/
+// 公式/多 sheet 全丢，二进制碎片被当成正文段落捞进去（正文里出现整段乱码），且
+// hits==0（文件毫无敏感信息）时**照样改写文件**，体积还可能膨胀（.xls 实测 +127%）。
+// 所以默认关闭，改由扩展明确告知「这类格式做不到脱敏，请另存为新格式」。
+// 两条红线都属「改的人当场看不出来、用户隔几天才发现」：
+//   ① 引擎默认值必须保持 False —— 改回 True 会让所有用户的 .doc 上传在上游变成
+//      另一个东西，而界面、日志、popup 上全都看不出来（hits 可能仍是 0）；
+//   ② 扩展必须真的计数（legacyCount）并给出**专门**提示（attachTextLegacy）——
+//      只报笼统的「附件不脱敏」会让用户以为自己操作错了，而不是格式不支持。
+const enginePanelPath = path.join(ROOT, 'engine', 'panel.py')
+if (!fs.existsSync(enginePanelPath)) {
+  fail('找不到 engine/panel.py —— 旧版 Office 转换默认值无人把关')
+} else {
+  const enginePanel = fs.readFileSync(enginePanelPath, 'utf8')
+  const onDefaults = [...enginePanel.matchAll(/ext_convert_legacy_office[^\n]*?\bTrue\b/g)]
+  if (onDefaults.length) {
+    fail(`engine/panel.py 有 ${onDefaults.length} 处 ext_convert_legacy_office 默认/回退值为 True —— ` +
+      '该转换是有损重建（丢图片/表格/样式、碎片混入正文、无敏感词也改写文件），必须保持默认关闭')
+  }
+  // 默认表 / 完整默认配置 / 读配置回退 / 运行时状态 四处都要关，漏一处就会重新打开。
+  const offDefaults = [...enginePanel.matchAll(/ext_convert_legacy_office[^\n]*?\bFalse\b/g)]
+  if (offDefaults.length < 3) {
+    fail(`engine/panel.py 只找到 ${offDefaults.length} 处 ext_convert_legacy_office=False —— ` +
+      '默认表 / 完整默认配置 / 读配置回退 / 运行时状态四处都要关，漏一处就漏开关')
+  }
+}
+if (!/const LEGACY_OFFICE_EXTS = new Set\(\[/.test(mainSrc)) {
+  fail('bridge-main.js 缺少 LEGACY_OFFICE_EXTS —— 旧版 Office 原样上行时无法给出专门提示')
+} else if (!/legacyCount/.test(mainSrc)) {
+  fail('bridge-main.js 声明了 LEGACY_OFFICE_EXTS 却没有 legacyCount 计数 —— 提示永远不会触发')
+}
+if (!/legacyCount/.test(sources['background.js'] || '')) {
+  fail('background.js 没有透传 legacyCount —— popup 读不到旧版 Office 告警计数')
+}
+if (!/attachTextLegacy/.test(sources['popup.js'] || '')) {
+  fail('popup.js 缺少 attachTextLegacy 文案 —— 旧版 Office 未脱敏时用户只看到笼统的「附件不脱敏」')
+}
+
+// ── mask 请求必须带 sid（否则多轮对话的占位符永远还原不回来）───────────────
+// 引擎的占位符映射表是**按 sid 隔离**的。此前 `/api/ext/mask` 调用压根不传 sid、
+// `mask-file` 传的也基本是空串，于是每轮都新签一个 → 模型引用上一轮（或文档脱敏那次）
+// 的占位符时，引擎在当前的表里查不到映射，只能原样吐回页面。
+// 用户看到的是「部分没被还原」，事件库里是 restored 与 unresolved 同时有值
+// （实测 2026-09-21：一次响应 restored=13 / unresolved=16，且相邻请求 sid 各不相同）。
+// 这两条静态可判，而运行时只表现为「少还原了几个字」，极难定位。
+const maskCallSites = [...bg.matchAll(/safeCall\(\s*'\/api\/ext\/mask'/g)]
+for (const site of maskCallSites) {
+  // 简写属性（`{ text, host, sid }`）没有冒号，所以必须同时认 `sid:` 与 `sid,` / `sid }`。
+  if (!/sid\s*[:,}]/.test(bg.slice(site.index, site.index + 300))) {
+    fail("background.js 的 /api/ext/mask 调用没带 sid —— 每轮新签 sid 会让多轮对话里" +
+      '的占位符无法还原（实测 restored 与 unresolved 同时有值）')
+  }
+}
+if (maskCallSites.length && !/async function findRecentSid/.test(bg)) {
+  fail('background.js 缺少 findRecentSid —— sid 无法按 tab+host 复用，跨轮次占位符还原不回来')
+}
+if (/async function findRecentSid/.test(bg) && !/v\.host !== host/.test(bg)) {
+  fail('background.js 的 findRecentSid 未按 host 区分 —— 同一标签页切换站点时会串用映射表')
+}
+
+// ── 打字探针（autocomplete）必须与主对话映射表隔离 ──────────────────────────
+// ChatGPT 的补全接口会在用户点发送**之前**把输入框内容发出去。实测（2026-09-20）
+// 送的是未上屏的拼音中间态：`{"input_text":"帮我整合y'xia"}` → NER 把 `y'xia` 判成 NAME，
+// `{"input_text":"帮我整合y'x"}` → 把仅 3 字符的 `y'x` 判成 ORG。
+// 碎片本身无害，但一旦写进主对话复用表，后续真实文本里出现同样的串就会被替换——跨轮污染。
+if (!/function isTypingProbe\s*\(/.test(bg)) {
+  fail('background.js 缺少 isTypingProbe —— 打字探针会污染主对话映射表（跳轮误替换）')
+}
+if (/function isTypingProbe\s*\(/.test(bg) && !/isTypingProbe\(text\)\s*\?\s*null/.test(bg)) {
+  fail('打字探针没有隔离 sid —— 必须是 `isTypingProbe(text) ? null : ...`，否则映射仍会跨轮污染')
+}
+if (!/"num_completions"/.test(bg) || !/"input_text"/.test(bg)) {
+  fail('isTypingProbe 的判据丢失 —— 必须按 body 字段判定（补全接口与正常对话同处' +
+    ' /backend-api/ 前缀下，按 URL 根本区分不了）')
+}
+// 判据必须落在**顶层键**上：全文子串匹配的误伤面太大 —— Maskit 的用户就是开发者，
+// 把含 `"input_text":` 的日志/JSON 贴进对话是日常，那轮真实对话会被判成探针、
+// 不复用 sid，回复里的占位符再也还原不回来，而页面上看不出任何异常。
+if (/function isTypingProbe\s*\(/.test(bg)) {
+  const at = bg.indexOf('function isTypingProbe')
+  const fnBody = bg.slice(at, at + 900)
+  if (!/JSON\.parse/.test(fnBody)) {
+    fail('isTypingProbe 没有按顶层键判定（缺 JSON.parse）—— 全文子串匹配会把' +
+      '「用户贴进对话的含 input_text 的 JSON」误判成补全探针')
+  }
+  if (/return\s+\/[^\n]*\b(?:input_text|num_completions)\b/.test(fnBody)) {
+    fail('isTypingProbe 退回成了全文正则匹配 —— 同上，误伤「把日志贴进对话」的日常场景')
+  }
+}
+
+// ── XHR 路径必须与 fetch 路径同样处理 URLSearchParams ────────────────────
+// fetch 侧早就显式处理了；XHR 少这一支时，用 `application/x-www-form-urlencoded`
+// 提交对话的站点会**整站静默漏脱敏**（且原先连留痕都没有）。
+if (!/const isUrlParams\s*=/.test(mainSrc) || !/isUrlParams && isUrlMaskable/.test(mainSrc)) {
+  fail('bridge-main.js 的 XHR 路径没处理 URLSearchParams —— 表单编码提交对话时会静默漏脱敏')
+}
+
+// ── 无感知漏脱敏必须留痕 ───────────────────────────────────────────────────
+// `isUrlMaskable && !isMaskableBody` = 我们判定该脱敏，却根本没读到内容。
+// 必须在上报之后才放行，否则某站改用 x-protobuf / 二进制 JSON 时会整站静默漏脱敏、
+// 页面上毫无异常、事件库里也没有任何线索。
+if (!/const reportUnsupportedBody\s*=/.test(mainSrc)) {
+  fail('bridge-main.js 缺少 reportUnsupportedBody —— 「该脱敏但 body 打不开」会无声漏掉')
+}
+if (/const reportUnsupportedBody\s*=/.test(mainSrc) &&
+  !/isUrlMaskable\s*&&\s*!isMaskableBody\(resource\)\)\s*\{\s*reportUnsupportedBody\(/.test(mainSrc)) {
+  fail('bridge-main.js 未在放行前上报不支持的 body —— 漏脱敏会无感知发生')
+}
+if (!/handleWarn\(/.test(bg) || !/'\/api\/ext\/warn'/.test(bg)) {
+  fail('background.js 缺少 warn 通道 —— 漏脱敏事件进不了事件库')
+}
+
+// ── 协议握手：两边的版本号必须一致 ───────────────────────────────────────
+// EXT_PROTOCOL_VERSION 是「/api/ext/* 契约版本」，引擎与扩展各存一份。它是**唯一**能
+// 发现「客户端改了契约、而用户没重载扩展」的机制，而两边数字一旦漂移，就会**永远误报**
+// （或者在真不兼容时反而不报）。所以这里必须交叉比对，不能各查各的存在性。
+const sharedSrc = sources['shared.js'] || ''
+const popupSrc = sources['popup.js'] || ''
+if (!/EXT_PROTOCOL_VERSION/.test(sharedSrc)) {
+  fail('shared.js 缺少 EXT_PROTOCOL_VERSION —— 扩展无法发现自己与客户端契约不兼容')
+}
+const panelPath = path.join(ROOT, 'engine', 'panel.py')
+const panelPy = fs.existsSync(panelPath) ? fs.readFileSync(panelPath, 'utf8') : null
+const mExt = sharedSrc.match(/EXT_PROTOCOL_VERSION\s*=\s*(\d+)/)
+const mEng = panelPy && panelPy.match(/^EXT_PROTOCOL_VERSION\s*=\s*(\d+)/m)
+if (mExt && !mEng) {
+  fail('engine/panel.py 缺少模块级 EXT_PROTOCOL_VERSION —— 扩展拿到 undefined 会恒报不匹配，' +
+    '变成全民误报')
+}
+if (mExt && mEng && mExt[1] !== mEng[1]) {
+  fail(`协议版本不一致：shared.js=${mExt[1]} vs panel.py=${mEng[1]} —— ` +
+    '两边必须同步（改契约时一起 +1），否则要么永远误报、要么真不兼容时反而不报')
+}
+if (!/protoMismatch/.test(bg) || !/applyProtoBadge/.test(bg)) {
+  fail('background.js 未做协议握手 —— 契约不兼容时扩展会静默失效（页面无异常、无从归因）')
+}
+if (!/chrome\.action\.setBadgeText/.test(bg)) {
+  fail('协议不匹配未打到图标角标 —— popup 只在点开时可见，最该被注意到的状态反而看不见')
+}
+if (!/renderProto\(/.test(popupSrc)) {
+  fail('popup.js 没有 renderProto —— 协议不匹配时用户看不到任何提示')
+}
+
 // ── 结论 ────────────────────────────────────────────────────────────────────
 for (const n of notes) console.log(`check-extension:      ${n}`)
 if (errors.length) {
