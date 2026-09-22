@@ -418,7 +418,7 @@ _DATA_ROOT = Path(os.environ.get("LLM_SHIELD_DATA_DIR") or str(_ROOT)).resolve()
 _skip_seen = {}
 _skip_seen_last_purge = 0.0
 
-# ---------- 引擎 ----------
+# ========== 引擎 ==========
 sessions: dict = {}
 
 
@@ -956,7 +956,7 @@ def _prefix_secret_regex():
     return _prefix_rx_cache
 
 
-# ---------- 占位符 ----------
+# ========== 占位符 ==========
 # 格式：{{LABEL_后缀6位}}，纯 ASCII。后缀自 0.1.13 起是纯辅音（见下方 _TOKEN_ALPHABET），
 # 存量 hex6 后缀仍继续识别（见 _SUFFIX_PAT）。
 # 旧格式 ⟦X·hex⟧ 用生僻 Unicode 且不带语义：主流 tokenizer 会切成多个罕见 token，
@@ -1506,7 +1506,7 @@ def is_target(host, path):
     return False
 
 
-# ---------- 反向代理路由 ----------
+# ========== 反向代理路由 ==========
 
 def _parse_upstream_target(target):
     """'https://api.openai.com' -> ('api.openai.com', 443, 'https', '', '')
@@ -4276,7 +4276,7 @@ def _emit(typ, **kw):
         pass
 
 
-# ---------- 2.0 审计钩子（隔离保证：永不改 body，永不抛异常，关时零开销） ----------
+# ========== 2.0 审计钩子（隔离保证：永不改 body，永不抛异常，关时零开销） ==========
 def _hash_body(content):
     try:
         if not content:
@@ -4622,7 +4622,7 @@ def error(flow):
         _drop(sid)
 
 
-# ---------- mitmproxy hooks ----------
+# ========== mitmproxy hooks ==========
 
 
 def _clean_tool_enums(body):
