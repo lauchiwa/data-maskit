@@ -2,6 +2,21 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.102.0] - 2026-09-22
+
+基于上游 v0.4.0（`xiaYuTian11/maskit`）。上游 `0.4.0` 的全部变更见下方对应章节，本节只记录本分支自身的处理。
+*Based on upstream v0.4.0 (`xiaYuTian11/maskit`). All upstream `0.4.0` changes are listed in their own section below; this section records only what this fork did.*
+
+### 新增 / Added
+- 同步上游 `v0.4.0`：浏览器扩展新增 XHR 与单文件/Blob 直传拦截、老版 Office（.doc / .xls）转码脱敏开关，拦截日志新增「浏览器扩展」筛选大类与徽标，并修复扩展还原链路、超大响应还原阻塞与 Office 重压缩兜底等一批问题。
+  *Synced upstream `v0.4.0`: the browser extension gains XHR and single-file/Blob upload interception plus a legacy Office (.doc / .xls) transcode-and-mask switch, logs gain a Browser Extension filter category and badges, and a batch of fixes lands for the extension restore path, event-loop stalls on oversized response restoration, and OOXML recompression fallback.*
+
+### 说明 / Notes
+- 上游 `master` 在 v0.4.0 之后的 4 个未发版提交（发版脚本容错、AGENTS.md 出库等）按本分支策略不合，等上游打出新 tag 再跟。
+  *The 4 unreleased commits on upstream `master` after v0.4.0 (release-script tolerance, AGENTS.md removal, etc.) are intentionally not merged per this fork's policy; they will be picked up when upstream cuts the next tag.*
+- 本次同步未改动本分支自有功能（`model_rules` 按模型改写请求头/请求体、`MASKIT_NER_THREADS` 线程数配置、上游血缘透出）。
+  *This sync leaves the fork's own features untouched (`model_rules` per-model header/body rewriting, the `MASKIT_NER_THREADS` setting, and upstream lineage reporting).*
+
 ## [0.101.1] - 2026-09-21
 
 基于上游 v0.3.2（`xiaYuTian11/maskit`），仅本分支自身修复，无上游同步。

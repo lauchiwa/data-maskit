@@ -246,7 +246,7 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 
 ### 版本号方案
 
-**本分支版本号走独立的 `0.1xx.x` 段（`minor ≥ 100`），与上游 `0.3.x` 无任何数值关系。**
+**本分支版本号走独立的 `0.1xx.x` 段（`minor ≥ 100`），与上游 `0.4.x` 无任何数值关系。**
 
 - `__version__`（`engine/panel.py`，唯一真相来源）= **本分支自己**的发布序号。`minor` 记功能批次，`patch` 记修复；
 - `__upstream_base__`（同文件，紧跟 `__version__`）= 本分支所基于的**上游版本**，只读元数据，不参与任何版本比较。
@@ -257,7 +257,7 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 
 | 位置 | 看到什么 |
 |---|---|
-| 设置 → 关于卡片 | 「当前版本 v0.1xx.x」下方一行「上游基线 v0.3.2」 |
+| 设置 → 关于卡片 | 「当前版本 v0.1xx.x」下方一行「上游基线 v0.4.0」 |
 | `GET /api/status` | `version` + `upstream_base` 两个字段 |
 | 诊断导出 | `app.version` + `app.upstream_base` |
 | `python scripts/check-upstream-sync.py` | 完整同步状态 + **校验声明真实性** |
@@ -302,7 +302,7 @@ git merge upstream/master
 
 # 3. 解冲突。版本文件（panel.py / tauri.conf.json / Cargo.toml / Cargo.lock /
 #    package.json / package-lock.json）的版本号一律保留本分支的值（ours）——
-#    绝不能被上游的 0.3.x 覆盖回去，否则更新检查会判定「有新版本」并把用户
+#    绝不能被上游的 0.4.x 覆盖回去，否则更新检查会判定「有新版本」并把用户
 #    降级到上游构建。
 
 # 4. 改 __upstream_base__ 为刚合进来的上游版本，然后验证声明真实性
