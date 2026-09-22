@@ -366,20 +366,30 @@ git tag -a v0.1xx.x -m "发布 v0.1xx.x"
 
 两个仍然收费的例外，本仓库目前都没碰到：**larger runners** 在公开仓库也照常计费（`ci.yml` / `release.yml` 用的都是标准 runner），以及 2026-03-01 起 self-hosted runner 的 $0.002/min 平台费 —— 该费用同样豁免公开仓库。
 
-**推 tag 会触发 `release.yml`。** 它需要两个 secret：`MASKIT_UPDATER_PRIVATE_KEY` 与 `MASKIT_UPDATER_PRIVATE_KEY_PASSWORD`。**未配置就推 tag 的后果**：打出未签名（无 `.sig`）的安装包并留下草稿 Release，而本地那份已验签的产物可能被覆盖。要么先在 Settings → Secrets 配好密钥，要么用 `gh release create` 发本地产物（不推 tag，不触发 CI）。
+**推 tag 会触发 `release.yml`。** 它需要两个 secret：`MASKIT_UPDATER_PRIVATE_KEY` 与 `MASKIT_UPDATER_PRIVATE_KEY_PASSWORD`（**均已于 2026-09-22 配置完成**；私钥密码为空字符串，故第二个 secret 的值是空）。未配置时的退化行为：打出未签名（无 `.sig`）的安装包，**Release 强制留在草稿**（不会自动转正）—— 这是故意的，转正会让全体现网用户的 `releases/latest/download/latest.json` 立即 404。
 
-#### 自动更新：阻塞原因已消除，但尚未打通
+**推 tag 前必须看清该 tag 自己的 `release.yml`。** GitHub 用的是 **tag 指向提交里**的 workflow 文件，不是 `master` 的当前版本。实测（补打历史 tag 时）：`v0.101.0` / `v0.101.1` 指向的提交里 `release.yml` 只有 `workflow_dispatch`，所以推它们**不会**触发发版；而 `v0.100.0` 与上游的 `v0.3.2` / `v0.4.0` 那里带着 `push: tags`，推过去会真的开构建。
 
-历史上这里的结论是「必定 404，因为仓库私有」。**`origin` 转公开后这个阻塞不存在了** —— `plugins.updater.endpoints` 指向的
-`github.com/lauchiwa/data-maskit/releases/latest/download/latest.json` 现在允许匿名下载，`tauri-plugin-updater` 能真的取到。
+由此得出一条硬规矩：**永远不要 `git push --tags`**。本仓库本地有 19 个 tag，其中包含从上游合并时带进来的 `v0.2.x`–`v0.4.0`；一次 `--tags` 等于同时开出十几个发版构建，并把上游版本发成本仓库的 Release。每次只显式推要发的那一个：`git push origin v0.1xx.x`。
 
-剩下的前置条件只有一条：**得先有一个带 `latest.json` 的正式 Release**。当前远端 0 个 Release，所以行为暂时仍是 404 —— 已安装客户端启动 8 秒后静默检查一次并静默失败，silent 模式不弹窗，不影响脱敏功能。
+#### 自动更新：已于 v0.102.0 正式打通
 
-打通需要：
+历史上这里的结论是「必定 404，因为仓库私有」。`origin` 转公开后该阻塞消失，并已于 **2026-09-22 随 v0.102.0 完成验证**：
 
-1. 在 Settings → Secrets 配好 `MASKIT_UPDATER_PRIVATE_KEY` 与 `MASKIT_UPDATER_PRIVATE_KEY_PASSWORD`（**当前未配置**，私钥在 `~/.tauri/maskit-updater.key`）；
-2. 推一个 `v*` tag 让 `release.yml` 打出带 `.sig` 的产物与 `latest.json`，并把草稿 Release 转正式。
+| 环节 | 实测结果 |
+|---|---|
+| 端点匿名可达 | `curl` 清空凭据拉 `releases/latest/download/latest.json` → **HTTP 200** |
+| `latest.json` 内容 | `version: v0.102.0`，含 `windows-x86_64` 与 `darwin-aarch64` 两个平台条目 |
+| 签名血缘 | 两个平台的 signature key id 均 = 客户端内置 pubkey 的 `8fdef509963ab482`（**MATCH**） |
+| Release 状态 | `draft=false`，签名完整所以自动转正 |
 
-端点本身**不需要**再改，所以也不需要为此重新打包 —— 端点是编译进二进制的，已装客户端认的就是这个地址。反过来说，将来若要换端点，则必须重新打包，改配置对已装客户端无效。
+因此现在每次按流程推一个 `v*` tag，已安装客户端就会在启动 8 秒后检测到并拉取更新。
+
+两个必须继续守住的前提：
+
+- **`latest.json` 绝不能缺**。新 Release 一旦转正即成为 `releases/latest`，没有 `latest.json` 就是全体现网用户静默断更（客户端 silent 模式不弹窗，没人会来报）。`release.yml` 已用「未签名则强制留草稿」兜着这一点，不要绕过它手动转正；
+- **Beta 预发布不传 `latest.json`**（脚本已自动识别 `-beta` / `-alpha` / `-rc`），否则现网普通客户端会误检测到预发布版。
+
+端点本身无需再改，也不需要为此重新打包。反过来说，将来若要换端点，**必须重新打包** —— 端点是编译进二进制的，改配置对已装客户端无效。
 
 安全性不受转公开影响：投毒的包装不上，产物要过 `pubkey` 的 Ed25519 校验，而私钥不在仓库里。
