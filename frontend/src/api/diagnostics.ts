@@ -32,7 +32,8 @@ export interface DiagnosticsBundle {
 }
 
 export function getDiagnostics(): Promise<DiagnosticsBundle> {
-  return shieldFetch('/api/diagnostics')
+  // 结论跟界面语言走：包里内嵌的自检结论应与用户看到的同语言（与 saveDiagnostics 对齐）。
+  return shieldFetch('/api/diagnostics?lang=' + encodeURIComponent(getI18nLang()))
 }
 
 export function saveDiagnostics(): Promise<{ ok: boolean; path?: string; size?: number; error?: string }> {

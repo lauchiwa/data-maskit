@@ -297,6 +297,19 @@ class PanelWiringTests(unittest.TestCase):
 
     def test_inputs_are_scrubbed(self):
         self.assertIn("_scrub_selfcheck", self.src)
+
+    def test_language_param_reaches_both_exports(self):
+        """自检与诊断包都要按 `?lang=` 出结论（英文界面不该出现中文结论）。
+
+        实测过的失效形态：端点读了 lang、但传入处忘了带（或新增端点时漏抄）——
+        测试全绿而英文界面冒出中文，所以两边都得钉住。
+        """
+        self.assertIn('request.args.get("lang")', self.src,
+                      "端点没读 ?lang=，结论永远中文")
+        self.assertIn("run_selfcheck(ctx, lang=lang)", self.src,
+                      "/api/selfcheck 读了 lang 却没传给 run_selfcheck")
+        self.assertRegex(self.src, r"run_selfcheck\(_selfcheck_inputs\(\), lang=",
+                         "诊断包读了 lang 却没传给 run_selfcheck")
         tree = ast.parse(self.src)
         fn = [n for n in ast.walk(tree)
               if isinstance(n, ast.FunctionDef) and n.name == "api_selfcheck"]
