@@ -32,6 +32,10 @@ tauri-plugin-dialog = "2.7.2"
 tauri-plugin-fs = "2.5.1"
 tauri-plugin-updater = "2"
 
+# 仅测试使用 bind 而不 listen 的 TCP socket，避免探测已释放端口的竞态。
+[dev-dependencies]
+socket2 = "0.6"
+
 # 只在 Windows 上需要：读写 HKCU\...\Run 做自启自愈。
 # 用 winreg 而不是 `reg query` 拿 stdout —— reg 在中文 Windows 输出 GBK，
 # 按 UTF-8 解会把中文安装路径解坏，而那条路径要拿来做比对。

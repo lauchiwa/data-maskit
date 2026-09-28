@@ -2047,17 +2047,9 @@ mod engine_log_rotation_tests {
 
 #[cfg(test)]
 mod panel_alive_tests {
-    use super::{AtomicBool, EngineManager, Mutex, Ordering, ResetInFlightOnDrop};
-    use std::net::TcpListener;
-
-    /// 端口类用例必须**串行**执行。
-    ///
-    /// 它们都在 bind/drop 系统临时端口池里的地址，而 `cargo test` 默认多线程并行：
-    /// 一个用例 `drop` 掉的端口会被另一个用例的 `bind(127.0.0.1:0)` 立刻复用，
-    /// 于是「刚刚空闲的端口」瞬间又变成在监听。
-    /// CI 实测（2026-09-28）：`free_port_is_not_alive` 在 macOS runner 上偶发失败
-    /// （`assertion failed: !EngineManager::port_ready_on(port)`），同一 job 前四次全绿。
-    static PORT_TEST_LOCK: Mutex<()> = Mutex::new(());
+    use super::{AtomicBool, EngineManager, Ordering, ResetInFlightOnDrop};
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::{SocketAddr, TcpListener};
 
     /// 占住一个空闲端口并保持监听：TCP 连得上，但永不 accept、永不回应 HTTP
     /// —— 正是「端口被别的进程占用」与「Flask 假死」的共同现场。
@@ -2073,7 +2065,6 @@ mod panel_alive_tests {
     /// 壳层把 ready 置为 true、托盘显示「引擎已就绪」，而前端所有 /api/* 请求超时。
     #[test]
     fn listening_but_silent_port_is_not_alive() {
-        let _serial = PORT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_listener, port) = hold_port();
         assert!(
             EngineManager::port_ready_on(port),
@@ -2086,13 +2077,25 @@ mod panel_alive_tests {
     }
 
     #[test]
-    fn free_port_is_not_alive() {
-        // 串行 + 释放后立即断言：端口不能被同进程内并行的用例抢走（见 PORT_TEST_LOCK）。
-        let _serial = PORT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (listener, port) = hold_port();
-        drop(listener);
+    fn bound_but_not_listening_port_is_not_alive() {
+        // bind 后不 listen：保留 TCP 端口，但连接必须失败。不能先 bind/drop 再探测，
+        // 释放的端口可能被重新分配；进程内互斥锁无法保护这段窗口（macOS CI 曾复现）。
+        // 两个网络用例都持有各自的端口，因此无需用全局锁把它们串行化。
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+            .expect("create TCP socket");
+        socket
+            .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .expect("bind without listening");
+        let addr = socket.local_addr().expect("local_addr").as_socket().unwrap();
+        let port = addr.port();
+        assert_ne!(port, 0, "OS must allocate a real port");
+        assert!(
+            TcpListener::bind(addr).is_err(),
+            "fixture must keep the TCP port reserved, not release it before probing"
+        );
         assert!(!EngineManager::port_ready_on(port));
         assert!(!EngineManager::panel_alive_on(port));
+        drop(socket); // 两次探测结束后才释放端口。
     }
 
     #[test]
