@@ -26,27 +26,214 @@ from typing import Dict, List, Optional, Tuple
 _logger = logging.getLogger("llm_shield")
 
 _MODEL_DIR = Path(__file__).parent / "models" / "ner_mini_zh"
+# 公开别名：engine_entry 的启动预检（C-3）要把它写进告警文案，
+# 让用户知道"该往哪儿放模型"。下划线名保留给模块内既有引用。
+MODEL_DIR = _MODEL_DIR
 _SESSION = None
 _TOKENIZER = None
 _ID2LABEL = {}
 _INITIALIZED = False
 _INIT_FAILED = False
 _LAST_ERROR = ""
-# 实际生效的 onnxruntime 推理线程数（_init_ner 里按 MASKIT_NER_THREADS 解析后写入）。
-# 暴露到 status()：部署方能核对「配额与线程是否对齐」，排查同机 CPU 争用。
-_NER_THREADS = 0
+# 实际使用的 ONNX 推理线程数，status() 与治理器指标共用一个来源。
+_INTRA_THREADS = 0
 
 # ── 成本护栏 ──────────────────────────────────────────────────────────────────
 # 单条文本长度上限：超过即跳过语义识别并留一次日志。宁可这一条不做识别，
 # 也不能让一条超长文本把整个代理冻住（单线程事件循环被占满 = 打字机卡死 +
 # 其他客户端超时）。实测 10 万字符单次调用要 69 秒。
-MAX_TEXT_CHARS = 2000
+# 单条文本长度上限（字）。
+#
+# ⚠️ 曾有 2000 字上限，超过就**整条不做 NER**（且只在全局日志里留一行）。实测用户
+# 真实流量里出现过 6208 字的单条正文（会话被拼成一个大字符串），那条里的中文人名
+# 全部明文上行 —— 比总预算更容易咬人，因为它是「整条不认」而不是「后面的不认」。
+#
+# 放到 20000 的理由：单次推理成本本身已由 `CALL_BUDGET_S`（每次调用 10s，见下）兜住，
+# `_decode_chunks` 也是分窗口跑的，所以长文本的代价是「拿部分实体」而不是失控。
+# 20000 字 ≈ 4s 冷推理，在请求级总预算（见 transparent._ner_req_budget）之内。
+MAX_TEXT_CHARS = 20000
 # 单次调用时间预算（秒）：长度在上限内但推理异常变慢时按时收手，只返回已收集实体。
-CALL_BUDGET_S = 2.0
+# 单次调用的推理时间上限（秒）。
+#
+# ⚠️ 它必须 ≥「一条长度达到 MAX_TEXT_CHARS 的文本能跑完」的耗时**并留出余量**，否则会
+# 形成一个很贵的稳态：超时 → `complete=False` → 负缓存**不写**（见 extract_entities
+# 里的注释）→ 下一轮同一段文本又从头冷推。
+# 实测（`tests/measure_ner_coverage.py`）：20000 字/60KB 需 5588ms；旧的 2.0s 上限下
+# 是每轮 2123/2013/2049ms 且缓存条数恒为 0。取 10.0s = 约 1.8 倍余量，因为余量不足时
+# 闸门之间就是不自洽的：6.0s 虽然在本机能跑完（5588ms），但机器稍慢或 CPU 受争就退回
+# 那个陷阱（实测单位成本 93µs/字节，与机器负载直接相关）。
+# 总量仍由请求级预算 `transparent._ner_req_budget` 兜住，单次上限放大更需它兜底。
+CALL_BUDGET_S = 10.0
 # 结果缓存：同一条文本在长会话里反复出现（系统提示词、重复的历史消息），
 # 不缓存就是每次重新推理。键是文本本身，容量固定（OrderedDict LRU），命中即零成本。
-_CACHE_MAX = 256
+#
+# ⚠️ 容量值得够**装下一条长会话的全部可识别叶子**（2026-09-24 事故）。
+# `mask()` 对每个字符串叶子各调一次，而客户端每轮都把整段历史重发；一条 300+ 条
+# 消息的会话叶子数会超过 256，LRU 于是每轮把上一轮的结果整批挤出 → 命中率≈0 →
+# 每轮都按冷启动全量重推（实测同一条 6.6MB 会话：冷启 24.7 秒，缓存装得下时第二轮
+# 只要 0.7 秒）。代价是一条长会话单个请求 20+ 秒，且脱敏是同步跑在 mitmproxy
+# 事件循环上的，整机连接一起冻结。
+# 字符总量上限是第二道闸：4096 条超长文本按条数算仍可吃下几十 MB 文本。
+_CACHE_MAX = 4096
+_CACHE_MAX_CHARS = 4_000_000
 _CACHE = OrderedDict()
+_CACHE_CHARS = 0
+# 缓存会被多个线程同时碰：代理链路的 `_MASK_POOL` 专职线程 + panel 扩展桥接的
+# Flask 线程（两者都会走到 `mask()` → `extract_entities`）。`_CACHE_CHARS` 的
+# 读-改-写、以及命中后的 `move_to_end`（查完再动）都不是原子的：前者会漂到与实际
+# 内容不符（计数偏高会让缓存被自己挤空，反而废掉这个修复），后者可能撞上并发的
+# `popitem` 抛 KeyError。锁只护这两处缓存操作，推理本身不持锁。
+_CACHE_LOCK = threading.Lock()
+# 初始化锁：`_init_ner()` 的双检**不是**原子的，两个线程可以同时通过检查、
+# 各建一个 InferenceSession（模型内存与 ONNX 线程双双翻倍，实测过）。
+_INIT_LOCK = threading.Lock()
+
+def _env_int(name, default):
+    """读整数环境变量；非法值回落默认（不抛异常）。
+
+    必须定义在模块级常量之前：MASKIT_NER_CONCURRENCY / MASKIT_NER_BUDGET 是在
+    **导入时**求值的（进程级治理器），放后面会直接 NameError（实测踩过）。
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
+# ── B-2：进程级治理器 ────────────────────────────────────────────────────────
+# 为什么需要：每个 InferenceSession 自带 `intra_op_num_threads` 个 ONNX 线程，
+# 多请求并发推理 = 线程数乘性叠加。请求级预算（transparent._ner_req_budget）
+# 只管"单个请求能用多久"，管不住"同时有几个请求在推理"，于是长会话 + 重试风暴
+# 下会把 CPU 吃满（本次故障的 CPU 归因之一）。
+#
+# 并发上限：CPU 少的机器上并发推理只是互相抢核（弱机 / 小容器恒为 1）。
+_NER_CONCURRENCY = max(1, _env_int("MASKIT_NER_CONCURRENCY",
+                                  1 if (os.cpu_count() or 2) <= 4 else 2))
+_SEM = threading.Semaphore(_NER_CONCURRENCY)
+_SEM_STATS = {"inflight": 0, "peak_inflight": 0, "waits": 0,
+              "wait_ms_total": 0.0, "wait_ms_max": 0.0, "timeouts": 0}
+# `_SEM` 只限"同时在推理的数量"，不保护这几个计数器的读改写：`inflight += 1` 是
+# 三步，并发下会丢更新，于是 `inflight` 会漂（明明没人在推理却显示 >0，或峰值偏低），
+# 而它正是 `/api/engine/metrics` 与自检拿来判断"语义识别吃不吃满"的依据。
+# 这组计数器是**诊断口径**，漂了不会影响脱敏正确性，所以只加一把轻量锁，不上原子库。
+_SEM_STATS_LOCK = threading.Lock()
+
+# 令牌桶：限的是"每秒允许花多少毫秒做推理"（时间口径，不是次数口径——
+# 一条 20000 字的文本和一条 20 字的文本成本差 1000 倍，按次数限毫无意义）。
+# 容量 = 每秒补充量，默认取并发数 × 1s 的 75%：把最多 3/4 个核留给推理，
+# 剩下的留给规则扫描、事件循环与其他请求。可用 MASKIT_NER_BUDGET 覆盖。
+_NER_BUDGET_MS_PER_S = max(50, _env_int("MASKIT_NER_BUDGET",
+                                        int(_NER_CONCURRENCY * 1000 * 0.75)))
+_BUCKET_LOCK = threading.Lock()
+_BUCKET = {"tokens": float(_NER_BUDGET_MS_PER_S), "ts": time.monotonic()}
+# 额度不足时的**有界等待**上限（毫秒，0 = 退回“直接跳过”的旧行为）。
+#
+# 为什么从“绝不等待”改成“有界等待”：桶的语义是**长期速率**，持续过载时无界
+# 等待会让请求永不返回；而等待会占住脱敏 worker（正是 0.6.0 要消的队头阻塞）。
+# 所以只在短窗口内等（默认 2s，且不超过本轮剩余 deadline）：等到就照常推理，
+# 等不到仍按原策略降级（记 global_throttled、不阻断、不断链）。
+_NER_BUDGET_WAIT_MS = max(0, min(10000, _env_int("MASKIT_NER_WAIT_MS", 2000)))
+# 单位成本（毫秒/字符）：实测 20000 字 5588ms（见上方 CALL_BUDGET_S 的注释）。
+# 用途只有一个——**动手前估个价**，好决定桶里的余额够不够；估错不影响正确性，
+# 结算时按实际耗时退还（见 _bucket_refund）。
+_EST_MS_PER_CHAR = 0.28
+_SEM_WAIT_MAX_S = 2.0
+
+
+def _bucket_take(est_ms, now=None):
+    """尝试预支 est_ms 的推理额度；余额不足返回 False（本函数**不等待**）。
+
+    等多久由调用方决定（见 `_bucket_wait`）：等待会把压力转成用户可见的延迟，
+    而语义识别是“尽力而为”的增强项，确定性规则（正则 + 词表）才是脱敏的底线。
+    所以只能按“本轮还剩多少时间”给一个小的等待窗口，不能在这里盲等。
+    """
+    now = time.monotonic() if now is None else now
+    with _BUCKET_LOCK:
+        elapsed = now - _BUCKET["ts"]
+        if elapsed > 0:
+            _BUCKET["tokens"] = min(float(_NER_BUDGET_MS_PER_S),
+                                    _BUCKET["tokens"] + elapsed * _NER_BUDGET_MS_PER_S)
+            _BUCKET["ts"] = now
+        if _BUCKET["tokens"] < est_ms:
+            return False
+        _BUCKET["tokens"] -= est_ms
+        return True
+
+
+def _bucket_wait(est_ms, timeout_s):
+    """在有界时间内等够 est_ms 额度：等到就取走并返回 True，超时返回 False。
+
+    有界是硬约束：桶的语义是长期速率，持续过载时“等到有额度”可能永远不成立，
+    而无界等待会占住脱敏 worker（正是 0.6.0 要消除的队头阻塞）。所以只在调用方
+    给的小窗口（默认 2s，且不超过本轮剩余 deadline）内小步轮询。
+    """
+    end = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        if _bucket_take(est_ms):
+            return True
+        left = end - time.monotonic()
+        if left <= 0:
+            return False
+        time.sleep(min(0.05, max(0.005, left)))
+
+
+def _bucket_refund(ms):
+    """退还额度（实际耗时低于预估，或拿到额度后没跑成）。"""
+    if ms <= 0:
+        return
+    with _BUCKET_LOCK:
+        _BUCKET["tokens"] = min(float(_NER_BUDGET_MS_PER_S), _BUCKET["tokens"] + float(ms))
+
+
+def request_metrics(reset=False):
+    """取（或取完清空）本线程的 NER 运行指标。
+
+    `sem_wait_ms` / `global_throttled` 要进事件（C-1），否则"这次脱敏到底等了多久、
+    有没有被限流"在界面上完全看不见 —— 与降级原因一样，不可见就等于静默降级。
+    """
+    m = dict(getattr(_local, "metrics", None) or {})
+    if reset:
+        _local.metrics = {"sem_wait_ms": 0.0, "infer_ms": 0.0, "global_throttled": 0,
+                          "sem_timeout": 0, "calls": 0}
+    return m
+
+
+def _metric_add(key, value):
+    try:
+        m = getattr(_local, "metrics", None)
+        if m is None:
+            m = _local.metrics = {"sem_wait_ms": 0.0, "infer_ms": 0.0,
+                                  "global_throttled": 0, "sem_timeout": 0, "calls": 0}
+        m[key] = m.get(key, 0) + value
+    except Exception:
+        pass
+
+
+def governor_status():
+    """治理器快照（C-1：面板看得见并发数、限流次数与桶余量）。"""
+    with _BUCKET_LOCK:
+        tokens = round(float(_BUCKET["tokens"]), 1)
+    with _SKIP_LOCK:
+        throttled = int(_SKIP_STATS.get("global_throttled", 0))
+        sem_timeouts = int(_SKIP_STATS.get("sem_timeout", 0))
+        waited = int(_BUDGET_WAITED["n"])
+    with _SEM_STATS_LOCK:
+        out = dict(_SEM_STATS)
+    out.update({
+        "concurrency": _NER_CONCURRENCY,
+        "budget_ms_per_s": _NER_BUDGET_MS_PER_S,
+        "bucket_tokens_ms": tokens,
+        "skipped_throttled": throttled,
+        "skipped_sem_timeout": sem_timeouts,
+        "budget_waited": waited,
+        "intra_threads": _INTRA_THREADS,
+    })
+    out["wait_ms_total"] = round(float(out.get("wait_ms_total") or 0.0), 1)
+    out["wait_ms_max"] = round(float(out.get("wait_ms_max") or 0.0), 1)
+    return out
 
 
 def _cache_put(key, entities):
@@ -57,11 +244,19 @@ def _cache_put(key, entities):
     负缓存解决的是同源问题：无实体的长文本此前每次请求都重跑推理
     （≤2000 字约 500ms/次）。它与「没跑完」必须区分开，所以调用方只在
     `_decode_chunks` 报 complete 时才调这里。
+
+    淘汰按「条数超限 **或** 字符总量超限」两者任一触发，取更长历史给新增让路。
     """
-    _CACHE[key] = [dict(e) for e in entities]
-    _CACHE.move_to_end(key)
-    while len(_CACHE) > _CACHE_MAX:
-        _CACHE.popitem(last=False)
+    global _CACHE_CHARS
+    # 同键覆盖要先扣掉旧值，否则字符计数只增不减，缓存会被自己挤空。
+    with _CACHE_LOCK:
+        if _CACHE.pop(key, None) is not None:
+            _CACHE_CHARS -= len(key)
+        _CACHE[key] = [dict(e) for e in entities]
+        _CACHE_CHARS += len(key)
+        while _CACHE and (len(_CACHE) > _CACHE_MAX or _CACHE_CHARS > _CACHE_MAX_CHARS):
+            old, _ = _CACHE.popitem(last=False)
+            _CACHE_CHARS -= len(old)
 # 预算窗口的宽限（秒）：调用方漏调 end_budget（异常路径）时超过它就自愈，
 # 免得某个线程被永久停掉语义识别——Flask 会复用线程，永久停用等于静默降级。
 _BUDGET_LEAK_GRACE_S = 60.0
@@ -69,23 +264,77 @@ _BUDGET_LEAK_GRACE_S = 60.0
 _local = threading.local()
 # 跳过原因计数 + 「只记一次」集合：失败必须可见，但每个请求都刷日志同样不可接受。
 _SKIP_STATS = {}
+# 全局跳过计数的锁：蒙版专职线程与扩展链路的 Flask 线程会并发 read-modify-write
+# （此前无锁，极端情况下会丢计数）。只在真发生跳过时拿，不是热路径。
+_SKIP_LOCK = threading.Lock()
 _SKIP_LOGGED = set()
+# 「曾经缺额度、但等到补上了」的进程级计数（与 `_SKIP_STATS` 共用 `_SKIP_LOCK`）。
+# 它与跳过计数是**不同结论**（补上了 vs 降级），混进 skip 表会让面板把它读成降级；
+# 但它同样必须有个出口 —— 只写进线程本地的 request_metrics 就等于没有（实测：写入后
+# 无任何消费者，而 CHANGELOG / SECURITY 已经把它当卖点写上了）。
+_BUDGET_WAITED = {"n": 0}
+
+
+def _bump_skip_stat(key):
+    """进程级跳过计数 +1（设置页读 status().skips）。"""
+    with _SKIP_LOCK:
+        _SKIP_STATS[key] = _SKIP_STATS.get(key, 0) + 1
+
+
+def _log_skip_once(key, msg):
+    """同类原因每个进程只写一条日志（长会话会把日志刷满）。"""
+    if key in _SKIP_LOGGED:
+        return
+    _SKIP_LOGGED.add(key)
+    try:
+        _logger.warning("[ner_engine] %s（同类问题后续不再重复记录）", msg)
+    except Exception:
+        pass
 
 
 def _warn_once(key, msg):
-    """记录一次可诊断的跳过原因（同类只写一条日志）。"""
-    _SKIP_STATS[key] = _SKIP_STATS.get(key, 0) + 1
-    if key not in _SKIP_LOGGED:
-        _SKIP_LOGGED.add(key)
-        try:
-            _logger.warning("[ner_engine] %s（同类问题后续不再重复记录）", msg)
-        except Exception:
-            pass
+    """记一次**进程级**跳过原因（计数 + 首条日志）。
+
+    ⚠️ 叶子级跳过请用 `_note_skip(key, msg)`：它同时记「按请求」那份账，而事件与
+    详情弹窗里的降级标记完全依赖那份（只调本函数 = 界面上永远是静默降级）。
+    """
+    _bump_skip_stat(key)
+    _log_skip_once(key, msg)
 
 
 def record_skip(key: str, msg: str = "") -> None:
-    """记录一次跳过原因并纳入 status().skips 统计（供外部如 transparent 的坐标降级调用）。"""
-    _warn_once(key, msg or f"NER 跳过: {key}")
+    """记录一次跳过原因（计数 + 首条日志 + 按请求记账），供外部如 transparent 的坐标降级调用。"""
+    _note_skip(key, msg or f"NER 跳过: {key}")
+
+
+def _note_skip(key: str, msg: str = "") -> None:
+    """记录一次**叶子级**跳过：按请求记账 + 进程级计数 +（给了 msg 时）首条日志。
+
+    按请求那份写在 threading.local 里，调用方（transparent 的脱敏管线跑在专职线程）
+    用 `request_skips()` 取出，写进 MASK/RESTORE 事件 —— 静默降级等于「以为开了、
+    其实没脱」。进程级那份供设置页展示。
+    """
+    try:
+        s = getattr(_local, "skips", None)
+        if s is None:
+            s = _local.skips = {}
+        s[key] = s.get(key, 0) + 1
+    except Exception:
+        pass
+    _bump_skip_stat(key)
+    if msg:
+        _log_skip_once(key, msg)
+
+
+def request_skips(reset: bool = False) -> Dict:
+    """取（或取完清空）本线程自上次 `begin_budget` 以来的跳过计数。
+
+    返回形如 `{"budget_exhausted": 3, "too_long": 1}`；空字典 = 本轮语义识别全程生效。
+    """
+    s = dict(getattr(_local, "skips", None) or {})
+    if reset:
+        _local.skips = {}
+    return s
 
 
 def begin_budget(seconds):
@@ -93,8 +342,12 @@ def begin_budget(seconds):
 
     期间「截止时间已过」等同于「预算耗尽」，extract_entities 直接跳过推理；
     必须由调用方配对调用 end_budget（transparent._ner_doc_budget 已封装）。
+    同时把本轮的跳过记账清零，供 `request_skips()` 如实上报。
     """
     _local.doc_active = True
+    _local.skips = {}
+    _local.metrics = {"sem_wait_ms": 0.0, "infer_ms": 0.0, "global_throttled": 0,
+                      "sem_timeout": 0, "calls": 0}
     # 不钳到 >=0：负值/0 用来表达「预算窗口已经过去」，便于测试与自愈判定
     _local.deadline = time.monotonic() + float(seconds)
 
@@ -183,6 +436,10 @@ def status() -> Dict:
     available 只代表模型文件齐备；真正能否推理要看 initialized。
     这两者都不成立时必须让用户看得见，否则「开了 NER 却没打码」无从归因。
     """
+    # 快照必须在锁内取：skip 计数由蒙版线程与 Flask 线程并发累加，口径与
+    # `governor_status()` 一致（不要一个持锁、一个不持）。
+    with _SKIP_LOCK:
+        skips = dict(_SKIP_STATS)
     return {
         "available": is_ner_available(),
         "initialized": bool(_INITIALIZED),
@@ -191,9 +448,13 @@ def status() -> Dict:
         "model_dir": str(_MODEL_DIR),
         "max_text_chars": MAX_TEXT_CHARS,
         "call_budget_s": CALL_BUDGET_S,
-        "intra_op_num_threads": _NER_THREADS,
+        "intra_op_num_threads": _INTRA_THREADS,
         "cache_size": len(_CACHE),
-        "skips": dict(_SKIP_STATS),
+        "cache_max": _CACHE_MAX,
+        "cache_chars": _CACHE_CHARS,
+        "skips": skips,
+        # B-2/A-4：并发与限流可见性（面板与自检都读这里）
+        "governor": governor_status(),
     }
 
 
@@ -204,6 +465,29 @@ def _init_ner():
     if _INIT_FAILED:
         return False
 
+    with _INIT_LOCK:
+        # 双检：拿到锁之后再确认一次，否则两个线程仍会各建一个 session
+        if _INITIALIZED:
+            return True
+        if _INIT_FAILED:
+            return False
+        return _init_ner_locked()
+
+
+def _intra_threads():
+    """每次推理的 ONNX 线程数（A-4）。
+
+    硬编码 4 在弱机 / 小容器上是灾难：4 个线程抢 1~2 个核，比单线程还慢，
+    而"看起来开了 NER"的用户完全无从归因。默认按核数自适应，可覆盖。
+    """
+    # 本分支默认最多 2 线程，给同机服务留核；保留上游的弱机自适应与显式覆盖。
+    default = min(2, max(1, os.cpu_count() or 2))
+    return max(1, min(16, _env_int("MASKIT_NER_THREADS", default)))
+
+
+def _init_ner_locked():
+    global _SESSION, _TOKENIZER, _ID2LABEL, _INITIALIZED, _INIT_FAILED, _LAST_ERROR
+    global _INTRA_THREADS
     if not is_ner_available():
         _INIT_FAILED = True
         _LAST_ERROR = f"模型文件缺失（应为 {_MODEL_DIR} 下的 model_quantized.onnx / tokenizer.json / config.json）"
@@ -223,20 +507,10 @@ def _init_ner():
             cfg = json.load(f)
         _ID2LABEL = cfg.get("id2label", {})
 
-        # CPU 推理线程数。实测约 0.25ms/字（4 线程，含分块与后处理），见模块头部成本模型。
-        # ⚠️ 默认从 4 降到 2：onnxruntime 会占满 intra_op_num_threads 个核到 100%。当
-        # maskit 与吃「整机 CPU」的服务（如 new-api 的过载保护）同机时，占满全核会触发
-        # 对方限流/拒服务。默认 2 给同机邻居留核；可用 MASKIT_NER_THREADS 覆盖（部署方按
-        # 机器核数与容器 cpus 配额自行调整，二者对齐可免 CFS 调度停顿）。取值下限 1。
-        try:
-            _ner_threads = int(os.environ.get("MASKIT_NER_THREADS", "2"))
-        except ValueError:
-            _ner_threads = 2
-        _ner_threads = max(1, _ner_threads)
-        global _NER_THREADS
-        _NER_THREADS = _ner_threads
+        # CPU 推理线程数按核数自适应（本分支默认上限 2），可用 MASKIT_NER_THREADS 覆盖。
+        _INTRA_THREADS = _intra_threads()
         opts = ort.SessionOptions()
-        opts.intra_op_num_threads = _ner_threads
+        opts.intra_op_num_threads = _INTRA_THREADS
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
         _SESSION = ort.InferenceSession(str(model_path), sess_options=opts, providers=["CPUExecutionProvider"])
@@ -302,7 +576,7 @@ def _decode_chunks(text: str, deadline: float) -> Tuple[List[Dict], bool]:
         except Exception as e:
             # 单块推理失败：记一次日志后收手，返回已收集的部分实体。
             # 曾完全静默 break，用户侧只表现为「部分文本没打码」。
-            _warn_once("infer_failed", f"推理异常，本段仅返回已识别结果：{type(e).__name__}: {e}")
+            _note_skip("infer_failed", f"推理异常，本段仅返回已识别结果：{type(e).__name__}: {e}")
             complete = False
             break
 
@@ -374,7 +648,7 @@ def _decode_chunks(text: str, deadline: float) -> Tuple[List[Dict], bool]:
         # 时间预算：超时就收手。必须是**块间**检查——单块推理无法中断，
         # 但只要不再开新块，耗时就不会继续线性膨胀。
         if time.monotonic() > deadline:
-            _warn_once("deadline", "达到单次推理时间预算，本次仅返回已识别结果")
+            _note_skip("deadline", "达到单次推理时间预算，本次仅返回已识别结果")
             complete = False
             break
         pos += STRIDE
@@ -398,24 +672,98 @@ def extract_entities(text: str) -> List[Dict]:
         return []
 
     if len(text) > MAX_TEXT_CHARS:
-        _warn_once("too_long",
+        _note_skip("too_long",
                    f"文本 {len(text)} 字超过 {MAX_TEXT_CHARS} 字上限，该条未做语义实体识别")
         return []
 
-    cached = _CACHE.get(text)
+    with _CACHE_LOCK:
+        cached = _CACHE.get(text)
+        if cached is not None:
+            _CACHE.move_to_end(text)
     if cached is not None:
-        _CACHE.move_to_end(text)
         return [dict(e) for e in cached]
 
     if not _init_ner():
+        _note_skip("model_unavailable")
         return []
 
     deadline = _current_deadline()
     if deadline is None:
-        _warn_once("budget_exhausted", "本次脱敏的语义识别总预算已耗尽，剩余文本未做实体识别")
+        _note_skip("budget_exhausted",
+                   "本次脱敏的语义识别总预算已耗尽，剩余文本未做实体识别")
         return []
 
-    raw_entities, complete = _decode_chunks(text, deadline)
+    # 单次调用超时（`deadline` 键）与推理异常（`infer_failed` 键）由 `_decode_chunks`
+    # 在发生处自己记账，这里**不要**再补一个笼统的键：同一个现象挂两个名字会让
+    # 设置页与弹窗各显示一半，且会把异常误报成超时。
+    # B-2：先拿"速率额度"，再拿"并发槽位"，最后才推理。
+    # 顺序不能反：先占槽位再发现没额度，会把槽位白占一会儿，放大排队。
+    # ⚠️ 估价必须**夹到桶容量**（0.6.0 修）：桶的容量是"每秒额度"
+    # （`_NER_BUDGET_MS_PER_S` = 并发 × 750），而单条长文本的线性估价可以远大于它
+    # （20000 字 ≈ 5600ms）。不夹的话 `_bucket_take` 永远失败 —— 于是超过
+    # 约 2680 字（并发 1）/ 5360 字（并发 2）的文本**永久**进不了语义识别，
+    # 而且是"确定性漏码"而不是"负载降级"：用户只看到 global_throttled 计数上涨。
+    # 桶的职责是限**速率**，不是限**单条大小**（单条大小由 CALL_BUDGET_S 与
+    # 分段长度上限兜住）。结算沿用既有口径：估高了退还，估低了不追缴。
+    est_ms = max(1.0, len(text) * _EST_MS_PER_CHAR)
+    est_ms = min(est_ms, float(_NER_BUDGET_MS_PER_S))
+    if not _bucket_take(est_ms):
+        # 额度不足：先在**有界**窗口内等一等（默认 2s，且不超过本轮剩余 deadline）。
+        # 等到就照常推理（记 budget_waited，“曾经缺额度但补上了”可见）；
+        # 等不到仍按原策略降级 —— 不阻断、不断链，只如实记原因。
+        # 给「取并发槽位」留出完整窗口：预算等待若把 deadline 吃光，紧接着的槽位
+        # 等待就只剩 max(0.05, ...) 的残值 —— 净效果是多等 2 秒、仍然不做识别，
+        # 还白占一个脱敏 worker（比直接降级更差）。所以这里先减掉槽位等待上限。
+        budget_wait_s = min(_NER_BUDGET_WAIT_MS / 1000.0,
+                            max(0.0, deadline - time.monotonic() - _SEM_WAIT_MAX_S))
+        if budget_wait_s > 0 and _bucket_wait(est_ms, budget_wait_s):
+            _metric_add("budget_waited", 1)
+            with _SKIP_LOCK:
+                _BUDGET_WAITED["n"] += 1
+        else:
+            _metric_add("global_throttled", 1)
+            _note_skip("global_throttled",
+                       f"语义识别的全局速率预算已用尽（{_NER_BUDGET_MS_PER_S} 毫秒/秒，"
+                       f"已等 {budget_wait_s:.1f}s），本条未做实体识别")
+            return []
+    remaining = max(0.05, min(_SEM_WAIT_MAX_S, deadline - time.monotonic()))
+    t_wait0 = time.monotonic()
+    got_slot = _SEM.acquire(timeout=remaining)
+    wait_ms = (time.monotonic() - t_wait0) * 1000
+    if not got_slot:
+        # 槽位等不到 = 已经有人在推理且迟迟不放手：跳过而不是无限排队。
+        _bucket_refund(est_ms)
+        with _SEM_STATS_LOCK:
+            _SEM_STATS["timeouts"] += 1
+        _metric_add("sem_timeout", 1)
+        _note_skip("sem_timeout",
+                   f"语义识别并发槽位等待超过 {remaining:.1f}s，本条未做实体识别")
+        return []
+    with _SEM_STATS_LOCK:
+        _SEM_STATS["waits"] += 1
+        _SEM_STATS["wait_ms_total"] += wait_ms
+        _SEM_STATS["wait_ms_max"] = max(_SEM_STATS["wait_ms_max"], wait_ms)
+    _metric_add("sem_wait_ms", wait_ms)
+    t_infer0 = time.monotonic()
+    with _SEM_STATS_LOCK:
+        _SEM_STATS["inflight"] += 1
+    # 计数本身靠 GIL 原子；peak 的 read-modify-write 允许输掉竞态（它只用于展示）：
+    # 为它单独加锁得不偿失，而报小的峰值不会放过任何真问题。
+    with _SEM_STATS_LOCK:
+        if _SEM_STATS["inflight"] > _SEM_STATS["peak_inflight"]:
+            _SEM_STATS["peak_inflight"] = _SEM_STATS["inflight"]
+    try:
+        raw_entities, complete = _decode_chunks(text, deadline)
+    finally:
+        with _SEM_STATS_LOCK:
+            _SEM_STATS["inflight"] -= 1
+        _SEM.release()
+        actual_ms = (time.monotonic() - t_infer0) * 1000
+        _metric_add("infer_ms", actual_ms)
+        _metric_add("calls", 1)
+        # 预估比实际高就退还（长文本往往比线性估计快），反之不追缴——
+        # 宁可偶尔多用一点额度，也不要为了精确记账把桶做成负值。
+        _bucket_refund(max(0.0, est_ms - actual_ms))
     if not raw_entities:
         # 负缓存（审计 M6 同源问题）：无实体的长文本此前**每次请求都重跑推理**
         # （≤2000 字约 500ms/次，实测成本模型 0.25ms/字）。

@@ -1,4 +1,5 @@
 """Cache protocol fields must not exempt business data or break schema references."""
+import asyncio
 import json
 from pathlib import Path
 import sys
@@ -30,6 +31,7 @@ class CacheFieldPathTests(unittest.TestCase):
         self.enterContext(mock.patch.multiple(tr, **state))
         self.enterContext(mock.patch.object(tr, "_maybe_reload"))
         self.enterContext(mock.patch.object(tr, "_emit"))
+        self.enterContext(mock.patch.object(tr, "write_runtime_metrics"))
         self.counter = 0
 
     def _send(self, route, body):
@@ -49,7 +51,7 @@ class CacheFieldPathTests(unittest.TestCase):
                 response=None, metadata={},
                 client_conn=SimpleNamespace(sockname=("127.0.0.1", 18701)),
             )
-            tr.request(flow)
+            asyncio.run(tr.request(flow))
             self.assertIsNone(flow.response, "The fixture must reach the forwarding path")
             self.assertIn("session_id", flow.metadata)
             sent = flow.request.content.decode("utf-8")

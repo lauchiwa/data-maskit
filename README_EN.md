@@ -62,20 +62,20 @@ When using **Cursor, Claude Code, Codex, Pi, OpenCode, ChatGPT, or any AI coding
 ## ✨ Highlights & Feature Overview
 
 ### 🛡️ 1. Deep Masking with Multi-turn Consistency
-- **20+ Built-in Scanner Rules**: API Keys/Tokens, PEM keys, DB connection strings, phone numbers, ID cards, emails, credit cards, private IPv4/IPv6, USCC unified social credit codes, and more;
+- **21 Built-in Scanner Rules (7 on by default)**: core privacy and credential rules (API key, bank card, DB connection string, email, ID card, landline, phone) are enabled out of the box; the other 14 (PEM private keys, JWT, tokens, secrets, cloud AccessKeys, private/public IPs, IPv6, MAC, license plates, USCC, HK/Macau travel permits, IBAN, and more) stay off so rare high-false-positive rules cannot derail the model's reasoning about your code and config, and can be enabled per rule in Settings;
 - **Custom Wordlists & Regex**: Categorized custom dictionary for names, codenames, and proprietary business terms; full regex support with resident deterministic placeholders;
 - **Sliding-window Placeholder Reuse**: Placeholders remain consistent across long conversations. "Alice" is assigned the exact same token in turn 1 and turn 20, preserving model reasoning consistency.
 
 ### 🤖 2. Local AI Entity Recognition (NER Semantic Model)
 - **Unstructured Free-Text Protection**: Built-in lightweight local ONNX model detects Chinese person names (NAME), organizations (ORG), and detailed physical addresses (ADDR) where regex rules fall short;
 - **Clean Original Extraction + Monotonic OffsetMap**: Extracts entities from the clean original context and translates coordinates back to the mutated text via a monotonic `OffsetMap`, completely eliminating plaintext fragment leakage caused by context truncation;
-- **100% Offline Local Inference**: Runs entirely inside your local process without any external network calls; toggleable in Settings.
+- **100% Offline Local Inference**: Runs entirely inside your local process without any external network calls; **off by default** (regex rules already cover the common cases) and can be enabled with one click in Settings.
 
 ### 🌐 3. Browser Extension Ecosystem (Web AI Privacy)
-- **Seamless Web AI Protection**: Dedicated Chrome & Edge MV3 extension for **ChatGPT, Claude, Kimi, Doubao, Qwen**, and other web AI platforms with 18+ preset sites with one-click authorization;
+- **Seamless Web AI Protection**: A Chrome & Edge MV3 extension. **ChatGPT, Claude, and DeepSeek are individually verified and pre-authorized out of the box — no manual site adding required** (you still need to enable the extension bridge and paste the access token in Settings); 14 more common AI sites (Kimi, Qwen, Tencent Yuanbao, ChatGLM, ERNIE Bot, Gemini, Grok, Perplexity, Copilot, and more) can be added with one click from Settings, unverified ones are clearly labeled, and custom sites are supported;
 - **Dual-Channel Interception (Fetch + XHR Engines)**: Intercepts standard Fetch as well as low-level `XMLHttpRequest` requests and streaming responses (XHR response restoration currently covers DeepSeek web only); other sites keep native behavior untouched;
-- **Direct Document & Attachment Masking**: Automatically parses and masks Word (`.docx` / `.doc`), Excel (`.xlsx` / `.xls`), and PowerPoint (`.pptx`) files locally before upload to cloud models;
-- **Local Masking + Typewriter Stream Restoration**: Prompts and attachments are masked locally before departure, and model responses are restored in real-time typewriter stream right inside the web chat UI with multi-turn session consistency.
+- **Direct Document & Attachment Masking (ChatGPT / Claude)**: Word (`.docx` / `.doc`), Excel (`.xlsx` / `.xls`), and PowerPoint (`.pptx`) files are parsed and masked locally before upload to cloud models; **on sites not yet supported (e.g. DeepSeek) the uploaded file itself is not masked** (passed through as-is), and the extension shows an explicit "attachment not masked" notice — do not send confidential files to those sites;
+- **Local Masking + Typewriter Stream Restoration**: Prompts are masked locally before departure, and model responses are restored in real-time typewriter stream right inside the web chat UI with multi-turn session consistency.
 
 ### ⚡ 4. Millisecond SSE Stream Takeover (Native Typewriter Flow)
 - Intercepts `text/event-stream` chunk by chunk with incremental restoration;
@@ -88,6 +88,8 @@ When using **Cursor, Claude Code, Codex, Pi, OpenCode, ChatGPT, or any AI coding
 ### 📊 6. Real-time Logs, Security Audit & Cost Tracking
 - Inspect full request/response diffs with one-click highlight mode;
 - **Passive Security Audit & Prompt Injection Detection**: Monitors upstream model responses and detects prompt extraction attempts, credential exfiltration instructions, and destructive command patterns;
+- **Dangerous Command Interception (opt-in, record-only by default)**: Flags model-issued commands such as `rm -rf /`, `mkfs`, `DROP DATABASE` and fork bombs into the Risky-action timeline. By default it neither rewrites nor blocks (zero byte change); you can switch to "rewrite with a harmless notice" or "block", and define custom rules plus an allow list. **Literal shapes only** (`a=rm; $a`, or writing the command into a script, will slip through) — a safety net, not a vault.
+- **Command interception scope (stated as-is)**: detection only looks at the **tool-argument channel** — the arguments of `Write`/`Edit` (i.e. the content about to be written to a file) are on that channel too, so writing `DROP TABLE users` into a `.sql` migration matches as well; browser-extension traffic (ChatGPT / Claude web) does **not** go through command interception; in "block" mode only the **selected channels** stop streaming (unselected channels keep flowing) and non-streaming responses are replaced with a 503.
 - Live token usage & model pricing cost estimation.
 
 ---
@@ -164,11 +166,12 @@ Web-based AI platforms cannot configure an API Base URL. Use Maskit's browser ex
 
 1. **Install Extension**: Download `Maskit_<version>_extension.zip` from [Releases](https://github.com/xiaYuTian11/maskit/releases/latest) and extract it. In Chrome/Edge, open `chrome://extensions` → toggle **Developer mode** → click **Load unpacked** and select the extracted folder (source users can directly load the `extension/` directory);
 2. **Connect to Engine**: In Maskit desktop dashboard `Settings → Browser Extension`, enable the extension bridge and copy your **Access Token** into the extension's settings popup;
-3. **Enable Sites**: Toggle target platforms (e.g. `chatgpt.com`, `claude.ai`, with 18+ preset sites supported and custom URL support).
+3. **Enable Sites**: `chatgpt.com`, `claude.ai`, and `deepseek.com` are pre-authorized out of the box; the other 14 preset sites can be granted with one click in the extension settings (unverified ones are labeled), and custom sites are supported.
 
 > 💡 **Status & Troubleshooting**:
-> - **File & Attachment Masking**: The extension supports direct attachment uploads and Office document masking (`.docx` / `.xlsx` / `.pptx` and transcoded `.doc` / `.xls`), eliminating manual scrubbing;
-> - Extension icon popup clearly displays current state: Green (Protected), Yellow (Engine offline, passthrough), Red (Invalid token or bridge disabled);
+> - **File & Attachment Masking**: Web-attachment uploads and Office document masking (`.docx` / `.xlsx` / `.pptx` and transcoded `.doc` / `.xls`) are adapted for ChatGPT / Claude and need no manual scrubbing; on sites not yet adapted (e.g. DeepSeek) the uploaded file itself is not masked and the extension shows a popup notice;
+> - Extension icon popup clearly displays current state: Green (Protected), Yellow (**engine offline — plaintext passthrough: not masked, but still connected**), Red (invalid token or bridge disabled — **also passthrough, not masked**);
+> - **When the engine is unreachable or the token is invalid, the extension passes traffic through unmasked by default** (the "never disconnect" trade-off); enable "Block when engine unavailable" in Settings if you would rather see requests fail than leave them unmasked;
 > - Extension events are logged in the dashboard's "Event Logs" and can be filtered by ingress (Proxy Link vs Browser Extension).
 
 ---
@@ -261,6 +264,49 @@ Given two clients (path prefixes `/openai` and `/anthropic`), point external too
 | Anthropic protocol (prefix `/anthropic`) | `http://<server-ip>:5802/anthropic` |
 
 > 💡 **Multi-port vs single-port**: multi-port (18701+) gives each client a dedicated port and the shortest `base_url` — ideal for local personal use; single-port maps just 5802 — ideal when container ports are constrained or you route everything through one Nginx prefix. Both modes coexist: prefix routing on 5802 and each client's dedicated port work simultaneously.
+
+---
+
+## 🔥 Concurrency Tuning & 503 Triage (Read This When Things Get Slow)
+
+Maskit's masking runs **only on your own machine** — every request costs local CPU. When many agents
+(Cursor + Claude Code + Codex + a script) share one gateway, the local CPU is the bottleneck, not the upstream.
+
+### Recommended settings
+
+| Scenario | What to do |
+|---|---|
+| 1–2 agents on a personal machine | Defaults are fine. Semantic recognition (NER) stays on. |
+| 4+ agents, or NER enabled on a 1–2 core box | Turn **NER off** in Settings, or give the container/machine more CPU. NER is the single biggest CPU consumer. |
+| Docker on a small VPS | Set `--cpus` to what you actually have (e.g. `--cpus=2`) and set `MASKIT_NER_THREADS=1`. Without `--cpus` the process happily uses every core it can see and looks "pinned at 100%". |
+| Large bodies / many parallel streams | Lower concurrency at the client; the queue budget (`MASKIT_MASK_QUEUE_BYTES`) is **backpressure, not throughput** — raising it only delays the rejection. |
+
+Masking pool width adapts to the core count (1–4) and can be overridden with `MASKIT_MASK_WORKERS`.
+Note that plain-Python rule scanning is GIL-bound: adding workers helps most with NER (ONNX releases the GIL)
+and with avoiding head-of-line blocking, not with raw regex throughput.
+
+### A 503 is not always "the gateway is overloaded"
+
+Since 0.6.0 every 503 is attributed. Open the event detail, or run **Settings → One-click self-check**:
+
+| `block_source` / reason | Meaning | What to do |
+|---|---|---|
+| `upstream` | The **upstream/relay** returned it (Maskit merely recorded it). Multiple agents on one API key is the usual cause | Lower concurrency, add retry backoff, or use separate keys |
+| `engine_busy` | The local masking queue hit its byte/count budget | Lower concurrency; raise `MASKIT_MASK_QUEUE_BYTES` only if the machine truly has headroom |
+| `engine_timeout` | One request exceeded the end-to-end deadline (`MASKIT_ENGINE_DEADLINE_S`, default 120s) | Check for a huge body or an overloaded box; the request result is discarded, the client may retry |
+| `fallback` | The proxy is stopped and the fallback listener is configured to answer 503 | Start the proxy, or set the stop mode to `passthrough` |
+
+**One-click self-check** (Settings → Health Check & Recovery) turns the same signals into
+"problem + evidence + suggested action", including bare-metal vs container CPU throttling
+(`nr_throttled`), NER degradation reasons, queue backlog and writer drops. It never uploads anything.
+
+> 📦 **The NER model is not distributed with the source repo**: `engine/models/ner_mini_zh/`
+> (a ~100MB quantized ONNX) is `.gitignore`d and ships only inside the **desktop installers** and the
+> **official Docker image**. When running from source or building your own image, place these three files
+> under `engine/models/ner_mini_zh/`: `config.json`, `tokenizer.json`, `model_quantized.onnx`.
+> Otherwise the "Semantic recognition" toggle can be turned on but will do nothing — the engine logs a
+> warning at startup, and **One-click self-check** in Settings reports the model as unavailable.
+
 
 ---
 

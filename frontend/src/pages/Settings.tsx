@@ -43,6 +43,7 @@ import { useMutation } from '@tanstack/react-query'
 import type { ShieldConfig, UpstreamConfig } from '@/types/api'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
+import { runSelfCheck, saveDiagnostics, type SelfCheckResult } from '@/api/diagnostics'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
@@ -181,8 +182,13 @@ const NER_SKIP_ITEMS: { key: string; labelKey: string }[] = [
   { key: 'budget_exhausted', labelKey: 'settings.sw.nerSkipBudget' },
   { key: 'infer_failed', labelKey: 'settings.sw.nerSkipInfer' },
   { key: 'deadline', labelKey: 'settings.sw.nerSkipDeadline' },
+  { key: 'model_unavailable', labelKey: 'settings.sw.nerSkipModelUnavailable' },
   { key: 'init_failed', labelKey: 'settings.sw.nerSkipInit' },
   { key: 'model_missing', labelKey: 'settings.sw.nerSkipModelMissing' },
+  { key: 'om_compose', labelKey: 'settings.sw.nerSkipCompose' },
+  { key: 'runtime', labelKey: 'settings.sw.nerSkipRuntime' },
+  { key: 'global_throttled', labelKey: 'settings.sw.nerSkipGlobalThrottled' },
+  { key: 'sem_timeout', labelKey: 'settings.sw.nerSkipSemTimeout' },
 ]
 
 function detectClientType(u: UpstreamConfig): string {
@@ -678,6 +684,10 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
   const [demoModel, setDemoModel] = useState('')
   const [realTesting, setRealTesting] = useState(false)
   const [healthInfo, setHealthInfo] = useState<Record<string, unknown> | null>(null)
+  // 一键自检（§16）：只手动触发；结论留在页面上直到用户重新跑，避免"看一眼就没了"
+  const [selfCheck, setSelfCheck] = useState<SelfCheckResult | null>(null)
+  const [selfCheckStale, setSelfCheckStale] = useState(false)
+  const [selfChecking, setSelfChecking] = useState(false)
   const [copiedMap, setCopiedMap] = useState<Record<string, boolean>>({})
   const [confirmDeleteCat, setConfirmDeleteCat] = useState<{ name: string; count: number } | null>(null)
 
@@ -697,28 +707,43 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
     try {
       const r = await shieldFetch('/api/open-url', {
         method: 'POST',
-        body: JSON.stringify({ url: 'https://github.com/xiaYuTian11/maskit/releases' }),
+        body: JSON.stringify({ url: 'https://github.com/lauchiwa/data-maskit/releases' }),
       })
       if (!(r as { ok?: boolean }).ok) toast(t('settings.toast.openFail'), 'error')
     } catch (e) { toast(`${t('settings.toast.openFail')}：${String(e)}`, 'error') }
   }
 
   // 关于页：GitHub Releases 最新版本（更新日志）
+  // 与「检查更新」同源：先浏览器直连 GitHub API（需 CSP connect-src 放行），
+  // 失败再退到服务端 /api/update/check —— 覆盖「浏览器能通」与「服务器能通」两种部署。
   const [siteRelease, setSiteRelease] = useState<{ version: string; notes?: string; pub_date?: string } | null>(null)
   const [siteReleaseErr, setSiteReleaseErr] = useState('')
   useEffect(() => {
     let alive = true
     const load = async () => {
       try {
-        const r = await (isTauri()
-          ? (await import('@tauri-apps/plugin-http')).fetch('https://api.github.com/repos/xiaYuTian11/maskit/releases/latest')
-          : window.fetch('https://api.github.com/repos/xiaYuTian11/maskit/releases/latest'))
-        const d = await r.json()
-        if (alive && d?.tag_name) {
+        let version = ''
+        let notes = ''
+        let pubDate = ''
+        try {
+          const r = await (isTauri()
+            ? (await import('@tauri-apps/plugin-http')).fetch('https://api.github.com/repos/lauchiwa/data-maskit/releases/latest')
+            : window.fetch('https://api.github.com/repos/lauchiwa/data-maskit/releases/latest'))
+          const d = await r.json()
+          version = String(d?.tag_name || '')
+          notes = String(d?.body || '')
+          pubDate = String(d?.published_at || '')
+        } catch {
+          const d = await shieldFetch<{ version?: string; notes?: string; pub_date?: string }>('/api/update/check', { timeoutMs: 20000 })
+          version = String(d?.version || '')
+          notes = String(d?.notes || '')
+          pubDate = String(d?.pub_date || '')
+        }
+        if (alive && version) {
           setSiteRelease({
-            version: String(d.tag_name).replace(/^v/, ''),
-            notes: d.body,
-            pub_date: d.published_at,
+            version: version.replace(/^v/, ''),
+            notes,
+            pub_date: pubDate,
           })
         }
       } catch (e) {
@@ -748,7 +773,9 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
   const auditProgress = auditTotal > 0 ? Math.min(100, Math.round((auditDone / auditTotal) * 100)) : 0
 
   const runAuditMutation = useMutation({
-    mutationFn: (opts: { upstream_name: string; model: string; profile: string }) => runAudit(opts),
+    mutationFn: (opts: { upstream_name: string; model: string; profile: string }) =>
+      // W1-4：同审计中心，允许后端临时启用探针并在结束后自动恢复原值
+      runAudit({ ...opts, allow_temp_probes: true }),
     onSuccess: (r) => {
       if (!r.ok) {
         toast(r.error || t('settings.toast.auditStartFail'), 'error')
@@ -1910,16 +1937,24 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                   </p>
                 )}
                 {/* 跳过原因计数（审计 M7）：`available` 为 true 只说明引擎能跑，
-                    **不说明每一段文本都做了识别**。`MAX_TEXT_CHARS=2000` 会让超长叶子整条
+                    **不说明每一段文本都做了识别**。`MAX_TEXT_CHARS` 会让超长叶子整条
                     跳过，预算耗尽也会中途停手——这些此前只写一条进程级日志，界面上
                     完全看不出，用户只会觉得「开了 NER 但没效果」。
                     只列非零项：一排 0 是噪声，不是信息。 */}
                 {!!(cfg as Record<string, unknown> | undefined)?.ner_enabled && status?.ner?.available
                   && (() => {
                     const skips = status.ner.skips || {}
-                    const parts = NER_SKIP_ITEMS
-                      .filter((it) => Number(skips[it.key] || 0) > 0)
-                      .map((it) => tf('settings.sw.nerSkipItem', { label: t(it.labelKey), n: Number(skips[it.key]) }))
+                    // 直接遍历**引擎报上来的键**，而不是只遍历本文件这份清单：
+                    // 漏登记一个键就等于该降级在界面上不存在，而引擎新增原因时最容易忘的
+                    // 恰好就是这里加一行（历史上 call_timeout / model_unavailable 就是这么漏的）。
+                    // 未登记的键回退到原始键名，宁可粗糙也不能消失。
+                    const labelOf = (k: string) => {
+                      const labelKey = NER_SKIP_ITEMS.find((it) => it.key === k)?.labelKey
+                      return (labelKey && t(labelKey)) || k
+                    }
+                    const parts = Object.keys(skips)
+                      .filter((k) => Number(skips[k] || 0) > 0)
+                      .map((k) => tf('settings.sw.nerSkipItem', { label: labelOf(k), n: Number(skips[k]) }))
                     if (parts.length === 0) return null
                     return (
                       <p className="text-[11px] leading-snug text-amber-600 dark:text-amber-400">
@@ -2434,6 +2469,102 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                   {JSON.stringify(healthInfo, null, 2).slice(0, 1500)}
                 </pre>
               )}
+              {/*
+                一键自检（§16）：结论 + 证据 + 建议。
+                刻意**不自动跑**：它读日志做聚合，属于"用户要看的时候才做"的动作，
+                自动跑等于给每次打开设置页都加一次全表聚合。
+              */}
+              <div className="w-full space-y-2 border-t pt-3">
+                <div className="flex flex-wrap items-center gap-3">
+                  <Button size="sm" variant="outline" className="h-8" onClick={async () => {
+                    if (selfChecking) return
+                    setSelfChecking(true)
+                    try {
+                      const r = await runSelfCheck()
+                      if (!r.ok || !r.selfcheck) throw new Error(r.error || 'selfcheck failed')
+                      setSelfCheck(r.selfcheck)
+                      setSelfCheckStale(Boolean(r.engine_metrics_stale))
+                    } catch (e) { toast(tf('settings.selfcheck.fail', { e: String(e) }), 'error') } finally { setSelfChecking(false) }
+                  }} loading={selfChecking}>
+                    {selfCheck ? t('settings.selfcheck.rerun') : t('settings.selfcheck.run')}
+                  </Button>
+                  {selfCheck && (
+                    <Button size="sm" variant="outline" className="h-8" onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(selfCheck.summary_line + '\n' +
+                          selfCheck.findings.map((f) => `[${f.severity}] ${f.title} | ${f.evidence} | ${f.action}`).join('\n'))
+                        toast(t('settings.selfcheck.copied'), 'success')
+                      } catch (e) { toast(tf('settings.selfcheck.copyFail', { e: String(e) }), 'error') }
+                    }}>
+                      {t('settings.selfcheck.copy')}
+                    </Button>
+                  )}
+                  <Button size="sm" variant="ghost" className="h-8" onClick={async () => {
+                    try {
+                      const r = await saveDiagnostics()
+                      toast(r.ok ? t('settings.selfcheck.exported') : String(r.error || ''), r.ok ? 'success' : 'error')
+                    } catch (e) { toast(String(e), 'error') }
+                  }}>
+                    {t('settings.selfcheck.export')}
+                  </Button>
+                  <span className="text-[11px] text-muted-foreground">{t('settings.selfcheck.hint')}</span>
+                </div>
+                {selfCheck && (
+                  <div className="space-y-2">
+                    <div className={
+                      selfCheck.overall === 'high' ? 'text-xs font-medium text-destructive'
+                        : selfCheck.overall === 'medium' ? 'text-xs font-medium text-amber-600'
+                        : 'text-xs font-medium text-emerald-600'
+                    }>
+                      {selfCheck.overall === 'high'
+                        ? tf('settings.selfcheck.overallHigh', { n: String(selfCheck.findings.length) })
+                        : selfCheck.overall === 'medium'
+                          ? tf('settings.selfcheck.overallMedium', { n: String(selfCheck.findings.length) })
+                          : t('settings.selfcheck.overallOk')}
+                      {selfCheckStale ? ' ' + t('settings.selfcheck.stale') : ''}
+                    </div>
+                    <ul className="space-y-2">
+                      {selfCheck.findings.map((f) => (
+                        <li key={f.id} className="rounded-lg border bg-muted/20 p-2">
+                          <div className="flex items-start gap-2">
+                            <span className={
+                              f.severity === 'high' ? 'mt-0.5 shrink-0 rounded bg-destructive/15 px-1.5 py-0.5 text-[10px] font-semibold text-destructive'
+                                : f.severity === 'medium' ? 'mt-0.5 shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700'
+                                  : 'mt-0.5 shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-muted-foreground'
+                            }>
+                              {f.severity === 'high' ? t('settings.selfcheck.sevHigh')
+                                : f.severity === 'medium' ? t('settings.selfcheck.sevMedium')
+                                  : t('settings.selfcheck.sevLow')}
+                            </span>
+                            <div className="min-w-0 flex-1 space-y-1">
+                              <div className="text-xs font-medium">
+                                {f.title}
+                                {f.verified === false && (
+                                  <span className="ml-1 text-[10px] text-muted-foreground">({t('settings.selfcheck.unverified')})</span>
+                                )}
+                              </div>
+                              <div className="font-mono text-[11px] text-muted-foreground">{f.evidence}</div>
+                              <div className="text-[11px]">
+                                <span className="text-muted-foreground">{t('settings.selfcheck.action')}：</span>{f.action}
+                              </div>
+                            </div>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                    {selfCheck.ok_items && selfCheck.ok_items.length > 0 && (
+                      <div className="text-[11px] text-muted-foreground">
+                        {t('settings.selfcheck.okTitle')}：{selfCheck.ok_items.map((o) => o.note).join(' / ')}
+                      </div>
+                    )}
+                    {selfCheck.input_errors && selfCheck.input_errors.length > 0 && (
+                      <div className="text-[11px] text-amber-700">
+                        {t('settings.selfcheck.inputErrors')}：{selfCheck.input_errors.map((e) => e.error).join('；').slice(0, 300)}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
             </CardContent>
           </Card>
 
@@ -2546,7 +2677,15 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
         {!embeddedTab && (
         <TabsContent value="about" className="space-y-4">
           {/* 产品信息 + 在线更新（合并为一个卡片） */}
-          <AboutUpdateCard version={status?.version} upstreamBase={status?.upstream_base} dataRoot={cfg?.data_root} running={status?.proxy_running} autoInstall={autoInstallUpdate} />
+          <AboutUpdateCard
+            version={status?.version}
+            upstreamBase={status?.upstream_base}
+            dataRoot={cfg?.data_root}
+            running={status?.proxy_running}
+            autoInstall={autoInstallUpdate}
+            updateSource={cfg?.update_check_url}
+            onSaveUpdateSource={(v) => save({ update_check_url: v }, t('settings.toast.updateSourceSaved'))}
+          />
 
           {/* 更新日志 */}
           <Card className="border bg-card">
@@ -2599,6 +2738,12 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
               {tf('settings.confirm.auditDesc', { name: auditUpstream || t('settings.advanced.selectedUpstream') })}
             </DialogDescription>
           </DialogHeader>
+          {/* 主动探针关闭时明示「临时启用 + 自动恢复」（W1-4）：与审计中心同一口径 */}
+          {!auditCfg.active_probes && (
+            <p className="text-xs leading-relaxed text-amber-600 dark:text-amber-500">
+              {t('settings.confirm.auditTempProbes')}
+            </p>
+          )}
           <DialogFooter>
             <Button size="sm" variant="outline" onClick={() => setConfirmAudit(false)}>{t('common.cancel')}</Button>
             <Button size="sm" variant="destructive" onClick={() => {

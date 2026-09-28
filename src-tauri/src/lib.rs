@@ -2047,8 +2047,17 @@ mod engine_log_rotation_tests {
 
 #[cfg(test)]
 mod panel_alive_tests {
-    use super::{AtomicBool, EngineManager, Ordering, ResetInFlightOnDrop};
+    use super::{AtomicBool, EngineManager, Mutex, Ordering, ResetInFlightOnDrop};
     use std::net::TcpListener;
+
+    /// 端口类用例必须**串行**执行。
+    ///
+    /// 它们都在 bind/drop 系统临时端口池里的地址，而 `cargo test` 默认多线程并行：
+    /// 一个用例 `drop` 掉的端口会被另一个用例的 `bind(127.0.0.1:0)` 立刻复用，
+    /// 于是「刚刚空闲的端口」瞬间又变成在监听。
+    /// CI 实测（2026-09-28）：`free_port_is_not_alive` 在 macOS runner 上偶发失败
+    /// （`assertion failed: !EngineManager::port_ready_on(port)`），同一 job 前四次全绿。
+    static PORT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// 占住一个空闲端口并保持监听：TCP 连得上，但永不 accept、永不回应 HTTP
     /// —— 正是「端口被别的进程占用」与「Flask 假死」的共同现场。
@@ -2064,6 +2073,7 @@ mod panel_alive_tests {
     /// 壳层把 ready 置为 true、托盘显示「引擎已就绪」，而前端所有 /api/* 请求超时。
     #[test]
     fn listening_but_silent_port_is_not_alive() {
+        let _serial = PORT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_listener, port) = hold_port();
         assert!(
             EngineManager::port_ready_on(port),
@@ -2077,6 +2087,8 @@ mod panel_alive_tests {
 
     #[test]
     fn free_port_is_not_alive() {
+        // 串行 + 释放后立即断言：端口不能被同进程内并行的用例抢走（见 PORT_TEST_LOCK）。
+        let _serial = PORT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (listener, port) = hold_port();
         drop(listener);
         assert!(!EngineManager::port_ready_on(port));

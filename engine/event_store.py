@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from contextlib import closing
 from credential_labels import CREDENTIAL_LABELS
+from credential_labels import (CREDENTIAL_ECHO_KINDS, CREDENTIAL_ECHO_REAL_MARKER,
+                               CREDENTIAL_ECHO_SAMPLE_MARKER)
 
 
 ROOT = Path(__file__).parent.resolve()
@@ -135,10 +137,26 @@ def _connect(schema=False):
             evidence TEXT,
             request_hash TEXT,
             response_hash TEXT,
-            probe_id TEXT
+            probe_id TEXT,
+            -- A-1：本条审计的成本与降级留痕。
+            -- 这三个字段此前**发了但从没落库**（表结构里没有对应列），于是
+            -- "排障时不必再猜这条告警是不是扫描被削过的产物"这句注释是空头支票；
+            -- 而测试打桩打在入队边界之前，看不见落库失败。
+            audit_ms REAL,
+            audit_scan_bytes INTEGER,
+            audit_scan_truncated INTEGER
         )
         """
     )
+    # 老库补列（新增列必须走这条：`CREATE TABLE IF NOT EXISTS` 对已存在的表不生效，
+    # 否则升级用户的审计表永远缺这三列 → 写入一直失败）
+    audit_cols = [r[1] for r in conn.execute("PRAGMA table_info(audit_events)").fetchall()]
+    for col, ddl in (("audit_ms", "REAL"),
+                     ("audit_scan_bytes", "INTEGER"),
+                     ("audit_scan_truncated", "INTEGER")):
+        if col not in audit_cols:
+            conn.execute(f"ALTER TABLE audit_events ADD COLUMN {col} {ddl}")
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_severity ON audit_events(severity)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_signal ON audit_events(signal_type)")
@@ -507,6 +525,12 @@ def init_db():
         conn.commit()
 
 
+# 是否发生过"损坏→隔离重建"（一键自检 S33 读它）。
+# 用进程内标志而不是 meta 表：重建后的新库不该背着旧库的历史，而"本次启动
+# 是否发生过隔离"恰好是用户排查时要的那个事实。
+_LAST_QUARANTINE = None
+
+
 def _quarantine_corrupt_db(reason):
     """把损坏的事件库挪到一边，返回新路径（失败返回 ""）。调用方随后重建空库。
 
@@ -516,6 +540,7 @@ def _quarantine_corrupt_db(reason):
     旧文件一律保留为 `<name>.corrupt-<时间戳>`，绝不删除：事件库是本地唯一副本，
     宁可占盘也不能替用户做「删掉」的决定。用户还能拿它去 sqlite3 里抢救数据。
     """
+    global _LAST_QUARANTINE
     try:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         base = DB_PATH.with_name(f"{DB_PATH.name}.corrupt-{stamp}")
@@ -525,6 +550,7 @@ def _quarantine_corrupt_db(reason):
                 continue
             dst = base if not suffix else base.with_name(base.name + suffix)
             src.replace(dst)
+        _LAST_QUARANTINE = {"at": time.time(), "reason": str(reason)[:200], "path": str(base)}
         return str(base)
     except Exception:
         return ""
@@ -812,8 +838,9 @@ def append_audit_event(record):
             conn.execute(
                 """
                 INSERT INTO audit_events
-                (ts, sid, host, method, path, signal_type, severity, evidence, request_hash, response_hash, probe_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (ts, sid, host, method, path, signal_type, severity, evidence, request_hash, response_hash, probe_id,
+                 audit_ms, audit_scan_bytes, audit_scan_truncated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     float(rec.get("ts") or time.time()),
@@ -827,6 +854,10 @@ def append_audit_event(record):
                     rec.get("request_hash"),
                     rec.get("response_hash"),
                     rec.get("probe_id"),
+                    # bool 要转 0/1：sqlite3 不接受 bool（会报 InterfaceError）
+                    (lambda v: None if v is None else float(v))(rec.get("audit_ms")),
+                    (lambda v: None if v is None else int(v))(rec.get("audit_scan_bytes")),
+                    (lambda v: None if v is None else int(bool(v)))(rec.get("audit_scan_truncated")),
                 ),
             )
             conn.commit()
@@ -934,15 +965,46 @@ _DEPRECATED_AUDIT_EVIDENCE_PREFIXES = (
     ("identity_swap", "identity_claim:%"),
     ("sse_anomaly", "%"),
     ("canary_leak", "%"),
+    # 凭据回流的历史噪音（W1-2，2026-09-22 审批）：W1-1 上线前，credential_echo 一律
+    # MEDIUM 且无形态标记，把「AI 在代码块里写 .env / CI 密钥示例」报成「响应投毒」。
+    # 谓词命中整类 `credential_echo:<kind>` 证据，只隐藏**旧的无标记存量**：
+    # W1-1 之外的两种新记录都带标记（`[示例形态]` / `[疑似真实凭据]`），
+    # 由下面 `_audit_visibility_filter` 的 NOT LIKE 保护子句守死。
+    #
+    # ⚠️ 前缀必须与 **evidence 列的真实形态**一致：落库的是
+    # `<kind> len=<n> sha256=<摘要>`（`audit_signals._redact_evidence` 的产物）。
+    # `credential_echo:` 只出现在扫描结果 dict 的 `kind` 字段上，而 `audit_events`
+    # 表**没有 kind 列**（见本模块建表语句）——按它写前缀会恒不匹配、降噪静默空转，
+    # 用户视角是「升级了，但历史噪音一条都没少」。
+    # 由 `tests/test_audit.py::CredentialEchoReadSideFilterTests` 拿引擎真实产出守死。
+    *(("response_poison", f"{kind} len=%") for kind in CREDENTIAL_ECHO_KINDS),
 )
+
+# 读侧降噪的**保护标记**：带任一标记的证据都是本版规则主动产出的、档位正确的新记录，
+# 任何已撤销判定谓词都不允许隐藏它。两个标记各有分工：
+#   · CREDENTIAL_ECHO_REAL_MARKER —— 非代码块 + 高熵的**真阳性**（隐藏它是安全事故）；
+#   · CREDENTIAL_ECHO_SAMPLE_MARKER —— 代码块内/低熵的**示例形态**（LOW）。它虽属噪音类，
+#     但隐藏它就违背了分档设计自己的承诺「门槛调到 LOW 仍可查，不丢可查性」
+#     （见 audit_signals.scan_response_poison 的分档注释）——用户主动调低门槛后
+#     一条都看不到，是静默失效。降噪对象应该是**旧的无标记存量**，不是新写的正确记录。
+# 谓词全部是 LIKE 前缀匹配，无法表达「以某某结尾」，所以保护必须在 SQL 里
+# 显式写出（而不是靠证据形态碰巧不匹配）。
+_AUDIT_NEVER_HIDE_MARKERS = (CREDENTIAL_ECHO_REAL_MARKER, CREDENTIAL_ECHO_SAMPLE_MARKER)
 
 
 def _audit_visibility_filter():
     """返回审计历史读侧过滤 SQL 子句与参数（不删除数据库记录）。"""
     clauses, params = [], []
+    marker_like = [f"%{m}%" for m in _AUDIT_NEVER_HIDE_MARKERS]
     for signal_type, evidence_pattern in _DEPRECATED_AUDIT_EVIDENCE_PREFIXES:
-        clauses.append("NOT (signal_type = ? AND COALESCE(evidence, '') LIKE ?)")
-        params.extend([signal_type, evidence_pattern])
+        clause = "NOT (signal_type = ? AND COALESCE(evidence, '') LIKE ?"
+        args = [signal_type, evidence_pattern]
+        for like in marker_like:
+            clause += " AND COALESCE(evidence, '') NOT LIKE ?"
+            args.append(like)
+        clause += ")"
+        clauses.append(clause)
+        params.extend(args)
     return clauses, params
 
 
@@ -980,7 +1042,8 @@ def fetch_audit_events(since=0, limit=500, severity_floor=None, signal_filter=No
         params.append(signal_filter)
     sql = (
         "SELECT id, ts, sid, host, method, path, signal_type, severity, evidence, "
-        "request_hash, response_hash, probe_id FROM audit_events WHERE "
+        "request_hash, response_hash, probe_id, audit_ms, audit_scan_bytes, "
+        "audit_scan_truncated FROM audit_events WHERE "
         + " AND ".join(where)
         + " ORDER BY id DESC LIMIT ?"
     )
@@ -1003,6 +1066,11 @@ def fetch_audit_events(since=0, limit=500, severity_floor=None, signal_filter=No
             "probe_id": r["probe_id"],
             "request_hash": r["request_hash"],
             "response_hash": r["response_hash"],
+            # A-1：审计成本与截断（老行为 NULL → 前端按"无此信息"处理，不假装是 0）
+            "audit_ms": r["audit_ms"],
+            "audit_scan_bytes": r["audit_scan_bytes"],
+            "audit_scan_truncated": (None if r["audit_scan_truncated"] is None
+                                     else bool(r["audit_scan_truncated"])),
         })
     return out
 
@@ -2329,4 +2397,148 @@ def stats_models(days=7, now=None):
             "completion": int(c or 0),
             "errors": int(err or 0),
         })
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# C-1 / §16：只读聚合（面板 /api/engine/metrics 与一键自检共用）
+# ══════════════════════════════════════════════════════════════════════════
+# 为什么放在本模块而不是新开文件：事件库的连接、建表与迁移都在这里，
+# 聚合读的也是同一个库（`_connect` / `_ensure_db`）；另起一个模块只会让
+# 「谁能碰这个库」多一处入口。
+#
+# 三条硬约束（与库的隐私口径一致）：
+#   ① **只读**：不写、不改、不迁移；
+#   ② **不返回正文**：只回计数/分位/状态码，调用方拿不到 payload 原文，
+#      也就没机会把它带进界面或诊断包 —— 隐私面靠"拿不到"，不靠"记得过滤"；
+#   ③ **任何一步失败只降级、不抛**：自检恰恰在系统半死不活时才用得上，
+#      聚合失败不该让整份结论消失（失败原因记在 `errors` 里）。
+# 超过这个条数就不再逐行解 payload 做归因（只回总量/速率）。
+# 取 5 万的理由：按每条 1.5~3KB payload 估算，逐行解一次就是 ~100MB 级读取，
+# 而 /api/selfcheck 是一次点击触发的 UI 动作，不该在 Flask 线程上做这种量级的工作。
+_AGGREGATE_DETAIL_MAX = 50000
+
+
+def _percentiles(values):
+    """返回 (p50, p95, n)；无数据时全 0。"""
+    vals = sorted(v for v in values if isinstance(v, (int, float)))
+    if not vals:
+        return 0.0, 0.0, 0
+    def at(p):
+        idx = min(len(vals) - 1, max(0, int(round(p / 100.0 * (len(vals) - 1)))))
+        return round(float(vals[idx]), 1)
+    return at(50), at(95), len(vals)
+
+
+def aggregate_recent(seconds=3600, now=None, sample_limit=2000):
+    """最近 N 秒的事件聚合（只读）。
+
+    返回结构固定（缺数据时给 0/空 dict），调用方不必到处判 None：
+        by_type / by_status / by_block_source / by_reason 计数，
+        mask_ms / upstream_ms 的 p50、p95，
+        unresolved 合计、每分事件数、最后一条事件时间、疑似重试风暴。
+    """
+    out = {
+        "window_s": int(seconds), "total": 0, "per_minute": 0.0, "last_event_ts": 0.0,
+        "by_type": {}, "by_status": {}, "by_block_source": {}, "by_reason": {},
+        "unresolved": 0, "retry_storms": [],
+        "mask_ms": {"p50": 0.0, "p95": 0.0, "n": 0},
+        "upstream_ms": {"p50": 0.0, "p95": 0.0, "n": 0},
+        "errors": [],
+    }
+    try:
+        _ensure_db()
+    except Exception as e:                                  # pragma: no cover
+        out["errors"].append("connect: %s: %s" % (type(e).__name__, e))
+        return out
+
+    window = max(60.0, float(seconds))
+    now = float(now or time.time())
+    since = now - window
+
+    def _grouped(conn, sql, params):
+        rows = conn.execute(sql, params).fetchall()
+        return {str(r[0]): int(r[1]) for r in rows if r[0] not in (None, "")}
+
+    try:
+        with closing(_connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT COUNT(*) AS n, MAX(ts) AS last FROM events WHERE ts >= ?", (since,)
+            ).fetchone()
+            out["total"] = int(row["n"] or 0)
+            out["last_event_ts"] = float(row["last"] or 0.0)
+            out["per_minute"] = round(out["total"] / (window / 60.0), 2)
+            if not out["total"]:
+                return out
+
+            # 全窗口扫描（http_status / json_extract(payload) / SUM(unresolved)）都要
+            # 逐行解 payload，而窗口上限是 7 天保留期 —— 窗口内事件量很大时（重试风暴
+            # 可以到 10 万/小时量级）一次点击就是几百 MB 的行读，还跑在 Flask 线程上。
+            # 所以给一个**总量闸**：超过就不再逐行归因，只回总量并把差额说清楚
+            # （调用方与 UI 都能区分"没有异常"与"太大了没细分"）。
+            if out["total"] > _AGGREGATE_DETAIL_MAX:
+                out["detail_skipped"] = True
+                out["detail_skipped_reason"] = (
+                    "窗口内事件 %d 条，超过逐行归因上限 %d：仅返回总量与速率"
+                    % (out["total"], _AGGREGATE_DETAIL_MAX))
+                return out
+
+            out["by_type"] = _grouped(
+                conn, "SELECT type, COUNT(*) FROM events WHERE ts >= ? GROUP BY type", (since,))
+            out["by_status"] = _grouped(
+                conn, "SELECT http_status, COUNT(*) FROM events WHERE ts >= ? "
+                      "AND http_status IS NOT NULL GROUP BY http_status", (since,))
+            # 5xx 汇总（自检 S11 用；单独一档是因为用户关心的不是具体 500/502/503 的分布）
+            r5 = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE ts >= ? AND http_status >= 500", (since,)
+            ).fetchone()
+            out["by_status"]["5xx"] = int(r5[0] or 0)
+
+            # payload 里的归因字段：block_source（A-7）/ reason（既有）
+            for key, col in (("by_block_source", "block_source"), ("by_reason", "reason")):
+                try:
+                    out[key] = _grouped(
+                        conn,
+                        "SELECT json_extract(payload, '$." + col + "') AS k, COUNT(*) "
+                        "FROM events WHERE ts >= ? AND k IS NOT NULL GROUP BY k", (since,))
+                except sqlite3.Error as e:
+                    out["errors"].append("%s: %s" % (col, e))
+
+            try:
+                r = conn.execute(
+                    "SELECT COALESCE(SUM(CAST(json_extract(payload, '$.unresolved') AS INTEGER)), 0) "
+                    "FROM events WHERE ts >= ?", (since,)).fetchone()
+                out["unresolved"] = int(r[0] or 0)
+            except sqlite3.Error as e:
+                out["errors"].append("unresolved: %s" % e)
+
+            for key, field, etype in (("mask_ms", "mask_ms", "MASK"),
+                                      ("upstream_ms", "upstream_ms", None)):
+                # 注意口径：p50/p95 取自**最新 `sample_limit` 行**，而计数覆盖整个窗口。
+                # 把两者混着读会失真（例如拿样本的 p50 去对比全窗口的 5xx 计数），
+                # 所以把 n 一并回给调用方。
+                try:
+                    cond = "AND type = ?" if etype else ""
+                    params = (since, etype) if etype else (since,)
+                    rows = conn.execute(
+                        "SELECT json_extract(payload, '$." + field + "') AS v FROM events "
+                        "WHERE ts >= ? " + cond + " ORDER BY id DESC LIMIT ?",
+                        params + (int(sample_limit),)).fetchall()
+                    p50, p95, n = _percentiles([r[0] for r in rows])
+                    out[key] = {"p50": p50, "p95": p95, "n": n}
+                except sqlite3.Error as e:
+                    out["errors"].append("%s: %s" % (field, e))
+
+            # 疑似重试风暴：同一路径 60 秒内出现 ≥5 次 5xx
+            try:
+                rows = conn.execute(
+                    "SELECT path, COUNT(*) AS c FROM events WHERE ts >= ? AND http_status >= 500 "
+                    "AND path IS NOT NULL GROUP BY path HAVING c >= 5 ORDER BY c DESC LIMIT 5",
+                    (max(since, now - 60.0),)).fetchall()
+                out["retry_storms"] = [{"path": r["path"], "count": int(r["c"])} for r in rows]
+            except sqlite3.Error as e:
+                out["errors"].append("retry_storms: %s" % e)
+    except Exception as e:                                  # pragma: no cover
+        out["errors"].append("aggregate: %s: %s" % (type(e).__name__, e))
     return out

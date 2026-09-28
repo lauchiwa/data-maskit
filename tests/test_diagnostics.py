@@ -4,7 +4,7 @@
 export 只需保证不含还原正文，诊断包还要保证日志、崩溃现场这些自由文本
 里的凭据与 PII 也被打码。
 
-测试设计上有一条血的教训（见 AGENTS「E2E 假绿」）：先断言脏数据**确实进包了**，
+测试设计上有一条血的教训（E2E 假绿）：先断言脏数据**确实进包了**，
 再断言它被打码。否则某天 crash_dumps 因为路径变更取不到数据，
 "没泄漏" 会变成一个永远通过的空测试。
 
@@ -208,7 +208,12 @@ class DiagnosticsPayloadTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         body = json.loads(r.data.decode("utf-8"))
         self.assertTrue(body["masked"])
-        self.assertEqual(body["schema"], 1)
+        # 0.6.0 起 schema=2：诊断包内嵌一键自检结论（结论给人看、证据给维护者，
+        # 同一个文件）。断 >= 2 而不是写死 2：版本再升时不该因为一个无关字段
+        # 让这条端到端用例变红。
+        self.assertGreaterEqual(body["schema"], 2)
+        self.assertIn("selfcheck", body)
+        self.assertIn("findings", body["selfcheck"])
 
     def test_endpoint_requires_token(self):
         """诊断包即便打过码也含端口/配置/错误信息，不能对无令牌请求开放。"""

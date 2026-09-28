@@ -152,6 +152,14 @@ export interface ShieldEvent {
    * 它说明模型在改写输出格式，是「哪天彻底还原不回来」的前兆。
    */
   degraded?: number
+  /**
+   * 本轮语义识别（NER）是否发生降级：true = 有字符串叶子没走语义识别。
+   * **只在降级时后端才写这个键**（正常一轮没有它）；原因与条数见 ner_skip_reasons。
+   * MASK 与 RESTORE 两条事件都带（详情弹窗按 _detailSeq 回源 RESTORE）。
+   */
+  ner_truncated?: boolean
+  /** 降级明细：原因 → 本轮由此原因跳过的叶子数。键见 EventDetailDialog 的 NER_SKIP_LABELS。 */
+  ner_skip_reasons?: Record<string, number>
   items: SlimItem[] | EventItem[]
   dialog?: string
   dialog_req?: string
@@ -160,6 +168,25 @@ export interface ShieldEvent {
   resp_preview?: string
   stream_mode?: 'stream' | 'whole'
   stream_actual?: 'stream' | 'whole' | 'stream_error'
+  /**
+   * A-7：本次的 503/错误是**谁**造成的。
+   * upstream = 上游/中转返回的（Maskit 只是如实记录）；engine = 本机 fail-closed 拦的；
+   * fallback = 代理已停时兜底层占位回的。没有这个字段，用户只能靠猜。
+   */
+  block_source?: 'upstream' | 'engine' | 'fallback'
+  /** 队列满被拒（engine_busy）时的现场数据，用于判断"是我并发太高还是机器太小" */
+  engine_busy?: boolean
+  engine_queue_depth?: number
+  engine_queue_bytes?: number
+  /** 语义识别因全局速率预算/信号量被跳过时的计数与等待时长 */
+  ner_global_throttled?: number
+  ner_sem_wait_ms?: number
+  /** C-2：本该流式却走整包的原因（content_encoding:gzip / excluded_host / non_sse） */
+  stream_degraded_reason?: string
+  /** 脱敏池排队时长（毫秒）：只在本条真的排过队（≥1ms）时才带 */
+  queue_wait_ms?: number
+  /** 响应侧等待脱敏线程池的时长（毫秒）：只在本条等超过阈值（默认 2s）时才带 */
+  aux_wait_ms?: number
   mask_ms?: number
   first_byte_ms?: number
   upstream_ms?: number
@@ -291,6 +318,9 @@ export interface ShieldConfig {
   model_prices?: Record<string, { input: number; output: number }>
   price_sync_enabled?: boolean
   price_sync_url?: string
+  /** 更新检查源（留空 = 内置源：GitHub 静态 latest.json → GitHub API）。
+   *  国内/内网服务器连不上 GitHub 时填镜像或自建中转。 */
+  update_check_url?: string
   autostart: boolean
   auto_start_proxy: boolean
   start_minimized: boolean
@@ -349,6 +379,10 @@ export interface AuditEvent {
   probe_id?: string
   request_hash?: string
   response_hash?: string
+  /** A-1：本条审计的耗时 / 扫描字节 / 是否被预算截断（老数据为 null） */
+  audit_ms?: number | null
+  audit_scan_bytes?: number | null
+  audit_scan_truncated?: boolean | null
   [key: string]: unknown
 }
 

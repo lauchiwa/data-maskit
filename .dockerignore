@@ -20,6 +20,7 @@ model_rules_device_id
 shield.pid
 shield-env-backup.json
 model_prices_cache.json
+engine-runtime.json
 diagnostics-*.json
 engine/config.json
 # 冒烟测试语料/脚本（根目录），不是运行时资产。

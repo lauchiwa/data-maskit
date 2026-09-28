@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+基于上游 v0.6.0（`xiaYuTian11/maskit`）。
+*Based on upstream v0.6.0 (`xiaYuTian11/maskit`).*
+
+### 新增 / Added
+- 同步上游 v0.5.0–v0.6.0 的并发治理、危险命令审计与一键自检，保留本分支更新签名、模型规则和缓存字段修复。
+  *Synced upstream v0.5.0–v0.6.0 concurrency controls, dangerous-command auditing and self-checks, preserving fork update signing, model rules and cache-field fixes.*
+
 ### 修复 / Bug Fixes
 - 按协议路径保护缓存相关键名与合法保留策略，敏感缓存键沿用稳定脱敏映射，避免同名业务字段漏检及 Schema 定义与引用不一致。
   *Protect cache-related keys and valid retention policies only at protocol paths; reuse stable masking for sensitive cache keys without exempting business data or breaking schema references.*
@@ -65,6 +72,105 @@
 ### 新增 / Added
 - 上游血缘基线元数据 `__upstream_base__`，经 `/api/status` 与诊断导出暴露（字段 `upstream_base`），用于确认运行中的实例基于哪个上游版本；只读，不参与版本比较。
   *Upstream lineage baseline `__upstream_base__`, exposed via `/api/status` and diagnostics export (field `upstream_base`), to identify which upstream version a running instance is based on; read-only, never used in version comparison.*
+
+## [0.6.0] - 2026-09-28
+
+### 修复
+- 引擎：修复大模型生成代码时改写凭据标签（如将连接串 CONNSTR 改写为 PASSWORD/SECRET）导致无法还原的问题，引入凭据标签同义互通反查。
+- 引擎：修掉"长会话拖慢整个代理"的队头阻塞——审计扫描窗口由 512KB 收到 128KB 并加时间预算，脱敏线程池按核数自适应（1~4），响应侧的**还原/审计/扫描整体移出事件循环**（流式收尾一并下池）。
+- 引擎：脱敏队列改为按字节预算与条数上限准入（超限回 503 + `Retry-After`，带抖动），并在 worker 异常路径上也归还名额；首次在内存上给并发设了天花板。
+- 引擎：新增端到端上限（默认 120s，`MASKIT_ENGINE_DEADLINE_S`），超时回结构化 503 而不是无限等待；等待超时不会中断已在跑的 worker。
+- 引擎：语义识别加进程级并发信号量与每秒推理预算，过载时**降级但不断链**并记录原因（`global_throttled`）；修掉初始化竞态（并发首调可能建出两个 ONNX 会话）。
+- 引擎：浏览器扩展链路解除全局串行 —— 脱敏/文件脱敏/流式还原这些重活移出 `_EXT_LOCK`（多标签页并发时不再互相堵），并把「必须持锁」与「必须不持锁」两侧都写成静态守卫。
+- 修复：`audit.scan_max` / `parse_max` / `time_budget_ms` 手改 config.json 后被配置归一化抹掉（自检提示让用户改这三个键，却会被自检自己抹掉）；新增：响应侧等待脱敏线程池超过 2s 时留痕（`aux_wait_ms` 进事件、导出与审计弹窗），并把审计耗时/扫描字节/是否截断真正显示在审计详情弹窗里（此前只在后端落库，前端渲染的是永远取不到值的死分支）。
+- 引擎：修掉流式收尾下池引入的两处线程归属问题（延后 `_drop` 可能抹掉同一会话的新实例、审计熔断在 aux 线程回写 `flow.response`），并给审计运行时计数器加锁；审计缓存键补上 `ct` 与响应头摘要（同 body 不同头不再回放旧结论）。
+- 引擎：请求体不再被解析两遍；响应侧新增可读的「为什么整包」原因与每条请求的脱敏排队时长，事件详情直接可见。
+- 引擎：流式收尾（审计 + 响应扫描）下池，并去掉四处 O(body) 白烧；审计只解码"会被用到的文本"（超 2MB 的响应不再为 128KB 扫描窗口把整份 body 解码成字符串），**响应哈希仍是全量 sha256**（证据语义不变）；同轮修掉"进程名取错 CSV 列导致每次端口判定都白跑一次 8s 超时 PowerShell"的老问题，端口快照改为一次 `tasklist` + 一次 CIM 批量归类（含 5s 缓存）。
+- 修复：四处 P0 —— 非流式请求用量恒为 0（拿流式字段做判据）、整包路径 `_drop` 漏传 `expect` 会抹掉同会话新实例、S32 读错键名导致「事件库写失败」永不触发、S03 把自身端口误判成被占用。
+- 修复：自检的跨线程共享状态补锁（aux 统计、canary 注册表、`peak_wait_ms`），修掉 `_AUX_PENDING` 双减、S11 零样本误报与 OK_NOTES 与已触发结论自相矛盾；测试不再依赖执行顺序。
+- 修复：审计探测窗口不再被模块级常量冻结（改 `audit.scan_max` 立即生效）、等待类指标不再因挂在错误的 gate 下永不显示、`peak_wait_ms` 峰值不再被并发覆盖、事件库队列字节默认值校正为 `max(32MB, workers × 8MB)`。
+- 引擎：语义识别预算不足时改为**有界等待**（`MASKIT_NER_WAIT_MS`，默认 2s）：等到即推理，等不到仍降级；新增 `budget_waited` 计数区分「补上了」与「真降级」（随 `/api/engine/metrics` 外发；界面与自检结论暂不展示）。
+
+### 新增
+- 设置页：一键自检的结论文案跟随界面语言（中/英），英文界面下不再输出中文结论（含诊断包内嵌的同一份结论）。
+- 引擎：503 增加来源归因（上游 / 本机熔断 / 兜底层），事件详情与自检都能一眼区分"是上游拒的还是本机拦的"。
+- 设置页：新增**一键自检**（设置 → 健康检查与恢复），把端口、队列、语义识别降级、审计截断、磁盘与容器 CPU 限流翻译成「问题 + 证据 + 建议动作」，只读本机数据、不联网；诊断包同步升级为 schema 2 并内嵌该结论。
+- 引擎：新增 `/api/engine/metrics`（走 `/api/` 三重校验）暴露脱敏队列、审计耗时与语义识别治理器状态，供面板与自检共用。
+
+### 文档
+- 文档：`README` 增「多并发调优与 503 排查」章节（503 四种来源的分辨方法、容器 CPU 配额与 NER 的关系），`SECURITY.md` 登记本轮新增的环境变量并补上"审计扫描预算"这一能力边界。
+- 引擎：启动时对「语义识别已开启但模型缺失」显式告警，并在 README 说明 NER 模型不随源码仓库分发。
+
+---
+
+### Bug Fixes
+- Engine: fixed placeholder restoration failure when LLMs rewrite credential labels (e.g. CONNSTR to PASSWORD/SECRET) by introducing synonym credential label reverse-lookup.
+- Engine: fixed head-of-line blocking behind long conversations — the audit scan window is now 128KB (was 512KB) with a time budget, the masking pool adapts to the core count (1–4), and response-side restore/audit/scan moved off the event loop (**the streaming finish path included**).
+- Engine: the masking queue now admits by byte budget and in-flight count (over-limit answers 503 + a jittered `Retry-After`) and returns the quota even when a worker raises; concurrency finally has an explicit ceiling.
+- Engine: added an end-to-end deadline (120 s by default, `MASKIT_ENGINE_DEADLINE_S`) that answers a structured 503 instead of waiting forever; hitting it does not kill the in-flight worker.
+- Engine: NER now has a process-wide inference semaphore and a per-second budget, degrading (with a recorded reason, `global_throttled`) instead of breaking the chain; fixed an init race where concurrent first calls could build two ONNX sessions.
+- Engine: removed global serialization on the browser-extension path — masking, document masking and stream restore moved out of `_EXT_LOCK` (concurrent tabs no longer queue behind each other), with static guards for both "must lock" and "must not lock".
+- Fixed: `audit.scan_max` / `parse_max` / `time_budget_ms` were silently erased from config.json by config normalization (the self-check told users to edit them, then wiped them itself). Added: response-side wait on the masking pool is now traced when it exceeds 2s (`aux_wait_ms` in events, exports and the event dialog), and audit cost/scan-bytes/truncation are now actually rendered in the audit detail dialog (previously DB-only, with the frontend rendering a branch that could never resolve).
+- Engine: fixed two thread-ownership issues introduced by offloading the stream finish (a deferred `_drop` could wipe a re-created session, and the audit block wrote `flow.response` on an aux thread), locked the audit runtime counters, and added `ct` + response-header digest to the audit cache key (identical bodies with different headers no longer replay a stale verdict).
+- Engine: request bodies are no longer parsed twice; responses now carry a readable "why whole-body" reason and each request reports its mask-queue wait, both visible in the event detail.
+- Engine: the streaming finish path (audit + response scan) is now offloaded, and three needless O(body) passes were removed. The audit now decodes only the text it actually uses (responses over 2 MB no longer get a full-body decode just to feed a 128 KB scan window) while the response hash stays a full sha256 (evidence semantics unchanged). The same pass fixed a long-standing bug where the process name was read from the wrong CSV column (so every port ownership check fell through to an 8 s-timeout PowerShell call); port snapshots now use one `tasklist` plus one batched CIM query with a 5 s cache.
+- Fixed four P0 defects: non-streaming requests always reported zero usage (a stream-only field was used as the predicate), the whole-body path dropped the `expect` argument and could wipe a re-created session, S32 read the wrong key so "event DB writes failing" never fired, and S03 mistook Maskit's own port for a foreign one.
+- Locked the self-check's cross-thread state (aux stats, canary registry, peak_wait_ms) and fixed the double decrement of `_AUX_PENDING`, S11's zero-sample false positive and OK_NOTES contradicting fired findings; tests no longer depend on execution order.
+- The audit probe window is no longer frozen by a module-level constant (editing audit.scan_max takes effect immediately), wait metrics are no longer hidden behind the wrong gate, peak_wait_ms can no longer lose updates under concurrency, and the event-queue byte default is corrected to max(32MB, workers x 8MB).
+- Engine: NER now waits inside a bounded window (MASKIT_NER_WAIT_MS, 2 s default) when the budget is exhausted — it infers if the budget returns, degrades otherwise; the new budget_waited counter separates "recovered" from real degradation and is exported via /api/engine/metrics only (the UI and the self-check conclusion do not show it yet).
+
+### Added
+- Settings: the one-click self-check conclusion now follows the UI language (Chinese/English); an English UI no longer shows Chinese conclusions, including the copy embedded in the diagnostics bundle.
+- Engine: 503s are now attributed (upstream / local fail-closed / fallback), so the event detail and the self-check tell upstream rejections apart from local blocking at a glance.
+- Settings: added **One-click self-check** (Settings → Health Check & Recovery) turning ports, queueing, NER degradation, audit truncation, disk and container CPU throttling into "problem + evidence + suggested action". It reads local data only and never goes online; the diagnostics bundle is now schema 2 and embeds the conclusion.
+- Engine: added `/api/engine/metrics` (behind the `/api/` triple guard) exposing mask-queue, audit-timing and NER-governor state for both the panel and the self-check.
+
+### Docs
+- Docs: `README` gained a "concurrency tuning & 503 triage" section (how to tell the four 503 sources apart, why container CPU quotas matter for NER); `SECURITY.md` registers the new environment variables and documents the audit scan budget as an explicit capability boundary.
+- Engine: warns loudly at startup when semantic recognition is enabled but the model is missing, and the README now states that the NER model is not distributed with the source repo.
+
+## [0.5.0] - 2026-09-24
+
+### 新增 / Added
+- 审计：凭据示例不再被报成「响应投毒」（代码块/低熵形态降为仅记录），新增三档审计预设与审计阻断开关、主动探针临时启用、以及「高风险操作时间线」视图（仅该视图放宽门槛，默认视图不受影响）。
+  *Audit: credential examples are no longer reported as response poisoning (code blocks / low-entropy shapes are downgraded to record-only), plus three audit presets with a blocking switch, temporary probe enablement, and a Risky-action timeline view that relaxes the severity floor only inside that view.*
+- 审计：新增「危险命令拦截」（审计页 → 主动安全探针）——检测模型下发的删根、擦盘、删库、fork 炸弹等命令并落库到高风险操作时间线，默认只记录不改写，可切换改写或阻断，支持自定义规则与白名单。
+  *Audit: added dangerous-command interception (Audit page → Active security probe tab) — detects model-issued commands such as root deletion, disk wiping, DROP DATABASE and fork bombs into the risky-action timeline. Record-only by default, switchable to rewrite or block, with custom rules and an allow list.*
+
+### 修复 / Bug Fixes
+- 引擎：修复长会话脱敏阻塞整个代理、在途请求被上游掐断后返回 502 的问题——脱敏重活移出 mitmproxy 事件循环，并给语义识别加单请求总预算、扩充结果缓存。
+  *Engine: fixed long conversations blocking the whole proxy and surfacing 502s when in-flight upstream connections were dropped — masking now runs off the mitmproxy event loop, with a per-request NER budget and a larger result cache.*
+- 引擎：共享全局态（占位符复用表、自定义词映射、配置热重载）改为互斥 + 原子发布，修掉多线程下的后缀撞车与半填充词表；PEM 私钥规则由 O(n²) 降为线性（1.49MB 病态输入 880ms → 25ms）。
+  *Engine: shared state (placeholder reuse tables, custom-word mappings, hot reload) is now mutex-protected and published atomically, fixing cross-thread suffix collisions and partially published word lists; the PEM private-key rule is now linear instead of O(n²) (1.49 MB pathological input: 880 ms → 25 ms).*
+- 引擎：占位符复用表改为按窗口批量回收，表满时签发 300 个新占位符由 144ms 降到 1.6ms；TTL 与容量语义不变。
+  *Engine: reuse-table pruning is now batched per time window — 300 new placeholders against a full table dropped from 144 ms to 1.6 ms, with TTL and capacity semantics unchanged.*
+- 引擎：自定义词映射重建改为「锁外派生 + 锁内换表」（锁序 _SYNC_LOCK → _STATE_LOCK），配置保存时不再让在途脱敏干等。
+  *Engine: custom-word mapping rebuild now derives outside the state lock and only swaps tables under it (lock order _SYNC_LOCK → _STATE_LOCK), so live masking no longer waits on a config save.*
+- 引擎：语义识别（NER）限流口径修正 —— 单请求总预算由固定 2s 改为按体积伸缩（10s 打底、每 MB +120s、封顶 60s），单条长度上限 2000→20000 字；本轮发生降级时 MASK 事件带 ner_truncated 与原因，不再静默。旧口径可用 `tests/measure_ner_coverage.py --budget 2.0` 复现（200 条/43KB 实测 74~101/200 个人名明文出网，截断点随机器负载浮动，所以不给单一数字），修复后 0。
+  *Engine: corrected NER throttling — the per-request budget is now size-aware (10 s base, +120 s/MB, capped at 60 s) instead of a fixed 2 s, and the per-text limit went from 2 000 to 20 000 chars; a degraded round is now flagged in the MASK event via ner_truncated and its reasons. Reproduce the old behaviour with `tests/measure_ner_coverage.py --budget 2.0` (74–101 of 200 names leaked in a 43 KB conversation; the cut point floats with machine load, hence a range), 0 after.*
+- 引擎：语义识别的时间闸门按**实测**成本重新标定（单位成本 93µs/字节）。单次调用上限 2s→10s：旧值跑不完一条上限长度文本，导致超长无实体文本每轮重付冷推理且永不进缓存（实测 20000 字 2123/2013/2049ms → 修复后 4806ms 一次、之后 1ms）。请求级每 MB 系数 20s→120s：旧值比实测成本小约 8 倍，中等体积请求会在半途静默停手。
+  *Engine: re-calibrated the NER time gates against measured cost (93 µs/byte). Per-call limit 2 s → 10 s: the old value could not finish a max-length text, so long entity-free text re-paid cold inference every round and never entered the cache (measured 2 123/2 013/2 049 ms at 20 000 chars → 4 806 ms once, then 1 ms). Per-MB request budget 20 s → 120 s: the old value was ~8× below measured cost, so mid-sized requests silently stopped halfway.*
+- 引擎：跳过原因统一记账（按请求 + 进程级）并加锁；单次超时/推理失败改在发生处记账（`deadline`/`infer_failed`），不再用一个笼统键把异常误报成超时。
+  *Engine: skip reasons are now accounted uniformly (per request and process-wide) behind a lock; call timeout and inference failure are recorded where they happen (`deadline` / `infer_failed`) instead of one blanket key that mislabelled exceptions as timeouts.*
+- 前端：设置页与事件详情弹窗共用同一份跳过原因标签；设置页改为遍历引擎上报的键（未登记的回退原始键名），不再因为漏加一行就把整条降级从界面上消失。
+  *Frontend: the settings page and the event detail dialog now share one set of skip-reason labels; the settings page iterates the keys the engine actually reports (unknown ones fall back to the raw key), so a missing line can no longer hide a whole degradation reason from the UI.*
+- 引擎：单次语义识别调用上限 2s→6s —— 旧值低于「跑完一条上限长度文本」的成本，于是超长且无实体的文本每轮都重付冷推理且永不进缓存（实测 20000 字 4806ms/轮 → 修复后 1ms）。
+  *Engine: raised the per-call NER time limit from 2 s to 6 s — the old value was below the cost of finishing a max-length text, so long entity-free text re-paid cold inference every round and never entered the cache (measured 4 806 ms per round at 20 000 chars → 1 ms after).*
+- 引擎：浏览器扩展链路（`/api/ext/mask`、`/api/ext/mask-file`）补上语义识别总预算与降级上报——响应带 `ner_skipped`，事件带降级标记；降级但零命中时也记一条，不再静默。
+  *Engine: the browser-extension endpoints (`/api/ext/mask`, `/api/ext/mask-file`) now open a total NER budget and report degradation — the response carries `ner_skipped` and the event is flagged; a degraded round with zero hits is still recorded instead of staying silent.*
+- 前端：事件详情弹窗新增「本轮语义识别降级」提示（原因 × 条数，中英双语）；MASK 与 RESTORE 两条事件都带该信息，详情回源 RESTORE 时同样可见。
+  *Frontend: the event detail dialog now shows a “semantic recognition degraded this round” notice (reason × count, bilingual); the flag is carried on both MASK and RESTORE events, so detail lookups that resolve to RESTORE show it too.*
+- 本地部署脚本：修复「替换安装文件时命中句柄占用即中止、且中止后不拉起客户端」的问题——改为等进程退出 + 删除/覆盖重试 + 引擎目录先落暂存再换名就位，并保证失败时也拉起客户端并回滚备份。
+  *Local deploy script: fixed a mid-swap abort on locked files that left the client stopped — it now waits for processes to exit, retries delete/copy, stages the engine dir before swapping it in, and always restarts the client with a backup rollback on failure.*
+- 发版流程：修复预发布版本号（`X.Y.Z-beta.N`）被过严正则误判为「版本分叉」而中止打包的问题，并让版本校验失败时回滚全部版本文件。
+  *Release: fixed prerelease versions (`X.Y.Z-beta.N`) being wrongly reported as a version mismatch due to over-strict regexes, and version-check failures now restore all version files.*
+- 发版流程：预发布判定改为「tag 含 `-` 即预发布」（不再只认 `-beta`/`-alpha`/`-rc`）。原先 `vX.Y.Z-dev` 这类 tag 会被当成正式版发布，进而产出 `latest.json` 并把 `ghcr.io/...:latest` 指向非正式构建。
+  *Release: pre-release detection now treats any tag containing `-` as a pre-release (instead of only `-beta`/`-alpha`/`-rc`). Previously a tag like `vX.Y.Z-dev` was published as a stable release, producing `latest.json` and repointing `ghcr.io/...:latest` at an unreleased build.*
+
+### 优化 / Changed
+- 文档：修正对外能力表述——扩展站点支持改为「ChatGPT / Claude / DeepSeek 三站已实测」，附件脱敏补充「未适配站点文件本体不脱敏并弹窗提示」，规则库写明「21 类中默认开启 7 类」，NER 标注默认关闭，并说明「引擎不可用时明文直通＝不脱敏」。
+  *Docs: corrected capability claims — extension site support now states the three verified sites, attachment masking notes unmasked files on unsupported sites with a popup warning, the rule library states that 7 of 21 rules are on by default, NER is marked off by default, and "engine down = unmasked passthrough" is documented.*
+
 ## [0.4.0] - 2026-09-21
 
 ### 新增 / Added
@@ -609,6 +715,7 @@ Release v0.2.6: Fix CI unit test deadlock, credential header clobbering (401 err
 - Docker 镜像（amd64 / arm64）内嵌 Web 控制台，远程访问需 `MASKIT_PANEL_TOKEN`。
 - 中英文界面一键切换、深浅主题。
 
+[0.4.0]: https://github.com/xiaYuTian11/maskit/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/xiaYuTian11/maskit/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/xiaYuTian11/maskit/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/xiaYuTian11/maskit/compare/v0.2.12...v0.3.0

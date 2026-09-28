@@ -49,7 +49,16 @@ Data Maskit 是一个**本地脱敏代理**：拦截本机 LLM API 请求，敏�
 |------|------|------|---------|
 | 转发到你配置的 LLM 上游 | 开（这是产品功能） | 脱敏后的请求 | — |
 | 模型价格目录同步（`price_sync_url`，默认 `mask.ciyuanroute.com`，失败回退 openrouter.ai） | **关** | 仅 GET，不带任何用户数据 | 设置 → 高级 → 价格同步 |
-| 版本检查 / 更新下载（桌面版经 Tauri Updater，Web / Docker 版经 GitHub Releases API） | **自动**：启动后约 8 秒静默查一次，之后每 6 小时复查；点「检查更新」可立即触发 | 当前版本号 | 无法关闭；仅探测版本号与元数据，不发送任何使用数据，下载仅在点击「安装」后发生 |
+| 版本检查 / 更新下载（桌面版经 Tauri Updater；Web / Docker 版先由**浏览器**直连 GitHub API，失败再退到**服务端** `/api/update/check`） | **自动**：启动后约 8 秒静默查一次，之后每 6 小时复查；点「检查更新」可立即触发 | 当前版本号 | 无法关闭；仅探测版本号与元数据，不发送任何使用数据，下载仅在点击「安装」后发生 |
+
+> Web / Docker 版先由浏览器直连 `api.github.com`（该源已在面板 CSP `connect-src` 放行）；
+> 直连失败（浏览器到 GitHub 不通）时退到服务端 `/api/update/check`，源顺序为
+> 「自定义源（`update_check_url`）→ 静态 `latest.json` → GitHub API」，结果缓存 10 分钟。
+> 两条路都保留是因为出网能力属于谁取决于部署环境：国内服务器 + 用户本地有代理时
+> 只有浏览器能通；内网/离线终端 + 服务器有出口时只有服务器能通。
+> 静态 `latest.json` 不计入 GitHub 匿名 API 限流（60 次/小时/IP），服务端缓存
+> 把多人共用出口的消耗压到 ~6 次/小时。可用 `update_check_url` 指向镜像或自建中转
+> （设置 → 关于与更新）。
 
 除上表外，引擎与前端**不发送任何统计、崩溃报告或日志**。反馈诊断包只在用户点击「保存」后生成到本地文件，由用户自行决定是否上传。
 
@@ -125,6 +134,18 @@ Data Maskit 是一个**本地脱敏代理**：拦截本机 LLM API 请求，敏�
 | `MASKIT_START_READY_TIMEOUT` | `60` | 代理冷启动就绪等待上限（秒） | 只影响启动判定 |
 | `MASKIT_BYTE_SPLICE` | `1` | 命中敏感词时只就地替换被脱敏的字符串字面量（保住客户端 body 排版与上游前缀缓存）；设 `0` 退回整棵重序列化 | 只影响回写字节与 CPU，**不改变发往上游的内容**：替换结果必须通过 `json.loads(结果) == 脱敏后的树` 等价校验，不过即退回重序列化 |
 | `MASKIT_BIND_HOST` | `127.0.0.1` | `docker-compose.yml` 的主机侧绑定地址 | 公网部署必须显式确认 |
+| `MASKIT_MASK_WORKERS` | 按核数自适应（1~4） | 脱敏线程池宽度；1~2 核机器自动为 1，可用本变量覆盖（上限 16） | 纯 Python 规则扫描受 GIL 约束，加宽收益有限；主要受益方是 NER（ONNX 推理释放 GIL）与避免队头阻塞。**加宽会同步放大并发 × 单请求内存**，容器里请对照 `--cpus` 设置 |
+| `MASKIT_MASK_QUEUE_BYTES` | `max(32MB, workers × 8MB)`（4 核默认 32MB；1~2 核被单条下限抬到 32MB） | 脱敏队列的**总字节预算**，超限即拒（503 `engine_busy` + `Retry-After`） | 这是背压保护而非吞吐参数：调大只推迟拒绝时刻，不增加算力。并发高且 body 大时先降并发 |
+| `MASKIT_ENGINE_DEADLINE_S` | `120` | 单个请求的端到端脱敏等待上限（秒），超时回 503 `engine_timeout` | 超时**不会**中断已在跑的 worker（Python 线程不可中断）：该请求结果被丢弃，但已签发的占位符仍在会话表里 |
+| `MASKIT_NER_CONCURRENCY` | 按核数自适应 | NER 同时推理数上限（信号量） | 过高会把 CPU 吃满，导致规则扫描与事件循环饥饿 |
+| `MASKIT_NER_BUDGET` | 按核数自适应（≥50） | NER 每秒可用推理毫秒预算（令牌桶） | 预算用尽时**降级但不断链**：先在短窗口内等（见下一行），等不到就跳过并记 `global_throttled`（自检 S22 可见）。⚠️ 单条估价会**夹到桶容量**，长文本按封顶值而非实际耗时计费（估高了退还、估低了不追缴）——这是**速率粗限流**，不是精确计量，别据此推算吞吐 |
+| `MASKIT_NER_WAIT_MS` | `2000` | 预算不足时等待的上限（毫秒，`0` = 立即跳过不等待） | 有界等待：等到就照常推理（记 `budget_waited`），等不到仍降级。等待会占住脱敏 worker，别设太大 |
+| `MASKIT_NER_THREADS` | 按核数自适应（本分支默认上限 2，可覆盖至 16） | `onnxruntime` 的 intra-op 线程数 | 弱机（1~2 核）应设为 1，否则 NER 会与规则扫描抢核 |
+| `MASKIT_AUDIT_SCAN_MAX` | `131072`（128KB） | 单次审计的扫描窗口字节数 | 调大=线性增加每次审计的 CPU/事件循环占用；调小=更早截断，检出面缩小 |
+| `MASKIT_AUDIT_PARSE_MAX` | `2097152`（2MB） | 审计结构化解析的体积上限 | 超过则跳过解析并在事件里留痕（`parse_skipped`） |
+| `MASKIT_AUDIT_TIME_BUDGET_MS` | `250` | 单次审计的时间预算（毫秒） | 超预算即停止后续信号并标记 `truncated` |
+| `MASKIT_PASSTHROUGH_CONCURRENCY` | `128`（下限 8） | 透传（代理停止时的兜底直连）并发槽位数 | 调小可限制兜底路径的资源占用 |
+| `MASKIT_PASSTHROUGH_SLOT_WAIT` | `5` | 兜底路径取槽位的等待秒数（超时回 503，来源 `fallback`） | 过小会在慢上游上误拒，过大会拖长兜底请求占用 |
 | `LLM_SHIELD_DATA_DIR` | 平台约定 | 覆盖数据目录（配置、事件库、日志、`proxy_token`） | 指向共享目录会削弱文件权限隔离 |
 | `LLM_SHIELD_PANEL_PORT` | `5801` | 覆盖面板端口 | 壳层与前端据此探活，改了要一并放通防火墙 |
 | `LLM_SHIELD_UPSTREAM` | 空 | 覆盖检测到的本地上游代理 | — |
@@ -141,6 +162,7 @@ Data Maskit 是一个**本地脱敏代理**：拦截本机 LLM API 请求，敏�
 - **不防上游 relay 关联分析**：占位符跨请求复用（同一实体每轮对话用同一占位符），上游虽看不到明文，但能推断"同一个实体反复出现"。对高保密场景，请自行评估。
 - **不防侧信道**：脱敏发生在请求上行前，但请求**时序/长度/频率**对上游可见。
 - **不防模型复述**：模型可能在回复中复述占位符语义（如"你刚才提到的联系人"）。还原只处理占位符本身。
+- **命令拦截（危险命令）只在响应阶段、只挡明文形态**：它拦的是「命令送到客户端（Agent 可能去执行）」，既不撤回已经发出的请求，也不代表上游没生成过。绕过形态包括写成 `a=rm; $a`、放进脚本再执行；改写/阻断只作用于「工具参数」通道内的明文，而 `Write`/`Edit` 的**文件内容也在该通道**（往 `.sql` 里写 `DROP TABLE` 会命中，属已知误伤面，白名单可豁免）；浏览器扩展链路不经过它。切到「阻断」时仅静默已勾选的通道，非流式响应会被换成 503，客户端 SDK 可能按上游故障重试同一条命令。
 
 ### 根证书说明
 
@@ -154,6 +176,16 @@ Data Maskit 是一个**本地脱敏代理**：拦截本机 LLM API 请求，敏�
 - 非 JSON 请求体 → 503；JSON 解析失败 → 400；请求体超 32MB → 413。
 - 审计信号触发自动停用 upstream 的开关（`audit.fail_closed`）默认关闭，用户自选。
 
+## 能力边界：审计扫描预算（默认值即上限）
+
+响应侧审计**不保证覆盖整个响应体**，这是刻意取舍：
+
+- 单次扫描有**字节上限（默认 128KB）与时间预算**，超出即停止并把该次审计标记为 `truncated`；
+- 被截断的响应仍会**完整**下发给客户端：只是"没扫到的那部分没被审计"，不会因此阻断流量；
+- 截断、跳过解析（非 JSON / 压缩 / 黑名单主机）、未做语义识别（NER 预算用尽）这几类降级都会写进事件并在自检结论里可见，不会静默发生。
+
+调大上限是**线性增加 CPU** 的（耗时按字节增长，且跑在请求路径上）。并发高时应优先降并发，而不是调大上限。
+
 ## 已审计项
 
 - 后端 0 处 `eval`/`exec`/`os.system`/`shell=True`/`pickle.load`
@@ -162,3 +194,7 @@ Data Maskit 是一个**本地脱敏代理**：拦截本机 LLM API 请求，敏�
 - 数据目录 ACL 启动时自动收紧（`_harden_data_dir_acl`）
 - 扩展桥接端点全部挂在 `/api/` 命名空间内（受 Host / Origin / 令牌三重校验），根空间只有静态资源
 - 扩展 `host_permissions` 只有 `127.0.0.1` / `localhost`；无 `storage.sync`、无远程代码、无请求正文日志
+- 语义识别（NER）降级恒可见：跳过原因（`too_long` / `deadline` / `infer_failed` / `budget_exhausted` / `model_unavailable` / `model_missing` / `om_compose` / `runtime`）既进事件（`ner_truncated` + `ner_skip_reasons`，MASK 与 RESTORE 都带）也进设置页计数，引擎与前端键集合一致由 `tests/test_regressions.py` 的契约测试锁住——**静默降级等于「以为开了、其实没脱」**
+- 已登记的上游依赖告警：RustSec **[RUSTSEC-2024-0429](https://rustsec.org/advisories/RUSTSEC-2024-0429.html)**（`glib::VariantStrIter` 迭代器实现 UB，`informational = "unsound"`，修复版本 `>=0.20.0`）。`glib` 经 Tauri → GTK 引入（`atk → gtk ← libappindicator ← tray-icon ← tauri`），**仅 Linux 目标存在**（`cargo tree -i glib` 在 Windows 目标下为空），发布物（Windows NSIS / macOS DMG / Python 引擎镜像）不含该依赖，自有代码也不调用受影响方法
+  - 2026-09-24 核验：**当前无任何可用升级能消除它** —— `tauri 2.11.6`（最新稳定）仍 `gtk ^0.18` + `tray-icon ^0.24`；`tray-icon 0.25.1`（最新）仍 `gtk ^0.18` + `libappindicator ^0.9`；`libappindicator 0.9.0`（最新）仍 `glib ^0.18`；gtk-rs 最新稳定 `gtk 0.19.0` 也仍低于要求的 `0.20`。唯一带 gtk 0.20 的可能路径是 `tauri 3.0.0-alpha`，属预发布、不适合生产
+  - 因此**不本地改依赖、不锁版本、不打 `[patch]` 强提**：强行把 glib 提到 0.20 会与同族 gtk 0.18 的 API 不兼容，直接打断 Linux 构建。下次升 Tauri 时用 `cargo tree -i glib` 复检，升到 `gtk >= 0.20` 即自然消除

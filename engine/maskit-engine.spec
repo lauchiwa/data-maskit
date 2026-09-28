@@ -36,6 +36,10 @@ hiddenimports = (
         'audit_signals',
         'audit_engine',
         'ner_engine',
+        # 0.6.0 新增（一键自检）：panel.py 里是**函数内**懒加载 `import selfcheck`，
+        # 且三处调用点都包在 try 里 —— 万一打包态缺它，表现是“点了自检没反应”
+        # 而不是报错（分析器的运气不能当保证）。tests/test_engine_packaging.py 锁这条。
+        'selfcheck',
         'onnxruntime',
         'tokenizers',
         # mitmdump 命令行入口：安装包不含 mitmdump.exe，引擎要自己当 mitmdump 跑

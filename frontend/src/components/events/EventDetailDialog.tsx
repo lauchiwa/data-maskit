@@ -42,6 +42,35 @@ function formatDuration(ms?: number | null): string {
 }
 
 /**
+ * 语义识别（NER）降级原因 → i18n 键。
+ *
+ * **只用 `settings.sw.nerSkip*` 这一套标签**：设置页与详情弹窗共用同一份文案，
+ * 避免两处各维护一份又互相漂移（当初就是设置页列了 6 个键、其中一个早已不产生、
+ * 而真在产生的两个没列，界面上直接看不到）。
+ *
+ * 键的空间（引擎侧）：ner_engine 的 too_long / budget_exhausted / infer_failed /
+ * deadline / model_unavailable，以及 transparent 经 `record_skip` 上报的
+ * model_missing / om_compose / runtime。未知原因（后端将来新增）直接回退到原始键名
+ * —— 降级信息宁可粗糙也绝不能不显示（不显示就等于静默降级）。
+ * 一致性由 tests/test_regressions.py::NerSkipReasonSurfacesTests 守。
+ */
+const NER_SKIP_LABELS: Record<string, string> = {
+  too_long: 'settings.sw.nerSkipTooLong',
+  budget_exhausted: 'settings.sw.nerSkipBudget',
+  infer_failed: 'settings.sw.nerSkipInfer',
+  deadline: 'settings.sw.nerSkipDeadline',
+  model_unavailable: 'settings.sw.nerSkipModelUnavailable',
+  model_missing: 'settings.sw.nerSkipModelMissing',
+  om_compose: 'settings.sw.nerSkipCompose',
+  runtime: 'settings.sw.nerSkipRuntime',
+  // B-2（0.6.0）：治理器新增的两个降级原因。加它们不是"多列两项"——
+  // 契约测试（test_regressions.NerSkipReasonSurfacesTests）会要求引擎报出的
+  // 每个键在两个界面上都有落点，否则用户看到的又是静默降级。
+  global_throttled: 'settings.sw.nerSkipGlobalThrottled',
+  sem_timeout: 'settings.sw.nerSkipSemTimeout',
+}
+
+/**
  * 在正文里高亮「被还原回来的原文」。
  *
  * 存在的理由：还原是这个软件的核心动作，但对着一段几千字的回复，
@@ -255,11 +284,106 @@ export function EventDetailDialog({
               </div>
             )}
 
+            {/* A-7 / C-1：503 归因 + 队列现场 + 语义识别降级计数。
+                这是"503 到底怪谁"这个问题的唯一答案来源——字段一直进了事件库与导出，
+                但此前**前端一个都没渲染**（等于用户看不到），所以在这里按"有则显示"补齐。
+                注意：审计耗时/扫描字节那三个字段**不属于这里** —— 它们只存在于
+                audit_events 表，渲染在 AuditEventDetailDialog；挂在这里是死分支
+                （真这么写过一次：永远读到 undefined，比不渲染更糟）。 */}
+            {(event.block_source || event.engine_busy || event.ner_global_throttled
+              // 等待类指标必须单独放行：它们由不同的事件发出（aux 等待是
+              // reason=response_offload_wait 的 ERR，只带 client 来源字段），
+              // 挂在上面那三个字段的 gate 里就永远渲染不出来（死分支）。
+              || typeof event.aux_wait_ms === 'number'
+              || typeof event.ner_sem_wait_ms === 'number') && (
+              <div className="space-y-1 rounded-lg border bg-muted/30 p-2.5 text-xs">
+                {event.block_source && (
+                  <div>
+                    <span className="text-muted-foreground">{t('detail.blockSource')}：</span>
+                    {t(`detail.blockSource.${event.block_source}`) === `detail.blockSource.${event.block_source}`
+                      ? event.block_source
+                      : t(`detail.blockSource.${event.block_source}`)}
+                  </div>
+                )}
+                {event.engine_busy && (
+                  <div className="text-amber-700 dark:text-amber-400">
+                    {tf('detail.engineBusy', {
+                      d: String(event.engine_queue_depth ?? '-'),
+                      b: String(event.engine_queue_bytes ?? '-'),
+                    })}
+                  </div>
+                )}
+                {typeof event.ner_global_throttled === 'number' && event.ner_global_throttled > 0 && (
+                  <div className="text-amber-700 dark:text-amber-400">
+                    {tf('detail.nerGlobalThrottled', { n: String(event.ner_global_throttled) })}
+                  </div>
+                )}
+                {typeof event.aux_wait_ms === 'number' && event.aux_wait_ms >= 1 && (
+                  <div className="text-muted-foreground">
+                    {tf('detail.auxWait', { ms: String(Math.round(event.aux_wait_ms)) })}
+                  </div>
+                )}
+                {typeof event.ner_sem_wait_ms === 'number' && event.ner_sem_wait_ms >= 1 && (
+                  <div className="text-muted-foreground">
+                    {tf('detail.nerSemWait', { ms: String(Math.round(event.ner_sem_wait_ms)) })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* C-2：本该流式却整包——把"为什么"直接写出来。
+                用户看到的只是"字一个个蹦 vs 一坨蹦"，没有这条就只能翻配置猜。
+                三种原因的可操作性不同，所以文案分开：编码问题是上游行为（改不了），
+                排除名单是自己加的（改得了）。 */}
+            {event.stream_degraded_reason && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs leading-relaxed text-amber-700 dark:text-amber-400">
+                <div className="font-semibold">{t('detail.streamDegraded')}</div>
+                <div className="mt-1">
+                  {event.stream_degraded_reason.startsWith('content_encoding:')
+                    ? tf('detail.streamDegraded.encoding', {
+                        enc: event.stream_degraded_reason.slice('content_encoding:'.length),
+                      })
+                    : event.stream_degraded_reason === 'excluded_host'
+                      ? t('detail.streamDegraded.excluded')
+                      : event.stream_degraded_reason === 'non_sse'
+                        ? t('detail.streamDegraded.non_sse')
+                        : tf('detail.streamDegraded.other', { reason: event.stream_degraded_reason })}
+                </div>
+              </div>
+            )}
+
+            {/* C-2 附带：本条的脱敏排队时长（只在真排过队时出现）。
+                它是"我这台机器/这套并发到底吃不吃得消"的直接证据，比看 CPU 直观。 */}
+            {typeof event.queue_wait_ms === 'number' && event.queue_wait_ms >= 1 && (
+              <div className="text-xs text-muted-foreground">
+                {tf('detail.queueWait', { ms: String(Math.round(event.queue_wait_ms)) })}
+              </div>
+            )}
+
             {/* msg / reason 提示（_reasoning_effort_hint 等排查信息） */}
             {(event.msg || event.reason) && (
               <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs leading-relaxed text-amber-700 dark:text-amber-400">
                 {event.msg && <div className="whitespace-pre-wrap">{event.msg}</div>}
                 {event.reason && <div className="mt-1 text-muted-foreground">{event.reason}</div>}
+              </div>
+            )}
+
+            {/* 语义识别（NER）降级提示。
+                「静默降级」＝用户以为开了、其实没脱：正则/词表照常，但只有 NER 能识别的
+                人名/机构/地址会整段明文上行（实测长会话下漏过 101/200 个人名）。
+                所以一旦命中就必须在这条事件的详情里说清「为什么漏、漏了几条」，
+                让用户能自己决定是调大预算还是关掉语义识别。 */}
+            {event.ner_truncated && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs leading-relaxed text-amber-700 dark:text-amber-400">
+                <div className="font-semibold">{t('detail.nerDegraded')}</div>
+                <div className="mt-1 text-muted-foreground">{t('detail.nerDegradedHint')}</div>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {Object.entries(event.ner_skip_reasons ?? {}).map(([k, n]) => (
+                    <Badge key={k} variant="outline" className="text-[11px] font-normal">
+                      {t(NER_SKIP_LABELS[k] || k)} × {n}
+                    </Badge>
+                  ))}
+                </div>
               </div>
             )}
 

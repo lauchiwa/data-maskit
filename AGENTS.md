@@ -188,9 +188,8 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 - **Beta / 预发布版本更新隔离规范（Pre-release Isolation）**：
   - 尚在迭代或稳定性待验证的先行特性，若需提前打包分发测试，发布为 **Beta 预发布版本**（如 `v0.2.x-beta.N`）；
   - **客户端防打扰与更新隔离底线（客户端默认不检测 Beta 更新）**：桌面端 Tauri 更新器端点固定为 `releases/latest/download/latest.json`。GitHub 官方核心机制中，`releases/latest` 永远只指向最新的正式稳定 Release，**天然排除所有标记为 Pre-release 的预发布版本**。因此任何先行 Beta 发布在 GitHub Release 上必须显式标记为 **Pre-release**，且绝不能产出/覆盖正式版的 `latest.json`。现网所有已安装正式版客户端默认**绝对不会检测到 Beta 更新**，彻底杜绝未稳定改动骚扰普通用户。
-  - **Beta 发布暂不支持（2026-09-21 实测：一键与手工两条路都走不通）**：缺口全在版本号读取正则（都带闭合引号 `__version__ = '(\d+\.\d+\.\d+)'`）—— `build.ps1` 的 105/107 与 184-188、`release.ps1:101`；`bump-version.py` 的入参校验 `fullmatch(r"\d+\.\d+\.\d+")` 同样不收 prerelease 后缀，所以连「手改版本号」那一步都进不去。
-    走 `build.ps1 -Version "X.Y.Z-beta.N"` 时，**先炸的是 184-188 的读回校验**（在任何构建之前，因此并不浪费打包时间），报「版本分叉，打包中止」—— **该中止路径漏调 `Restore-Version`**（build.ps1 里其余 22 个失败点都调了），于是 7 个版本文件会留在 beta 的脏状态，而报错文案会把排查方向带向「哪个文件没同步」，实际是正则读不出来。`release.ps1` 见 `build.ps1` 非零即退出，到不了它自己的 101 行。
-    **需要预发布时不要走这两条路**（今天没有任何一条能通）；补齐上述正则与 `Restore-Version` 之前**一律不发 beta**。这是独立专项，不与正式发版混在一个改动里做。
+  - **Beta 发布仍需独立验收（2026-09-28 同步上游 v0.6.0）**：2026-09-21 发现的版本读取正则与失败回滚缺口已由上游补齐，并带有预发布隔离回归测试；tag 含 `-` 即按预发布处理，不产出正式 `latest.json` 或 Docker `latest`。
+    这不等于本分支已完成 Beta 打包与分发验证；**在独立验收和用户明确授权前仍不发 Beta**，不得把同步代码或单测通过当成发布授权。
 
 - **本地开发与联调热更新底线（用户明确约定，2026-09-20）**：
   - 当修改了引擎（`engine/`）、前端（`frontend/`）或相关脱敏逻辑需要用户进行联调测试时，**AI 助手必须主动调用本地全量部署安装脚本（`.\scripts\local-dev-deploy.ps1 -Full`）完成编译、安全备份、替换本地安装目录（`<Maskit 安装目录>`，即 Tauri 默认安装位置）并重启客户端进程**；
@@ -298,7 +297,7 @@ python scripts/check-upstream-sync.py --fetch
 
 # 2. 在分支上合并，不要直接在 master 上合
 git switch -c merge/<上游版本>
-git merge upstream/master
+git merge v<上游版本>   # 合已核验的发布 tag，不带入 master 上未发版的提交
 
 # 3. 解冲突。版本文件（panel.py / tauri.conf.json / Cargo.toml / Cargo.lock /
 #    package.json / package-lock.json）的版本号一律保留本分支的值（ours）——
@@ -339,7 +338,10 @@ git tag -a v0.1xx.x -m "发布 v0.1xx.x"
 - `src-tauri/tauri.conf.json` 的 `plugins.updater.endpoints` 与 `pubkey`（本分支自己的密钥，Key ID `8FDEF509963AB482`）。**被上游值覆盖 = 本分支构建会被上游发布覆盖掉**；
 - `engine/panel.py` 的 `__upstream_base__` 及其在 `/api/status`、诊断导出里的两处透出；
 - `frontend/src/components/settings/AboutUpdateCard.tsx` 的「上游基线」行与 `about.upstreamBase*` 两个 i18n key；
-- `scripts/generate-latest-json.py` 的 `--repo` 默认值（空串 → 回退环境变量 → 兜底本分支仓库）。
+- `scripts/generate-latest-json.py` 的 `--repo` 默认值（空串 → 回退环境变量 → 兜底本分支仓库）；
+- Web/服务端更新检查与关于页发布日志的默认仓库（`frontend/src/lib/tauri.ts`、`Settings.tsx`、`panel.py` 的 `DEFAULT_UPDATE_*`），都必须指向本分支；
+- `model_rules` 必须在异步脱敏 worker 内、脱敏之后注入；缓存字段按协议路径保护，NER 默认最多 2 线程且兼容 `intra_op_num_threads` 状态字段；
+- `AGENTS.md` / `CLAUDE.md` 继续跟踪，不能跟随上游删除或忽略；`tests/test_fork_contracts.py` 为分支约束提供回归保护。
 
 更新签名私钥在 `~/.tauri/maskit-updater.key`，**永不入库**。丢失后已安装的客户端只认对应公钥，再也无法推送任何更新，只能让用户手工重装 —— 必须在仓库外另做备份。
 

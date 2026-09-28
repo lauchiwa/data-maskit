@@ -98,7 +98,9 @@ if ($LASTEXITCODE -ne 0) {
 
 # 读取构建出的最新版本号
 $panelPath = "engine\panel.py"
-$verLine = Select-String -Path $panelPath -Pattern "__version__ = '(\d+\.\d+\.\d+)'" | Select-Object -First 1
+# 正则必须放行 prerelease（X.Y.Z-beta.N），与 build.ps1 的 $verRe 同口径：
+# 这里读不出值会直接中止发版（即使包已经打好了）。
+$verLine = Select-String -Path $panelPath -Pattern "__version__ = '(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)'" | Select-Object -First 1
 if (-not $verLine) { Write-Error "无法读取构建后的版本号"; exit 1 }
 $targetVer = $verLine.Matches[0].Groups[1].Value
 $tag = "v$targetVer"
@@ -106,6 +108,9 @@ $tag = "v$targetVer"
 Write-Host "`n[3/4] 构建成功！目标版本: $targetVer (Tag: $tag)" -ForegroundColor Green
 
 $nsisPath = "src-tauri\target\release\bundle\nsis\Maskit_${targetVer}_x64-setup.exe"
+# 注：prerelease 产物命名已实测（2026-09-22）：0.5.0-beta.1 的产物为
+# bundle/nsis/Maskit_0.5.0-beta.1_x64-setup.exe，`-` 原样保留，并同时产出 .sig 更新签名
+# （即 Tauri 打包器未对 `-` 做净化）。此处找不到文件只是跳过打印体积，不中止发版。
 if (Test-Path $nsisPath) {
     $nsisSize = [math]::Round((Get-Item $nsisPath).Length / 1MB, 1)
     $pkgType = if ($nsisSize -gt 60) { "全功能一体包 (All-in-One)" } else { "轻量规则包" }
@@ -133,7 +138,7 @@ if (-not (Select-String -Path $changelogPath -Pattern $changelogHeading -SimpleM
     Write-Host ""
     Write-Host "CHANGELOG.md 里找不到章节: $changelogHeading" -ForegroundColor Red
     Write-Host "GitHub Release 的双语说明是从该章节提取的，缺失会让云端发版 job 失败。" -ForegroundColor Yellow
-    Write-Host "请按 AGENTS.md「CHANGELOG 维护工作流」补好后重跑：" -ForegroundColor Yellow
+    Write-Host "请先按下面的步骤补好 CHANGELOG 该版本章节后重跑：" -ForegroundColor Yellow
     Write-Host "    1) 把开发期间累积的 `## [Unreleased]` 条目改名为 $changelogHeading - <日期>" -ForegroundColor Yellow
     Write-Host "    2) 或直接新建该章节并写入中英双语条目" -ForegroundColor Yellow
     Write-Error "CHANGELOG 章节缺失，已中止发版（未产生任何 Git 提交或 Tag）。"
@@ -175,25 +180,31 @@ Assert-LastExit "git add -u"
 if (Test-Path "docs\architecture-en.png") { git add docs\architecture-en.png docs\architecture-zh.png; Assert-LastExit "git add 架构图" }
 if (Test-Path "release.ps1") { git add release.ps1; Assert-LastExit "git add release.ps1" }
 # 列出全部新文件：`git add -A` 会把构建产物/临时文件一并暂存，这里按路径精确添加。
-# 新增任何需随发版提交的文件时，请同步追加到本列表。
-$newFiles = @(
-  "engine\credential_labels.py",
-  "frontend\src\lib\credential-labels.ts",
-  "frontend\src\pages\Extension.tsx",
-  "scripts\pack-extension.py",
-  "scripts\verify-all.py",
-  "tests\test_config_patch.py",
-  "tests\test_event_store_selfheal.py"
-)
+# 改成**动态列举**：硬编码白名单会在发版前新增源文件时静默漏掉（0.6.0 前置里
+# 新增的整批 tests/、scripts/ 与 engine/selfcheck.py 都不在旧列表里）。
+# `--exclude-standard` 会排除 .gitignore 覆盖的构建产物与临时文件。
+$newFiles = @(git ls-files --others --exclude-standard)
 foreach ($f in $newFiles) {
   if (Test-Path $f) { git add -- $f; Assert-LastExit "git add $f" }
 }
 
 # 提交
-$commitMsg = "chore(release): 发布 v$targetVer"
-git commit -m $commitMsg
-Assert-LastExit "git commit"
-Write-Host "已提交: $commitMsg" -ForegroundColor Green
+#
+# ⚠️ 必须先判断有没有暂存内容。当版本号**已被提前改成目标值**时（典型场景：先按
+# CHANGELOG 定好 0.4.0 再发版），`build.ps1` 执行的是 `0.4.0 -> 0.4.0` 替换，
+# 文件内容一字不变，`git add -u` 自然暂存不到任何东西。此时无条件 commit 会以
+# “nothing to commit” 返回非零，被 Assert-LastExit 中止——而且是**在完整构建
+# （前端 + PyInstaller + Tauri，约 10 分钟）跑完之后**才炸，白跑一次打包。
+# “没有内容可提交”本身就是合法状态，跳过 commit 直接打 Tag 即可。
+$staged = @(git diff --cached --name-only)
+if ($staged.Count -gt 0) {
+  $commitMsg = "chore(release): 发布 v$targetVer"
+  git commit -m $commitMsg
+  Assert-LastExit "git commit"
+  Write-Host "已提交: $commitMsg" -ForegroundColor Green
+} else {
+  Write-Host "无文件改动需要提交（版本号已是 v$targetVer），跳过 commit，直接打 Tag。" -ForegroundColor Yellow
+}
 
 # 推送主分支
 Write-Host "正在推送分支到 origin $currentBranch..." -ForegroundColor Cyan

@@ -9,6 +9,7 @@
  * **不做自动上报**——生成后由用户预览、自己决定发不发。
  */
 import { shieldFetch } from '@/lib/shield-fetch'
+import { getI18nLang } from '@/lib/i18n'
 
 export interface DiagnosticsBundle {
   schema: number
@@ -17,6 +18,8 @@ export interface DiagnosticsBundle {
   fatal?: string
   app?: Record<string, unknown>
   proxy?: Record<string, unknown>
+  /** schema 2 起内嵌：结论给人看、证据给维护者，同一个文件。 */
+  selfcheck?: SelfCheckResult
   ports?: unknown
   upstreams?: unknown[]
   settings?: Record<string, unknown>
@@ -29,9 +32,46 @@ export interface DiagnosticsBundle {
 }
 
 export function getDiagnostics(): Promise<DiagnosticsBundle> {
-  return shieldFetch('/api/diagnostics')
+  // 结论跟界面语言走：包里内嵌的自检结论应与用户看到的同语言（与 saveDiagnostics 对齐）。
+  return shieldFetch('/api/diagnostics?lang=' + encodeURIComponent(getI18nLang()))
 }
 
 export function saveDiagnostics(): Promise<{ ok: boolean; path?: string; size?: number; error?: string }> {
-  return shieldFetch('/api/diagnostics/save', { method: 'POST', timeoutMs: 30000 })
+  // 结论跟界面语言走：英文界面导出的诊断包里不该出现中文结论。
+  return shieldFetch('/api/diagnostics/save?lang=' + encodeURIComponent(getI18nLang()), { method: 'POST', timeoutMs: 30000 })
+}
+
+/** 一键自检结论（§16）。与诊断包的分工：这里是**结论**，诊断包是**原始证据**。 */
+export interface SelfCheckFinding {
+  id: string
+  severity: 'high' | 'medium' | 'low' | 'ok'
+  title: string
+  evidence: string
+  action: string
+  /** false = 数据不足，界面必须标出来（不要当成"没问题"） */
+  verified?: boolean
+}
+
+export interface SelfCheckResult {
+  schema: number
+  generated_at: number
+  overall: 'high' | 'medium' | 'ok'
+  /** 一句话结论：设计成能直接复制给别人看 */
+  summary_line: string
+  findings: SelfCheckFinding[]
+  fired_ids?: string[]
+  ok_items?: { id: string; note: string }[]
+  input_errors?: { rule?: string; source?: string; error: string }[]
+}
+
+export interface SelfCheckResponse {
+  ok: boolean
+  selfcheck?: SelfCheckResult
+  engine_metrics_stale?: boolean
+  error?: string
+}
+
+/** 跑一次自检（只读；不产生任何外发请求）。 */
+export function runSelfCheck(): Promise<SelfCheckResponse> {
+  return shieldFetch<SelfCheckResponse>('/api/selfcheck?lang=' + encodeURIComponent(getI18nLang()))
 }

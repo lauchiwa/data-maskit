@@ -20,7 +20,7 @@ __version__ = '0.102.0'
 # 与 __version__ 分开维护：__version__ 是**本分支自己**的发布序号（0.10x.x 段，
 # 与上游 0.x.x 永不相撞，更新检查按段比较恒判定为更新），这里记录血缘基线。
 # 每次合并上游 tag 后同步改这一行；只读元数据，不参与任何版本比较。
-__upstream_base__ = '0.4.0'
+__upstream_base__ = '0.6.0'
 import json
 import codecs
 import copy
@@ -56,7 +56,9 @@ from shield_defaults import (
     DEFAULT_UPSTREAMS,
     DEFAULT_BUILTIN_RULES,
     DEFAULT_EGRESS_PROXY,
+    DEFAULT_COMMAND_BLOCK,
     BUILTIN_RULE_META,
+    validate_command_regex,
     parse_egress_proxy,
     OPENROUTER_MODELS_URL,
     PRICE_SYNC_INTERVAL_DAYS,
@@ -299,8 +301,23 @@ _MIN_PANEL_TOKEN_LEN = 16
 # 启动日志，必须能在面板首屏看到「我设置的 token 没生效」）。
 PANEL_TOKEN_ENV_REJECTED = False
 _env_token = os.environ.get("MASKIT_PANEL_TOKEN", "").strip()
+# 容器 secret 场景：SECURITY.md 与 docker-compose.yml 都承诺了
+# `MASKIT_PANEL_TOKEN_FILE`（把令牌放进 docker secret / 只读文件），此前**没有任何
+# 消费者** —— 按文档配好 secret 的用户会被静默改用随机 token（面板首屏进不去，
+# 且容器里翻不到日志）。这里补上：仅在未给环境变量时读文件。
+_token_file = os.environ.get("MASKIT_PANEL_TOKEN_FILE", "").strip()
+if _token_file and not _env_token:
+    try:
+        _env_token = Path(_token_file).read_text(encoding="utf-8").strip()
+    except Exception as _e:
+        _msg = (f"[panel] MASKIT_PANEL_TOKEN_FILE 读取失败（{type(_e).__name__}）："
+                f"{_token_file} —— 已改用随机 token（可在面板首屏状态里看到）")
+        print(_msg)
+        print(_msg, file=sys.stderr, flush=True)
+        PANEL_TOKEN_ENV_REJECTED = True
+        _env_token = ""
 if _env_token and (len(_env_token) < _MIN_PANEL_TOKEN_LEN or not _env_token.isascii()):
-    msg = (f"[panel] MASKIT_PANEL_TOKEN 无效（需 ≥{_MIN_PANEL_TOKEN_LEN} 位 ASCII），"
+    msg = (f"[panel] 面板令牌无效（MASKIT_PANEL_TOKEN / _FILE，需 ≥{_MIN_PANEL_TOKEN_LEN} 位 ASCII），"
            f"已忽略并改用随机 token")
     # stdout + stderr 双写：容器日志采集器常只挂 stderr，单写 stdout 等于没写
     print(msg)
@@ -565,9 +582,16 @@ def security_headers(resp):
     # 也不需要 'unsafe-inline'（模板内联事件属性已清零，审计 P2-2 收口）。
     # style-src 保留 'unsafe-inline'：页面有大量 <style> 块与 style 属性，
     # 收紧会禁掉整页样式，收益与风险不成比例。
+    #
+    # connect-src 必须放行 api.github.com：这里原先是纯 'self'，把「检查更新」与
+    # 「更新日志」两条浏览器直连 GitHub 的 fetch 一起挡掉了。CSP 拦截在 Firefox 里
+    # 抛的正是 `TypeError: NetworkError when attempting to fetch resource.` ——
+    # 看起来像「网络不通」，实际请求根本没发出去，所以「浏览器明明能打开 GitHub
+    # 网页」和「面板里检查更新报 NetworkError」会同时成立。只放行这一个源：
+    # 它是 GitHub 官方 API（CORS 为 `*`），且是更新检查的唯一外部依赖。
     resp.headers.setdefault(
         "Content-Security-Policy",
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://api.github.com; frame-ancestors 'none'",
     )
     return resp
 
@@ -986,7 +1010,7 @@ import http.client
 _passthrough = {"servers": {}, "lock": threading.Lock(), "mode": ""}
 
 
-def _read_chunked_body(rfile, limit=64 * 1024 * 1024):
+def _read_chunked_body(rfile, limit=64 * 1024 * 1024, keep=None):
     """读取 Transfer-Encoding: chunked 请求体并解码（BaseHTTPRequestHandler 不自动解）。
 
     必须先判后读：chunk 头里的 `size` 由客户端完全控制，`rfile.read(size)` 会按它
@@ -996,8 +1020,13 @@ def _read_chunked_body(rfile, limit=64 * 1024 * 1024):
 
     畸形 chunk 头（非十六进制）/ 中途 EOF 一律 raise：曾静默 break 返回半截 body，
     截断的 JSON 被转发上游报 400——错误被移花接木，排障困难（审计 P2）。
+
+    keep：只保留前 keep 字节（其余照旧读掉）。503 占位层只需要从 body 里读出
+    `model` 做事件归因，却被迫把整个 64MB 请求体攒在内存里——重试风暴下这是
+    纯浪费（A-8）。**注意 limit 仍然约束"读掉的总字节"**，不是"保留的字节"。
     """
     body = b""
+    seen = 0
     while True:
         try:
             line = rfile.readline()
@@ -1019,12 +1048,18 @@ def _read_chunked_body(rfile, limit=64 * 1024 * 1024):
                 if t in (b"\r\n", b"\n", b""):
                     break
             break
-        if size < 0 or len(body) + size > limit:
+        if size < 0 or seen + size > limit:
             raise ValueError("request body too large")
         chunk = rfile.read(size)
         if len(chunk) < size:
             raise ValueError("chunked_body_truncated")
-        body += chunk
+        seen += size
+        if keep is None or len(body) < keep:
+            body += chunk
+            # keep 是**硬上限**：整块追加可能溢出一个 chunk（实测 100 字节的窗口
+            # 返回过 112 字节）。调用方按这个上限定过内存预算，不能"大概齐"。
+            if keep is not None and len(body) > keep:
+                body = body[:keep]
         rfile.read(2)  # 块尾 CRLF
     return body
 
@@ -1674,10 +1709,47 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
     return PT
 
 
+# 兜底层并发上限（A-8）：重试风暴下「一连接一线程」会瞬间堆出成百上千线程，
+# 每个都在做「转发」或「回 503」这种轻活，线程与内存却按连接数线性上涨。
+# 取 128：正常开发（几个 IDE / 几个标签页）永远够，异常风暴时把压力挡在
+# 监听队列里（客户端表现为「慢」而不是「连接被拒」），超过 5s 仍抢不到槽位
+# 的连接才关掉——**先背压、后丢弃**，避免把用户的日常网络调用误伤成随机失败。
+_PASSTHROUGH_CONCURRENCY = max(8, int(os.environ.get("MASKIT_PASSTHROUGH_CONCURRENCY", "128") or 128))
+_PASSTHROUGH_SLOT_WAIT_S = float(os.environ.get("MASKIT_PASSTHROUGH_SLOT_WAIT", "5") or 5)
+
+
 class _PassthroughHTTPServer(http.server.ThreadingHTTPServer):
     """透传 HTTP 服务：handler 线程设 daemon + 读超时，避免面板退出被挂起连接卡住。"""
 
     daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        self._slots = threading.BoundedSemaphore(_PASSTHROUGH_CONCURRENCY)
+        self.overloaded = 0     # 抢不到槽位被关掉的连接数（只用于日志/自检）
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(timeout=_PASSTHROUGH_SLOT_WAIT_S):
+            self.overloaded += 1
+            try:
+                request.close()
+            except Exception:
+                pass
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            try:
+                self._slots.release()
+            except ValueError:
+                pass
 
     def handle_error(self, request, client_address):
         pass  # 客户端半途断开等错误不刷日志
@@ -1685,6 +1757,22 @@ class _PassthroughHTTPServer(http.server.ThreadingHTTPServer):
 
 # 透传层请求体上限（64MB，审计性能观察项）：超大正文会占满线程与内存
 _MAX_PASSTHROUGH_BODY = 64 * 1024 * 1024
+
+# 503 占位层只需要从请求体里取一个 model 字段做事件归因（A-8）：
+# 截断后的 body 本来就解不出合法 JSON，用正则从头部嗅探即可。
+_REJECT_MODEL_SNIFF = 64 * 1024
+_REJECT_MODEL_RX = re.compile(rb'"model"[ \t]*:[ \t]*"([^"]{1,120})"')
+
+
+def _sniff_model(body):
+    """从（可能被截断的）请求体头部嗅出 model 字面量；取不到就返回空串。"""
+    if not body:
+        return ""
+    try:
+        m = _REJECT_MODEL_RX.search(body)
+        return m.group(1).decode("utf-8", errors="ignore") if m else ""
+    except Exception:
+        return ""
 
 
 def _stop_mode():
@@ -1727,8 +1815,32 @@ def _make_error_handler(upstream_name=None):
         def log_message(self, *a):
             pass
 
+        def _drain_body(self, remain):
+            """读完 remain 字节的请求体，但只保留前 _REJECT_MODEL_SNIFF 字节。
+
+            分块读是为了别一次性 `read(64MB)`：畸形 Content-Length 会让进程
+            先按声明长度分配缓冲区（与 `_read_chunked_body` 里同一条教训）。
+            """
+            kept = []
+            kept_len = 0
+            while remain > 0:
+                try:
+                    chunk = self.rfile.read(min(remain, 65536))
+                except Exception:
+                    break
+                if not chunk:
+                    break
+                remain -= len(chunk)
+                if kept_len < _REJECT_MODEL_SNIFF:
+                    kept.append(chunk)
+                    kept_len += len(chunk)
+            return b"".join(kept)[:_REJECT_MODEL_SNIFF]
+
         def _reject(self):
-            # 必须读掉请求体：不读干净就回响应，客户端侧常表现为连接重置而非 503
+            # 必须读掉请求体：不读干净就回响应，客户端侧常表现为连接重置而非 503。
+            # 但**不需要留下整包**——以前是「全量读进内存 + json.loads 一个 64MB 的
+            # 字典只为取一个 model 字段」，在重试风暴里这就是纯浪费（A-8）。
+            # 现在：排空照旧（防 RST），只保留前 64KB，用正则嗅探 model。
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except (ValueError, TypeError):
@@ -1738,22 +1850,13 @@ def _make_error_handler(upstream_name=None):
                 # chunked 请求体也要读干净（上限内），否则回 503 后未读数据
                 # 触发 RST，客户端看到的是连接重置而不是错误信息
                 try:
-                    body = _read_chunked_body(self.rfile, limit=1 << 20)
+                    body = _read_chunked_body(self.rfile, limit=1 << 20,
+                                              keep=_REJECT_MODEL_SNIFF)
                 except Exception:
                     body = b""
             elif length > 0:
-                try:
-                    body = self.rfile.read(min(length, _MAX_PASSTHROUGH_BODY))
-                except Exception:
-                    pass
-            req_model = ""
-            if body:
-                try:
-                    b_json = json.loads(body.decode("utf-8", errors="ignore"))
-                    if isinstance(b_json, dict):
-                        req_model = str(b_json.get("model") or "")[:120]
-                except Exception:
-                    pass
+                body = self._drain_body(min(length, _MAX_PASSTHROUGH_BODY))
+            req_model = _sniff_model(body)
             # OpenAI 兼容的错误结构：绝大多数客户端/SDK 会把 error.message 直接显示
             # 出来，用户一眼看到「Shield 没起来」，不必去猜是不是自己网络问题。
             payload = json.dumps({
@@ -1790,6 +1893,9 @@ def _make_error_handler(upstream_name=None):
                         "host": _safe_public_text(self.headers.get("Host", "") or "", 255),
                         "method": self.command, "path": self.path.split("?")[0],
                         "status": 503, "http_status": 503, "reason": "shield_unavailable",
+                        # A-7：兜底占位层回的是 503，来源与"上游返回的 503"完全不同，
+                        # 必须区分（这是"代理到底有没有在跑"的唯一机器可读依据）。
+                        "block_source": "fallback",
                          "upstream": _safe_upstream_display(upstream_name),
                         "model": req_model or None,
                         "client": client_str,
@@ -2953,7 +3059,12 @@ def _is_mitmdump_pid(pid):
         return False
     name = ""
     try:
-        name = out.splitlines()[0].split(",")[1].strip('"') if out.strip() else ""
+        # ⚠️ CSV 列序是 "Image Name","PID","Session Name",... —— 进程名在**第 0 列**。
+        # 这里曾写 [1]（拿到的是 PID 字符串），于是 `"mitmdump" in name.lower()` 恒为假，
+        # 每次判定都白掉进下面那次 PowerShell `Get-CimInstance`（超时 8s）——
+        # 在启停/释放端口路径上意味着「每个 PID 一次 PowerShell」。
+        # 实测：`tasklist /FI "PID eq N" /FO CSV /NH` → "pwsh.exe","25228",...
+        name = out.splitlines()[0].split(",")[0].strip('"') if out.strip() else ""
     except Exception:
         return False
     if "mitmdump" in name.lower():
@@ -3450,7 +3561,7 @@ def default_config():
         "ext_bridge_enabled": False,
         "ext_token": "",
         # (B) 类（引擎未启动 / 端口不通 / 403 直通类）是否改为阻断。默认 false=直通，
-        # 与 AGENTS 红线 3「透明直连兜底、绝不断网」同语义；(A) 类无开关、恒阻断。
+        # 与「透明直连兜底、绝不断网」这条红线同语义；(A) 类无开关、恒阻断。
         "ext_block_when_engine_down": False,
         # 扩展流量是否写入本地事件库与统计。**只管落库与统计**：脱敏/还原与
         # 「未脱敏状态」可见性照常（详见 SECURITY.md 与 SPEC §5.3 三条边界）。
@@ -3481,10 +3592,15 @@ def default_config():
         # 境外官方 API 走代理，互不影响）。
         "egress_proxy": dict(DEFAULT_EGRESS_PROXY),
         "model_prices": {},
-        # 默认关闭：这是引擎唯一的主动出站请求（拉模型价格表），交给用户显式开启
+        # 默认关闭：这是引擎唯一的**周期性**主动出站请求（拉模型价格表），交给用户显式开启
         "price_sync_enabled": False,
         "price_sync_url": DEFAULT_PRICE_SYNC_URL,
         "price_sync_interval_days": 7,
+        # 更新检查源：留空 = 内置源（GitHub 静态 latest.json → GitHub API）。
+        # 国内/内网服务器连不上 GitHub 时填镜像或自建中转；GitHub API 的
+        # tag_name/body/published_at 与 latest.json 的 version/notes/pub_date
+        # 两种格式后端都会归一化，换源不用动前端。
+        "update_check_url": "",
         "log_retention_days": 7,
         "autostart": False,
         "start_minimized": False,
@@ -3502,6 +3618,10 @@ def default_config():
             "active_probes": False,
             "severity_floor": "MEDIUM",
             "auto_report": False,
+            # 审计的**响应级**熔断（默认关）：CRITICAL 时把本次响应换成 503。
+            # 必须出现在本函数里——它是「合法键」的唯一真相来源，_config_patch_node
+            # 用 `key/path 不存在` 拒绝未知字段；漏了它前端那个开关存不下去。
+            "fail_closed": False,
             "signals": {
                 "error_leak": True,
                 "identity_swap": True,
@@ -3512,6 +3632,10 @@ def default_config():
                 "dangerous_action": True,
             },
         },
+        # 命令拦截（W2-3）：默认 observe（只记录）+ 仅工具参数通道。
+        # 内置危害命令作为**可读可改的默认值**随包分发，用户可在界面新增/修改/
+        # 停用/删除（删除不复活，见 _normalize_command_block 的种子语义）。
+        "command_block": copy.deepcopy(DEFAULT_COMMAND_BLOCK),
     }
 
 
@@ -3916,6 +4040,9 @@ def normalize_config(raw, warnings=None):
         "price_sync_enabled": bool(raw.get("price_sync_enabled", False)),
         "price_sync_url": str(raw.get("price_sync_url") or DEFAULT_PRICE_SYNC_URL).strip(),
         "price_sync_interval_days": max(1, min(90, (int(raw.get("price_sync_interval_days", 7) or 7) if str(raw.get("price_sync_interval_days", "")).isdigit() else 7))),
+        # 更新检查源：非法值静默丢弃（回落内置源）。这里不做 400：它只是个辅助配置，
+        # 为它把整份配置卡在保存失败上，用户只会看到「保存失败」而不知道是哪个字段。
+        "update_check_url": _normalize_update_check_url(raw.get("update_check_url")),
         # 日志保留天数：0 = 永久保留（付费版「日志不限期」权益）。
         # 原来钳成 max(1, min(90, ...))，而 PAID_QUOTA 声明的是 None（不限）——
         # 承诺在代码里结构上就兑现不了，付费用户设 365 会被静默压成 90（2026-08-17 审计）。
@@ -3928,7 +4055,44 @@ def normalize_config(raw, warnings=None):
         "wizard_done": bool(raw.get("wizard_done", False)),
         "meta": raw.get("meta") if isinstance(raw.get("meta"), dict) else {},
         "audit": _normalize_audit(raw.get("audit")),
+        "command_block": _normalize_command_block(raw.get("command_block"), warn),
     }
+
+
+def _normalize_update_check_url(raw):
+    """规范化「更新检查源」URL：非法一律返回 ""（= 用内置源）。
+
+    只做**形态**校验，不要求白名单域名——这一项的全部意义就是让用户填自己的镜像/
+    自建中转，锁死域名等于把功能废掉。允许 http：内网自建中转常是明文 HTTP，
+    而这里取回的内容只用于「显示有新版本」，真正的下载地址由前端按 GitHub 固定
+    仓库拼，被篡改也换不掉下载源。带 userinfo 的 URL 一律拒绝——用户很容易顺手把
+    带账号密码的代理地址贴进来，那会让凭据出现在日志与状态接口里。
+
+    非法输入静默回落 ""（不抛错）：它是辅助配置，为它让整份配置保存失败，
+    用户只会看到「保存失败」而不知道是哪个字段错了。
+    """
+    try:
+        text = str(raw or "").strip()
+        if not text or len(text) > 2048:
+            return ""
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
+            return ""
+        u = urlsplit(text)
+        if u.scheme.lower() not in ("http", "https"):
+            return ""
+        if u.username or u.password:
+            return ""
+        if not u.hostname:
+            return ""
+        try:
+            port = u.port
+        except ValueError:
+            return ""
+        if port is not None and not (0 < port <= 65535):
+            return ""
+        return text
+    except Exception:
+        return ""
 
 
 def _normalize_host_list(raw):
@@ -3974,7 +4138,16 @@ def _normalize_model_prices(raw):
 
 
 def _normalize_audit(raw):
-    """规范化 audit 配置块。缺字段补默认。"""
+    """规范化 audit 配置块。缺字段补默认。
+
+    ⚠️ 三个调优键（`scan_max` / `parse_max` / `time_budget_ms`）必须**原样透传**：
+    引擎侧读的就是它们（`transparent._read_settings` 的 `audit_scan_max` 等，自带
+    上下限钳制），而归一化的产物会被 `load_config` 在有差异时**写回磁盘**
+    （本文件 :4273 的 `save_config(cfg, allow_shrink=True)`）。
+    原先这里没有这三个键 → 用户手改 config.json 之后，**任何一次 load_config 都会把键
+    从盘上抹掉**；而自检就是调 load_config 的，等于"照提示改、被自检自己抹掉"，
+    引擎随即回落到默认窗口。上限由引擎侧钳制，这里只做类型透传，不复制第二份范围常量。
+    """
     base = default_config()["audit"]
     if not isinstance(raw, dict):
         return base
@@ -3987,14 +4160,113 @@ def _normalize_audit(raw):
     floor = str(raw.get("severity_floor") or "MEDIUM").upper()
     if floor not in {"LOW", "MEDIUM", "HIGH", "CRITICAL"}:
         floor = "MEDIUM"
-    return {
+    out = {
         "enabled": bool(raw.get("enabled", True)),
         "passive": bool(raw.get("passive", True)),
         "active_probes": bool(raw.get("active_probes", False)),
         "severity_floor": floor,
         "auto_report": bool(raw.get("auto_report", False)),
+        # 审计的响应级熔断（与脱敏主线的同名 fail_closed 不是一回事，见 transparent.py 注释）
+        "fail_closed": bool(raw.get("fail_closed", False)),
         "signals": signals,
     }
+    # 只在用户显式写过时才回填：不给每个用户的配置文件凭空长出三个键。
+    # bool 是 int 的子类，要显式排除，否则 True 会被当成合法字节数写回去。
+    for _k in ("scan_max", "parse_max", "time_budget_ms"):
+        _v = raw.get(_k)
+        if isinstance(_v, (int, float)) and not isinstance(_v, bool):
+            out[_k] = _v
+    return out
+
+
+# ========== 命令拦截（config.command_block）规范化 ==========
+# 正则合法性交给 shield_defaults.validate_command_regex（**唯一校验源**：
+# panel 保存时与 transparent 加载时都调它；两处各写一份必然漂移）。
+CMD_MODES = ("observe", "rewrite", "block")
+CMD_CHANNELS = ("tool", "text")
+
+
+def _normalize_cmd_pattern(raw, warn):
+    """规范化单条命令拦截规则；非法（正则编译不过 / 超长 / 嵌套量词）返回 None。
+
+    非法条目**丢弃并告警，不静默**：warnings 会回传给前端提示，用户能知道
+    「我加的那条为什么没生效」。
+    """
+    if not isinstance(raw, dict):
+        return None
+    rx_src = str(raw.get("regex") or "")
+    if not rx_src.strip():
+        return None
+    label = str(raw.get("label") or "").strip()[:60]
+    pid = str(raw.get("id") or "").strip()[:60]
+    name = label or pid or rx_src[:24]
+    ok, why = validate_command_regex(rx_src)
+    if not ok:
+        warn.append(f"命令拦截规则「{name}」{why}，已忽略")
+        return None
+    if not pid:
+        # 用户新增时未带 id：按正则内容派生，**稳定且可复现**（不能用 hash()——
+        # PYTHONHASHSEED 随进程变化，会把 id 改来改去）
+        pid = "user-" + hashlib.sha1(rx_src.encode("utf-8")).hexdigest()[:10]
+    return {
+        "id": pid,
+        "label": label,
+        "regex": rx_src,
+        "enabled": bool(raw.get("enabled", True)),
+        "builtin": bool(raw.get("builtin", False)),
+    }
+
+
+def _normalize_command_block(raw, warn):
+    """规范化 command_block 段。
+
+    **种子语义（关键，用户 2026-09-22 明确要求「删除不复活」）**：
+    只在 `patterns` 键**缺失**（或类型不对）时灌内置种子；键已存在时哪怕值是
+    `[]` 也一律原样尊重。否则用户删掉的条目会被 `default_config()` 每次加载重新灌回，
+    「删不掉」比不提供更糟。这是项目既有范式（transparent.py 的 stream_exclude_hosts
+    同款约定：键存在但为空 = 用户显式清空，必须原样生效）。
+    """
+    base = default_config()["command_block"]
+    if not isinstance(raw, dict):
+        # 整段缺失=第一次运行 → 灌种子（开箱即用）
+        return copy.deepcopy(base)
+    mode = str(raw.get("mode") or "observe").strip().lower()
+    if mode not in CMD_MODES:
+        warn.append(f"命令拦截模式「{mode}」未知，已回落 observe（只记录）")
+        mode = "observe"
+    raw_patterns = raw.get("patterns")
+    if not isinstance(raw_patterns, list):
+        patterns = copy.deepcopy(base["patterns"])
+    else:
+        patterns = []
+        seen = set()
+        for item in raw_patterns:
+            norm = _normalize_cmd_pattern(item, warn)
+            if norm is None:
+                continue
+            if norm["id"] in seen:
+                # id 撞车：补后缀而不是丢条目，否则用户新增的第二条会静默消失
+                norm["id"] = f"{norm['id']}-{len(seen)}"
+            seen.add(norm["id"])
+            patterns.append(norm)
+    allow = []
+    for item in (raw.get("allow_patterns") or []):
+        src = str(item or "").strip()
+        if not src:
+            continue
+        ok, why = validate_command_regex(src)
+        if not ok:
+            warn.append(f"命令白名单「{src[:24]}」{why}，已忽略")
+            continue
+        allow.append(src)
+    raw_channels = raw.get("channels")
+    channels = [c for c in (raw_channels or []) if c in CMD_CHANNELS] if isinstance(raw_channels, list) else []
+    if not channels:
+        # 缺省只拦工具参数通道：正文里 AI 常**讲解**命令（「切勿运行 rm -rf /」），
+        # 启用 text 必须由用户显式选择，不能被缺省值悄悄带上（§6.5）。
+        channels = list(base["channels"])
+    return {"mode": mode, "patterns": patterns,
+            "allow_patterns": allow, "channels": channels}
 
 
 def _sync_runtime_config(cfg):
@@ -4773,6 +5045,9 @@ def api_status():
         "price_sync_enabled": bool(cfg.get("price_sync_enabled", False)),
         "price_sync_url": _safe_target(cfg.get("price_sync_url")),
         "price_sync_interval_days": max(1, min(90, int(cfg.get("price_sync_interval_days", 7) or 7))),
+        # 更新检查源（留空 = 内置源）：前端设置页回显用。走 _safe_target 剥掉
+        # userinfo/query，避免用户把带凭据的镜像地址存进来后被状态接口回显出去。
+        "update_check_url": _safe_target(cfg.get("update_check_url")),
         "egress_proxy_users": [u.get("name") for u in (cfg.get("upstreams") or [])
                                if u.get("use_proxy")],
         "debug": bool(cfg.get("debug", False)),
@@ -4878,6 +5153,9 @@ audit_job = {
     "cancel": False,
     "result": None,
     "error": "",
+    # W1-4：本次扫描是否临时改动过 audit.active_probes；非 None = 结束后要恢复的值。
+    # 必须进 _audit_scan_worker 的 finally 消费（异常/取消路径同样要恢复）。
+    "restore_active_probes": None,
 }
 # 审计启动互斥锁（审计 AUDIT-002）：并发请求同时过 running 检查会启动两轮付费探针
 _audit_start_lock = threading.Lock()
@@ -5069,10 +5347,124 @@ def api_prices_list():
         return jsonify({"ok": False, "error": _safe_public_text(e, 240)}), 500
 
 
+# ========== 版本更新检查（服务端探测，前端直连失败时的兜底） ==========
+# 前端默认先让**浏览器**直连 api.github.com（该源已在 security_headers 的 CSP
+# connect-src 放行），直连失败才退到这里。两条路都保留，是因为「出网能力属于谁」
+# 取决于部署环境：
+#   ① 国内服务器 + 用户本地有代理 → 只有浏览器能到 GitHub，走前端直连；
+#   ② 内网/离线终端 + 服务器有出口 → 只有服务器能到，走这个端点。
+# 原实现在 ① 也失败，根因是 CSP `connect-src 'self'` 把浏览器请求直接挡掉了——
+# Firefox 抛的正是 `TypeError: NetworkError when attempting to fetch resource.`，
+# 看起来像网络不通，实际请求根本没发出去。
+DEFAULT_UPDATE_API_URL = "https://api.github.com/repos/lauchiwa/data-maskit/releases/latest"
+# 静态 release 资产（由 scripts/generate-latest-json.py 产出）比走 API 更好：
+# ① 不计入 GitHub 匿名 API 限流（60 次/小时/IP，多人共用一个服务器出口很容易打满）；
+# ② 内容就是面板要的 version / notes / pub_date。
+# 但它只在**已签名**的正式版 Release 上产出（见 release.yml），拿不到时回落 API。
+DEFAULT_UPDATE_STATIC_URL = "https://github.com/lauchiwa/data-maskit/releases/latest/download/latest.json"
+UPDATE_CHECK_TTL = 600          # 10 分钟缓存：把多人共用出口的 API 消耗从「每次点击一次」压到 ~6 次/小时
+UPDATE_CHECK_TIMEOUT = 15       # 比前端原来的 6s 宽——跨境请求 6s 太容易误判成失败
+_update_check_cache = {"data": None, "at": 0.0}
+_update_check_lock = threading.Lock()
+
+
+def _fetch_update_source(url, timeout=UPDATE_CHECK_TIMEOUT):
+    """GET 一个更新源，返回 (归一化后的 dict, 错误文本)。
+
+    两种响应格式都接受并归一化：
+      - GitHub API:  {tag_name, body, published_at}
+      - latest.json: {version, notes, pub_date}
+    这正是「换源不用改前端」的落点——前端只认 version/notes/pub_date 三个字段。
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github.v3+json, application/json",
+        "User-Agent": "Maskit-UpdateCheck/1.0",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(256 * 1024).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        return None, f"HTTP {e.code}"
+    except Exception as e:
+        return None, _safe_public_text(e, 120)
+
+    try:
+        payload = _json.loads(raw)
+    except Exception:
+        return None, "响应不是合法 JSON"
+    if not isinstance(payload, dict):
+        return None, "响应格式不是对象"
+
+    # 两种字段名都认（latest.json 用 version，GitHub API 用 tag_name）
+    version = str(payload.get("version") or payload.get("tag_name") or "").strip()
+    if not version:
+        return None, "响应缺少版本字段"
+    return {
+        "version": version,
+        "notes": str(payload.get("notes") or payload.get("body") or ""),
+        "pub_date": str(payload.get("pub_date") or payload.get("published_at") or ""),
+    }, ""
+
+
+@app.get("/api/update/check")
+def api_update_check():
+    """服务端探测最新版本。多源回退 + TTL 缓存 + 明确错误语义。
+
+    源顺序：用户自定义 URL（若配）→ 静态 latest.json → GitHub API。
+    第一个成功即用；全部失败返回 502 + 可读原因，而不是把原始异常抛给用户。
+    结果缓存 10 分钟：GitHub 匿名 API 限流 60 次/小时/IP，多人共用一个服务器出口时
+    每次点击都打一次必然打满，缓存后降到 ~6 次/小时。
+    """
+    now = time.time()
+    with _update_check_lock:
+        cached = _update_check_cache["data"]
+        if cached and now - _update_check_cache["at"] < UPDATE_CHECK_TTL:
+            return jsonify({"ok": True, "cached": True, **cached})
+
+    try:
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    custom = _normalize_update_check_url((cfg or {}).get("update_check_url"))
+    sources = ([custom] if custom else []) + [DEFAULT_UPDATE_STATIC_URL, DEFAULT_UPDATE_API_URL]
+
+    last_err, data, used = "", None, ""
+    for url in sources:
+        got, err = _fetch_update_source(url)
+        if got:
+            data, used = got, url
+            break
+        last_err = err
+
+    if data is None:
+        _emit_log(f"[panel] 更新检查失败（{len(sources)} 个源均不可用）: {last_err}")
+        return jsonify({
+            "ok": False,
+            "error": "无法连接更新服务，请检查网络或在设置中配置更新检查源",
+            "detail": last_err,
+        }), 502
+
+    data["source"] = used
+    with _update_check_lock:
+        _update_check_cache.update({"data": data, "at": now})
+    return jsonify({"ok": True, "cached": False, **data})
+
+
 @app.get("/api/audit/job")
 def api_audit_job():
     """轮询扫描进度。前端据此显示进度与结果，刷新页面也能接回。"""
-    return jsonify({k: v for k, v in audit_job.items() if k != "cancel"})
+    return jsonify(_public_audit_job())
+
+
+def _public_audit_job():
+    """对外可见的 job 状态：`cancel` 是服务端标志，`restore_active_probes`
+    是 W1-4 的内部恢复账目（已弹走），都不属于前端契约。"""
+    return {k: v for k, v in audit_job.items()
+            if k not in ("cancel", "restore_active_probes")}
 
 
 @app.post("/api/audit/cancel")
@@ -5097,7 +5489,7 @@ def api_audit_run():
     # 否则两个并发请求可能同时通过检查、启动两轮付费探针。
     with _audit_start_lock:
         if audit_job["running"]:
-            return jsonify({"ok": False, "error": "已有扫描在运行", "job": {k: v for k, v in audit_job.items() if k != "cancel"}}), 409
+            return jsonify({"ok": False, "error": "已有扫描在运行", "job": _public_audit_job()}), 409
         upstream_name = str(data.get("upstream_name") or "").strip()
         model = str(data.get("model") or "claude-3-5-sonnet").strip()
         profile = str(data.get("profile") or "general").strip()
@@ -5109,7 +5501,17 @@ def api_audit_run():
         # 为真时才评估跨请求污染（D1/S7），关着的时候 D1 恒判「无异常」。
         # 与其给出一个从未执行的检查的「通过」，不如先拒绝并告诉用户怎么开。
         audit_cfg = cfg.get("audit") if isinstance(cfg.get("audit"), dict) else {}
-        if not audit_cfg.get("active_probes"):
+        # 主动探针开关必须为真，否则整轮扫描是「花钱买一份假报告」：
+        # 探针会真的发出请求并消耗 token，但 transparent 只在 AUDIT_ACTIVE_PROBES
+        # 为真时才评估跨请求污染（D1/S7），关着的时候 D1 恒判「无异常」。
+        # 与其给出一个从未执行的检查的「通过」，不如先拒绝并告诉用户怎么开。
+        #
+        # W1-4：关状态下 UI 不再吃 400 —— 前端确认弹窗里写明「将临时启用 +
+        # 运行结束后自动恢复」，确认后带 `allow_temp_probes=true` 发起。
+        # **不携带该标志的调用方（脚本/旧客户端）仍按原逻辑 400**：
+        # 这是有意的兼容策略，不静默改变第三方调用者的行为。
+        need_temp_enable = not audit_cfg.get("active_probes")
+        if need_temp_enable and not data.get("allow_temp_probes"):
             return jsonify({
                 "ok": False,
                 "error": "主动探针未启用（设置 → 安全审计 → 主动探针）。"
@@ -5127,9 +5529,18 @@ def api_audit_run():
             return jsonify({"ok": False, "error": "代理未运行，先启动代理"}), 400
         if not int(target.get("port") or 0):
             return jsonify({"ok": False, "error": "upstream 端口非法"}), 400
+        # 临时启用必须在**全部校验通过之后**才写盘：任一 400 提前返回时
+        # 配置都不能留下 active_probes=true 的脏状态。
+        restore_to = None
+        if need_temp_enable:
+            restore_to = False
+            _set_audit_active_probes(True)
+            _emit_log("[panel] 主动探针已临时启用（扫描结束后自动恢复为关闭）")
         audit_job.update({
             "running": True, "started_at": time.time(), "done": 0, "total": 0,
             "phase": "准备探针", "cancel": False, "result": None, "error": "",
+            # W1-4：待恢复的原值（None = 本次没动过该开关，finis 时无需处理）
+            "restore_active_probes": restore_to,
         })
         threading.Thread(
             target=_audit_scan_worker,
@@ -5137,6 +5548,20 @@ def api_audit_run():
             daemon=True,
         ).start()
     return jsonify({"ok": True, "started": True})
+
+
+def _set_audit_active_probes(value):
+    """把 `audit.active_probes` 写盘（只动这一个字段，不整表覆盖）。
+
+    W1-4 的两处调用：临时启用前置 true；扫描结束的 `finally` 里恢复原值。
+    必须走整份配置的读写改写（而不是写单字段文件），因为 transparent 的热重载
+    按 config.json 的 mtime 触发，且 `save_config` 会做归一化与备份。
+    """
+    cfg = load_config()
+    audit = dict(cfg.get("audit") or {})
+    audit["active_probes"] = bool(value)
+    cfg["audit"] = audit
+    save_config(cfg)
 
 
 def _audit_scan_worker(target, upstream_name, model, profile, cfg):
@@ -5148,6 +5573,19 @@ def _audit_scan_worker(target, upstream_name, model, profile, cfg):
         audit_job["error"] = _safe_public_text(e, 300)
         _emit_log(f"[audit] 扫描失败: {_safe_public_text(e, 200)}")
     finally:
+        # W1-4：临时启用的探针开关必须恢复原值。放 finally 才能兼顾
+        # 「正常跑完 / 抛异常 / 用户中途取消」三条路径（前端恢复会被刷新/关页漏掉）。
+        restore = audit_job.pop("restore_active_probes", None)
+        if restore is not None:
+            try:
+                cur = (load_config().get("audit") or {}).get("active_probes")
+                # 只有「仍是我们临时置为 true 的那份」才恢复：用户在扫描期间手改了
+                # 该开关时以用户为准，不静默覆盖用户的安全设置。
+                if cur is True:
+                    _set_audit_active_probes(restore)
+                    _emit_log("[panel] 主动探针开关已恢复为扫描前的原值")
+            except Exception as e:
+                _emit_log(f"[panel] 恢复主动探针开关失败: {_safe_public_text(e, 200)}")
         audit_job["running"] = False
         audit_job["phase"] = "已完成" if not audit_job["error"] else "失败"
 
@@ -5643,6 +6081,19 @@ def api_logs_export():
         "upstream", "model", "stream_mode", "stream_actual",
         "count", "restored", "status", "http_status",
         "mask_ms", "resp_ts", "first_byte_ms", "upstream_ms", "total_ms", "bytes", "usage", "cost_usd", "seq", "reason", "msg",
+        # ---- 0.6.0 新增的归因字段 ----
+        # 白名单是**显式**的：引擎里发了、这里没登记，导出后就是「看不出来源」。
+        # `degraded` 正是这么丢过一次（0.1.14 补进事件，却一直没进白名单）。
+        "block_source",        # 503 来源：upstream / engine / fallback（A-7）
+        "degraded",            # 靠宽松兜底修回来的占位符个数
+        "stream_degraded_reason",  # 流式退回整包的原因（C-2）
+        "queue_wait_ms",       # 脱敏池排队时长（A-6）
+        "engine_queue_depth",  # 提交时的队列深度（A-6）
+        "engine_queue_bytes",  # 提交时的排队字节（A-6；前端弹窗要显示，漏登记会被导出丢弃）
+        "aux_wait_ms",         # 响应侧等待 aux 池的时长（超阈值才记，见 transparent 注释）
+        "engine_busy",         # 是否因队列满被拒（A-6）
+        "ner_global_throttled",  # NER 全局令牌桶限流次数（B-2）
+        "ner_sem_wait_ms",     # NER 信号量等待时长（B-2）
     }
     clean = []
     for e in ev:
@@ -5689,7 +6140,25 @@ def api_logs_export():
 # 会对 `_RECENT_FWD` 做 `list()` 快照，构造期并发插入会 RuntimeError → 用模块级
 # `_EXT_LOCK` 把 transparent 调用段整体串行化。
 #
-# ⚠️ 锁序规矩：**禁止在 `_EXT_LOCK` 临界区内调用任何会碰 panel 配置锁（cfg_lock）
+# 2026-09-24 补充：代理链路的脱敏也搬到了自己的专职线程（`transparent._MASK_POOL`），
+# 于是「panel 侧之间」的 `_EXT_LOCK` 不再足以保护 transparent 的全局表。
+# 全局表本身的互斥改由 `transparent._STATE_LOCK` 负责（签发占位符、复用表清理、
+# 映射重建）；`_EXT_LOCK` 继续管 panel 侧自己的不变量（`_EXT_STATS`、会话 inflight 等）。
+#
+# 2026-09-26（B-6）**收窄**：原先 `_EXT_LOCK` 把 `tr.mask_body` / `mask_ooxml_bytes` /
+# `restore_stream_chunk` 这些重活一起圈住。扩展是多标签页并发的，锁内跑一次带 NER
+# 的脱敏（可上百毫秒）等于把所有页签串成一条队列 —— 表现为「开了扩展之后越用越卡」。
+# 现在**只保 panel 侧不变量**：`transparent` 调用一律在锁外（它的全局表已由
+# `_STATE_LOCK` 保护，B-1a 立的契约）。改这里时必须保持两个性质：
+#   ① `_EXT_STATS` 的 `+=` 必须在锁内（读改写三步）；
+#   ② `tr._touch(sid)` 必须在锁内 —— 它是"这个会话还活着"的唯一刷新点；
+#   ③ 会话 `inflight` 的语义是**响应未到**（mask 之后置 True、restore 的 final 置 False），
+#      **不是**"脱敏进行中"：脱敏期间会话刚建、ts=now，`_sweep` 本来就不会回收它。
+#      别顺手把它改成"重活前置 True"——那会让长生成之外的请求也长期处于 inflight。
+#
+# ⚠️ 锁序规矩：`_EXT_LOCK` → `transparent._STATE_LOCK`，**永远不能反向**。
+# transparent 不回调 panel、不持锁做 I/O，所以不存在反向路径；
+# **禁止在 `_EXT_LOCK` 临界区内调用任何会碰 panel 配置锁（cfg_lock）
 # 的函数**（load_config / save_config / _sync_runtime_config 等）。`tr._maybe_reload`
 # 今天只读 transparent 自己的配置文件，实测不碰 panel 锁；一旦它将来改读 panel
 # 配置，就是 `_EXT_LOCK → cfg_lock` 与反向的经典死锁，届时应先重构锁边界。
@@ -5844,12 +6313,13 @@ def api_ext_mask():
     t0 = time.perf_counter()
     try:
         import transparent as tr
+        # `force=True` 是**故意**的，别为了“省开销”改成非 force：本端点是每请求一条的
+        # 热路径，但实测全量重载仅 209µs（mtime 短路 41µs，差 0.17ms，占单次 mask <5%），
+        # 换来的是「每次 mask 都按最新配置确认」的硬语义（tests/test_ext_bridge.py::
+        # test_t13_config_ttl_is_the_injection_point 守这条）。不需要 `_EXT_LOCK`：
+        # transparent 的重载自己加锁，且它读的是自己的配置文件（不碰 panel 的 cfg_lock）。
+        tr._maybe_reload(force=True)
         with _EXT_LOCK:
-            # `force=True` 是**故意**的，别为了“省开销”改成非 force：本端点是每请求一条的
-            # 热路径，但实测全量重载仅 209µs（mtime 短路 41µs，差 0.17ms，占单次 mask <5%），
-            # 换来的是「每次 mask 都按最新配置确认」的硬语义（tests/test_ext_bridge.py::
-            # test_t13_config_ttl_is_the_injection_point 守这条）。
-            tr._maybe_reload(force=True)
             _sweep_throttled(tr)
             # 显式建会话：mask() 内部虽会懒建，但懒建**只在真有字符串叶子被扫描时**
             # 才发生——纯协议体或整棵命中 skip 规则时 sessions[sid] 根本不存在，
@@ -5862,18 +6332,31 @@ def api_ext_mask():
             # _emit_restore_summary 的 **source 摊成 payload 里一个孤立的 kind 键。
             # 入口维度改用事件字段 ingress（与 source 正交）。
             tr._new_session(sid)
+        # ↓↓↓ 以下到 `_EXT_STATS` 之前**不持锁**：这是本端点唯一的重活（B-6）
+        # 给本链路的语义识别开**总**预算（与代理链路同口径，见 transparent._ner_req_budget）。
+        # 本端点此前**完全没有**总预算：`ner_engine.CALL_BUDGET_S` 只管单次调用，
+        # 而一个请求体里有多少个字符串叶子是没有上限的 —— 大 body 会按秒级占住
+        # Flask 工作线程，而扩展侧 HTTP 超时更短，用户看到的就是「网页请求失败」。
+        with tr._ner_doc_budget(tr._ner_req_budget(len(text.encode("utf-8")))):
             masked = tr.mask_body(text, sid)
+        # 本轮降级（有空叶子没走 NER）：随响应回给扩展，并写进下面的 MASK 事件
+        ner_skips = tr._ner_skips_of_this_round()
+        with _EXT_LOCK:
             s = tr.sessions[sid]
             items = tr._mask_event_items(sid)
+            if ner_skips:
+                s["ner_skips"] = ner_skips
             s["inflight"] = True
             _EXT_STATS["mask"] += 1              # += 是读改写三步，必须在锁内
         hit_count = len(s.get("last_hits") or set())
-        # 仅当真实命中敏感词并发生打码时才产生 MASK 事件，彻底消除大量 0 命中的空白噪声日志
-        if _ext_cfg().get("ext_record_events", True) and hit_count > 0:
+        # 仅当真实命中敏感词并发生打码时才产生 MASK 事件，彻底消除大量 0 命中的空白噪声日志。
+        # 例外：本轮发生语义识别降级时即使 0 命中也要记 —— 降级意味着「本该识别出人名/
+        # 机构/地址的文本没被识别」，而这恰好是最可能漏码的情形，不记就等于静默降级。
+        if _ext_cfg().get("ext_record_events", True) and (hit_count > 0 or ner_skips):
             # dialog / req_preview 落库前必须过凭据清洗（审计 B1）。
             # 这两个字段是**客户端原始请求体**，`items` 里凭据类只有 digest+preview，
             # 但同一行 payload 的 dialog 会把 API Key 原文一起写进 SQLite ——
-            # 违反 AGENTS 约束 6「凭据类永远无法从 SQLite 回溯」。
+            # 违反「凭据类永远无法从 SQLite 回溯」这条硬约束。
             # 必须先在完整 text 上执行双重凭据清洗（会话已知凭据 + 形态正则），再做长度截断；
             # 严禁先截断再清洗，否则跨越 4000/800 边界的凭据会因正则特征破损而留下半截明文残片。
             # 清洗只针对**凭据形态**：普通 PII（手机号/身份证/姓名）的原文照旧保留，
@@ -5885,8 +6368,11 @@ def api_ext_mask():
                      items=items, host=str(data.get("host") or ""), path="/ext/mask",
                      dialog=scrubbed_dialog[:4000],
                      req_preview=scrubbed_dialog[:800],
-                     mask_ms=round((time.perf_counter() - t0) * 1000, 1))
-        return jsonify({"ok": True, "masked_text": masked, "sid": sid})
+                     mask_ms=round((time.perf_counter() - t0) * 1000, 1),
+                     **({"ner_truncated": True, "ner_skip_reasons": ner_skips}
+                        if ner_skips else {}))
+        return jsonify({"ok": True, "masked_text": masked, "sid": sid,
+                        **({"ner_skipped": ner_skips} if ner_skips else {})})
     except Exception as e:
         # (A) 类：引擎明确失败 → 无条件阻断（红线 2），无开关。
         # 失败路径**必须留一条日志**，否则用户只看到「网页全站请求失败」、事件页
@@ -6222,30 +6708,41 @@ def api_ext_mask_file():
     try:
         raw_bytes = base64.b64decode(b64_content)
         import transparent as tr
+        # 同 /api/ext/mask：force=True 是故意的（理由见那里的注释）。
+        tr._maybe_reload(force=True)
         with _EXT_LOCK:
-            # 同 /api/ext/mask：force=True 是故意的（理由见那里的注释）。
-            tr._maybe_reload(force=True)
             _sweep_throttled(tr)
             tr._touch(sid)
             if sid not in tr.sessions:
                 tr._new_session(sid)
-            masked_bytes, hit_count = mask_ooxml_bytes(raw_bytes, filename, sid, tr)
+        # 文件脱敏是这条链路上最重的一步（解析 OOXML + 逐叶子脱敏），
+        # 必须在锁外跑（B-6）：否则一个用户上传文档就把所有页签的请求堵住。
+        masked_bytes, hit_count = mask_ooxml_bytes(raw_bytes, filename, sid, tr)
+        # 文件链路的总预算在 mask_ooxml_bytes 内部已开（_EXT_FILE_NER_BUDGET_S），
+        # 这里把它的降级结果取出来上报：预算超了必须看得见，否则用户以为整份文件都脱了。
+        ner_skips = tr._ner_skips_of_this_round()
+        with _EXT_LOCK:
             s = tr.sessions[sid]
             items = tr._mask_event_items(sid)
+            if ner_skips:
+                s["ner_skips"] = ner_skips
             s["inflight"] = True
             _EXT_STATS["mask"] += 1
 
-        if _ext_cfg().get("ext_record_events", True) and hit_count > 0:
+        if _ext_cfg().get("ext_record_events", True) and (hit_count > 0 or ner_skips):
             tr._emit("MASK", ingress="ext", sid=sid,
                      count=hit_count,
                      new_count=len(s.get("new_orig") or set()),
                      items=items, host=str(data.get("host") or ""), path="/ext/mask-file",
                      dialog=f"[文件脱敏: {filename}]",
                      req_preview=f"Uploaded document: {filename} ({len(raw_bytes)} bytes)",
-                     mask_ms=round((time.perf_counter() - t0) * 1000, 1))
+                     mask_ms=round((time.perf_counter() - t0) * 1000, 1),
+                     **({"ner_truncated": True, "ner_skip_reasons": ner_skips}
+                        if ner_skips else {}))
 
         masked_b64 = base64.b64encode(masked_bytes).decode("ascii")
-        return jsonify({"ok": True, "base64": masked_b64, "sid": sid, "hit_count": hit_count})
+        return jsonify({"ok": True, "base64": masked_b64, "sid": sid, "hit_count": hit_count,
+                        **({"ner_skipped": ner_skips} if ner_skips else {})})
     except Exception as e:
         try:
             _emit_log(f"[panel] ext mask-file 失败: {type(e).__name__}")
@@ -6291,20 +6788,23 @@ def api_ext_restore():
         import transparent as tr
         with _EXT_LOCK:
             _sweep_throttled(tr)
+            tr._touch(sid)
             # ⚠️ 这里**只 touch、不补建会话**。曾试过「会话不存在就 _new_session 补建」，
             # 目的是让 restore() 能正常计数；结果直接把安全门拆了：
             # restore() 见会话存在才会走替换流程，而替换流程会去查**全局**复用表
             # `_RECENT_REV`——于是任意自造 sid（`ext:000…0`）都能借复用表把占位符
             # 还原出来。tests/test_ext_bridge.py::test_t7 正是守这条，当场变红。
             # 计数改用 `_take_orphans_without_session`（只数、不还原），见下。
-            tr._touch(sid)
-            if content_type:
-                out = tr.restore_stream_chunk(text, sid, stream_id,
-                                              content_type=content_type,
-                                              escape=escape, final=final)
-            else:
-                out = tr.restore(text, sid, channel=f"ext:{stream_id}",
-                                 escape=escape, final=final)
+        # 还原是每 SSE chunk 一次的高频路径（B-6）：必须在锁外。
+        # 锁外跑的前提是 `_touch` 已在锁内刷新过 ts（上面那一步），
+        # 否则并发 `_sweep` 可能在两者之间按 TTL 把会话回收掉 → 占位符还原不出来。
+        if content_type:
+            out = tr.restore_stream_chunk(text, sid, stream_id,
+                                          content_type=content_type,
+                                          escape=escape, final=final)
+        else:
+            out = tr.restore(text, sid, channel=f"ext:{stream_id}",
+                             escape=escape, final=final)
         if final:
             items = []
             with _EXT_LOCK:
@@ -6447,11 +6947,19 @@ def api_demo_mask():
         return jsonify({"ok": False, "error": "文本过长（最多 4000 字）"}), 400
     try:
         import transparent as tr
+        # 本端点每次用**唯一 sid**（`demo-{hex}`），彼此不共享会话态；
+        # transparent 的全局表由它自己的 `_STATE_LOCK` 保护，所以这里不需要 `_EXT_LOCK`
+        # （原先靠它串行化整段 mask —— 演示页会把真实用户请求一起堵住，B-6）。
         tr._maybe_reload(force=True)
         sid = f"demo-{secrets.token_hex(4)}"
-        tr._new_session(sid, source={"kind": "demo"})
+        # 插入放回锁内、脱敏留在锁外：`sessions` 的**插删**是与 `_sweep` 的遍历
+        # 互斥的那一步（transparent.py 的 _STATE_LOCK 契约里，dict 的插删靠 GIL，
+        # 而 panel 侧约定用 _EXT_LOCK 串行化）；脱敏重活才是 B-6 要挪出去的东西。
+        with _EXT_LOCK:
+            tr._new_session(sid, source={"kind": "demo"})
         masked = tr.mask(text, sid)
-        sess = tr.sessions.get(sid) or {}
+        # 取副本：下面的展示组装不再依赖会话对象
+        sess = dict(tr.sessions.get(sid) or {})
         fwd = sess.get("fwd") or {}
         labels = sess.get("labels") or {}
         # 只返回占位符与标签，不回传原文敏感值
@@ -6462,9 +6970,10 @@ def api_demo_mask():
                 "label": labels.get(original) or "X",
                 "original_len": len(str(original or "")),
             })
-        # 清理 demo 会话，避免污染真实映射
+        # 清理 demo 会话，避免污染真实映射（与代理/扩展链路同一张会话表，同锁）
         try:
-            tr.sessions.pop(sid, None)
+            with _EXT_LOCK:
+                tr.sessions.pop(sid, None)
         except Exception:
             pass
         return jsonify({
@@ -7117,7 +7626,7 @@ def _scrub_credentials_only(s):
     """只打凭据，保留普通 PII。
 
     日志详情弹窗的定位是「脱敏 ↔ 原文对照」，把手机号邮箱一起打掉这功能就没了；
-    但凭据一个字符都不能露（AGENTS 约束 13）。所以这里只跑凭据那一组。
+    但凭据一个字符都不能露（凭据原文不得入库、不得回显）。所以这里只跑凭据那一组。
     """
     try:
         out = str(s)
@@ -7217,7 +7726,7 @@ def _safe_upstream_display(value):
     return _safe_public_text(text, 160)
 
 
-_ALLOWED_EXTERNAL_GITHUB_PATH = "/xiaYuTian11/maskit"
+_ALLOWED_EXTERNAL_GITHUB_PATHS = ("/xiaYuTian11/maskit", "/lauchiwa/data-maskit")
 
 
 def _is_allowed_external_url(url):
@@ -7250,9 +7759,8 @@ def _is_allowed_external_url(url):
         if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in path):
             return False
         if host == "github.com":
-            return path == _ALLOWED_EXTERNAL_GITHUB_PATH or path.startswith(
-                _ALLOWED_EXTERNAL_GITHUB_PATH + "/"
-            )
+            return any(path == base or path.startswith(base + "/")
+                       for base in _ALLOWED_EXTERNAL_GITHUB_PATHS)
         return True
     except Exception:
         return False
@@ -7301,12 +7809,335 @@ def _diag_scrub_word_lists(stats):
     return out
 
 
+# PID 归属判定缓存：pid -> "mitmdump" | "panel" | "other"
+_PID_KIND_CACHE = {"ts": 0.0, "data": {}}
+_PID_KIND_TTL_S = 5.0
+
+
+def _classify_pids(pids, fresh=False):
+    """批量判定若干 PID 的归属（mitmdump / 本产品面板 / 其它）。
+
+    为什么必须批量（0.6.0 修）：`_ports_snapshot` 原先按「每个端口的每个 PID」调
+    `_is_mitmdump_pid` / `_is_shield_panel_pid`，而这两个函数**每个 PID 起两次子进程**
+    （`tasklist`，认不出再拉 `powershell Get-CimInstance`，后者超时 8s）。
+    20 个期望端口 × 若干 PID = 几十次子进程串在一个 Flask 请求里，机器上端口一多
+    就是几十秒的卡顿 —— 而它只是给页面填一个"谁在听"的字段。
+    这里合并为**最多两次**子进程（一次 tasklist 拿进程名、一次 CIM 批量拿命令行），
+    再加 5s 缓存；`fresh=True`（诊断/启停）绕过缓存。
+
+    判据与 `_is_mitmdump_pid` / `_is_shield_panel_pid` 保持一致，并由
+    `test_attribution.PidClassifyConsistencyTests` 逐条比对防漂移；批量路径整体失败时
+    回退到那两个逐 PID 函数（慢但结论不变）。
+    """
+    wanted = []
+    for x in pids or ():
+        try:
+            pid = int(x)
+        except Exception:
+            continue
+        if pid > 0 and pid != os.getpid():
+            wanted.append(pid)
+    if not wanted:
+        return {}
+    now = time.time()
+    if not fresh and now - _PID_KIND_CACHE["ts"] < _PID_KIND_TTL_S:
+        hit = {p: _PID_KIND_CACHE["data"][p] for p in wanted if p in _PID_KIND_CACHE["data"]}
+        if len(hit) == len(set(wanted)):
+            return hit
+    kinds = {}
+    if sys.platform != "win32":
+        # /proc 直读，无子进程
+        for pid in wanted:
+            if _is_mitmdump_pid(pid):
+                kinds[pid] = "mitmdump"
+            elif _is_shield_panel_pid(pid):
+                kinds[pid] = "panel"
+            else:
+                kinds[pid] = "other"
+    else:
+        names = _batch_process_names(wanted)
+        if names is None:
+            # 批量拿不到（tasklist 被策略拦截等）：退回逐 PID，慢但结论一致
+            for pid in wanted:
+                kinds[pid] = ("mitmdump" if _is_mitmdump_pid(pid)
+                              else "panel" if _is_shield_panel_pid(pid) else "other")
+        else:
+            # 进程名里就带 mitmdump 的直接定案；其余（python.exe 等）才需要命令行
+            need_cmd = [p for p in wanted if "mitmdump" not in (names.get(p) or "").lower()]
+            cmds = _batch_process_cmdlines(need_cmd)
+            for pid in wanted:
+                if "mitmdump" in (names.get(pid) or "").lower():
+                    kinds[pid] = "mitmdump"
+                    continue
+                low = (cmds.get(pid) or "").lower() if cmds else _read_process_cmdline(pid).lower()
+                if "mitmdump" in low or "mitmproxy.tools" in low or "transparent.py" in low:
+                    kinds[pid] = "mitmdump"
+                elif any(m in low for m in _SHIELD_ENGINE_CMDLINE_MARKERS):
+                    kinds[pid] = "panel"
+                else:
+                    kinds[pid] = "other"
+    _PID_KIND_CACHE["ts"] = now
+    _PID_KIND_CACHE["data"].update(kinds)
+    return kinds
+
+
+def _batch_process_names(pids):
+    """一次 `tasklist /FO CSV /NH` 拿回 {pid: 进程名}；整体失败返回 None。"""
+    try:
+        _rc, out = _run_console(["tasklist", "/FO", "CSV", "/NH"],
+                                timeout=min(_CMD_TIMEOUT, 10))
+    except Exception:
+        return None
+    if not out:
+        return None
+    want = set(pids)
+    names = {}
+    for line in out.splitlines():
+        parts = [p.strip().strip('"') for p in line.split('","')]
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[1])
+        except Exception:
+            continue
+        if pid in want:
+            names[pid] = parts[0]
+    return names
+
+
+def _batch_process_cmdlines(pids):
+    """一次 CIM 查询拿回 {pid: CommandLine}；失败返回 {}（调用方自行回退）。"""
+    if not pids:
+        return {}
+    filt = " or ".join("ProcessId=%d" % int(p) for p in pids)
+    script = (f"Get-CimInstance Win32_Process -Filter '{filt}' | "
+              'ForEach-Object { "$($_.ProcessId)|$($_.CommandLine)" }')
+    try:
+        _rc, out = _run_console(["powershell", "-NoProfile", "-NonInteractive",
+                                 "-Command", script], timeout=min(_CMD_TIMEOUT, 10))
+    except Exception:
+        return {}
+    cmds = {}
+    for line in (out or "").splitlines():
+        if "|" not in line:
+            continue
+        pid_s, _, cmd = line.partition("|")
+        try:
+            cmds[int(pid_s.strip())] = cmd
+        except Exception:
+            continue
+    return cmds
+
+
+def _ports_snapshot(cfg, fresh=False):
+    """期望端口的监听实况。
+
+    `fresh=True` 只给**诊断/启停**这类"必须看到当下真相"的动作用（读缓存会给出过期
+    结论，而"端口到底谁在听"正是判断「代理有没有真的起来」的关键）。
+
+    UI 端点（一键自检 / 引擎指标）默认走缓存：这条路径在 Windows 上是
+    `netstat` + **逐 PID** 的 `tasklist`，识别不出时还会拉 `powershell Get-CimInstance`
+    （8s 超时）—— 串在一个 Flask 请求里，机器上端口一多就是几十秒的卡顿，
+    而它只是给页面填一个"谁在听"的字段。
+    """
+    try:
+        expected = set(_expected_listen_ports(cfg))
+        occ = _listening_port_pids(expected, fresh=fresh)
+        kinds = _classify_pids([x for pids in occ.values() for x in pids], fresh=fresh)
+        return [
+            {"port": p, "listening": p in occ,
+             # 自身优先：面板进程自己会 bind 期望端口做 passthrough / 兜底 503，
+             # 而 `_classify_pids` 与 `_is_shield_panel_pid` 都刻意排除自身 PID
+             # （它们服务于“清理/杀进程”，把自己算进去会误杀），于是这些端口会落进
+             # "other" → 自检 S03 在“代理已停止 + 兜底层在听”这个**默认正常态**
+             # 报「端口被其他进程占用」。这里单独认一次自身。
+             "holder": ("panel" if any(x == os.getpid() for x in occ.get(p, []))
+                        else "mitmdump" if any(kinds.get(x) == "mitmdump" for x in occ.get(p, []))
+                        else "panel" if any(kinds.get(x) == "panel" for x in occ.get(p, []))
+                        else "other" if occ.get(p) else "")}
+            for p in sorted(expected)
+        ]
+    except Exception as e:
+        return {"error": _safe_public_text(e, 240)}
+
+
+def _read_engine_metrics(max_age_s=180):
+    """读引擎写出的运行指标（跨进程：见 transparent.write_runtime_metrics）。
+
+    缺失或过期都返回 `{}` 并标 `stale`：自检据此把结论标成"未验证"，
+    而不是拿旧数据当现状（拿过期指标下结论正是自检最容易骗人的地方）。
+    """
+    try:
+        data = json.loads((DATA_ROOT / "engine-runtime.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict) or not data:
+        return {}
+    age = time.time() - float(data.get("generated_at") or 0)
+    data["age_s"] = round(age, 1)
+    data["stale"] = age > max_age_s
+    return data
+
+
+def _project_engine_metrics(eng):
+    """把引擎写的运行指标投影成"面板真正需要的键"，并清洗其中的自由文本。
+
+    为什么要投影而不是原样回传（0.6.0 修）：`engine-runtime.json` 里含引擎写入的
+    `ner.last_error` 等**自由文本异常串**，而这个端点的响应会进入浏览器/诊断链路 ——
+    原样回传等于绕开了自检结论那条路径上的 `_scrub_text`（同一份数据两套口径）。
+    投影同时也是接口契约：面板只依赖列出的键，引擎加内部字段不会自动外泄。
+    """
+    if not isinstance(eng, dict) or not eng:
+        return {}
+    out = {
+        "schema": eng.get("schema"),
+        "generated_at": eng.get("generated_at"),
+        "pid": eng.get("pid"),
+        "age_s": eng.get("age_s"),
+        "stale": eng.get("stale"),
+        "mask_pool": eng.get("mask_pool") or {},
+        "aux_pool": eng.get("aux_pool") or {},
+        "audit": eng.get("audit") or {},
+    }
+    ner = eng.get("ner") if isinstance(eng.get("ner"), dict) else {}
+    out["ner"] = {
+        "enabled": bool(ner.get("enabled")),
+        "available": bool(ner.get("available")),
+        "initialized": bool(ner.get("initialized")),
+        "failed": bool(ner.get("failed")),
+        # 异常串过清洗后才外发（与其他出口同口径）
+        "last_error": _scrub_text(ner.get("last_error") or "", 200),
+        "governor": ner.get("governor") or {},
+    }
+    if eng.get("ner_error"):
+        out["ner_error"] = _scrub_text(eng["ner_error"], 120)
+    return out
+
+
+def _selfcheck_inputs():
+    """组装一键自检的输入（面板进程视角 + 引擎写来的指标 + 事件库聚合）。"""
+    cfg = load_config()
+    eng = _read_engine_metrics()
+    try:
+        import event_store
+        agg = event_store.aggregate_recent(3600)
+    except Exception as e:                                  # pragma: no cover
+        agg = {"errors": ["%s: %s" % (type(e).__name__, e)]}
+    running = bool(state.get("proxy_running"))
+    ctx = {
+        "app": {"version": __version__, "frozen": bool(getattr(sys, "frozen", False)),
+                "python": sys.version.split()[0], "platform": platform.platform()},
+        "env": {},
+        "proxy": {
+            "running": running,
+            "capture_mode": state.get("capture_mode") or cfg.get("capture_mode", "reverse"),
+            "fallback_mode": str(state.get("fallback_mode") or ""),
+            "restarts": state.get("restarts"),
+            "uptime_s": int(time.time() - state["started_at"]) if running and state.get("started_at") else 0,
+            "last_error": _scrub_text(state.get("last_error", ""), 400),
+            # 走缓存：一键自检是 UI 动作，不该为"谁在听端口"拉起一串子进程
+            "ports": _ports_snapshot(cfg),
+            "panel_host": PANEL_HOST,
+        },
+        "engine": {
+            "mask_pool": (eng.get("mask_pool") or {}),
+            "aux_pool": (eng.get("aux_pool") or {}),
+            "audit": (eng.get("audit") or {}),
+            "metrics_stale": bool(eng.get("stale")) if eng else True,
+            "metrics_age_s": eng.get("age_s"),
+        },
+        "ner": {},
+        "events": {
+            "window_s": agg.get("window_s", 3600),
+            "total": agg.get("total", 0),
+            "per_minute": agg.get("per_minute", 0.0),
+            "by_type": agg.get("by_type", {}),
+            "by_status": agg.get("by_status", {}),
+            "by_block_source": agg.get("by_block_source", {}),
+            "by_reason": agg.get("by_reason", {}),
+            "unresolved": agg.get("unresolved", 0),
+            "retry_storms": agg.get("retry_storms", []),
+            "mask_ms": agg.get("mask_ms", {}),
+            "upstream_ms": agg.get("upstream_ms", {}),
+            "last_event_ts": agg.get("last_event_ts", 0.0),
+            "aggregate_errors": agg.get("errors", []),
+        },
+        "settings": {
+            "fail_closed": bool(cfg.get("fail_closed", True)),
+            "audit_fail_closed": bool((cfg.get("audit") or {}).get("fail_closed", False)),
+            "filter_enabled": bool(cfg.get("filter_enabled", True)),
+            "response_scan": bool(cfg.get("response_scan", True)),
+            "ner_enabled": bool(cfg.get("ner_enabled", False)),
+        },
+    }
+    # NER 状态：模型文件是否齐备在本进程也能看（与进程无关），运行态优先取引擎那份。
+    try:
+        import ner_engine
+        ctx["ner"] = {
+            "enabled": bool(cfg.get("ner_enabled", False)),
+            "available": bool(ner_engine.is_ner_available()),
+            "initialized": False,
+            "failed": False,
+            "last_error": "",
+            "skips": {},
+            "governor": {},
+        }
+        if isinstance(eng.get("ner"), dict):
+            ctx["ner"].update({k: v for k, v in eng["ner"].items() if k != "enabled"})
+            ctx["ner"]["enabled"] = bool(cfg.get("ner_enabled", False))
+        else:
+            ctx["ner"]["skips"] = dict(getattr(ner_engine, "_SKIP_STATS", {}) or {})
+    except Exception as e:                                  # pragma: no cover
+        ctx["ner"] = {"enabled": bool(cfg.get("ner_enabled", False)),
+                      "error": "%s: %s" % (type(e).__name__, e)}
+    # 环境探测（cgroup/磁盘/核数）：容器里"CPU 100% 降不下来"的根因常在这里
+    try:
+        import selfcheck
+        ctx["env"] = selfcheck.probe_environment(DATA_ROOT)
+    except Exception as e:                                  # pragma: no cover
+        ctx["env"] = {"error": "%s: %s" % (type(e).__name__, e)}
+    # 事件库写入健康 + 是否发生过损坏隔离（storage.*）
+    try:
+        import event_store
+        ctx["storage"] = {"writer": event_store.writer_stats()}
+        ctx["storage"]["db_quarantined"] = bool(getattr(event_store, "_LAST_QUARANTINE", False))
+    except Exception as e:                                  # pragma: no cover
+        ctx["storage"] = {"error": "%s: %s" % (type(e).__name__, e)}
+    return ctx
+
+
+def _scrub_selfcheck(result):
+    """自检结论过一遍打码：结论会被用户复制粘贴出去，路径/主机名里的个人信息
+    不该跟着走（`_scrub_text` 是唯一入口，失败时返回占位串而不是原文）。"""
+    try:
+        if not isinstance(result, dict):
+            return result
+        if result.get("summary_line"):
+            result["summary_line"] = _scrub_text(result["summary_line"], 500)
+        for f in result.get("findings") or []:
+            if isinstance(f, dict):
+                for key in ("title", "evidence", "action"):
+                    if f.get(key):
+                        f[key] = _scrub_text(f[key], 500)
+        # 取数失败的异常串同样会被渲染（设置页"部分数据源取数失败"那行）：
+        # 异常文本可能带路径/主机名，必须与其余字段同口径清洗。
+        for e in result.get("input_errors") or []:
+            if isinstance(e, dict) and e.get("error"):
+                e["error"] = _scrub_text(e["error"], 300)
+        return result
+    except Exception:
+        return result
+
+
 def _diagnostics_payload(error_limit=60):
     """组装诊断包。任何一节取数失败都降级成错误字符串，不让整包生成失败——
     诊断包恰恰是在系统半死不活的时候才用得上。"""
     cfg = load_config()
     out = {
-        "schema": 1,
+        # schema 2（0.6.0）：内嵌一键自检结论。
+        # 为什么内嵌而不是另开一个导出：用户报障时只该点一次按钮 ——
+        # 结论让人自己先看懂，原始证据留给维护者，两者同一份文件。
+        "schema": 2,
         "generated_at": int(time.time()),
         "masked": True,   # 与 masked_export 同义：本包不含任何还原正文
     }
@@ -7338,19 +8169,7 @@ def _diagnostics_payload(error_limit=60):
         "ca_cert_exists": CA_CERT.exists(),
     }
 
-    # 端口实况：一次性 netstat。fresh=True——诊断是一次性动作，读缓存会给出过期结论
-    try:
-        expected = set(_expected_listen_ports(cfg))
-        occ = _listening_port_pids(expected, fresh=True)
-        out["ports"] = [
-            {"port": p, "listening": p in occ,
-             "holder": ("mitmdump" if any(_is_mitmdump_pid(x) for x in occ.get(p, []))
-                        else "panel" if any(_is_shield_panel_pid(x) for x in occ.get(p, []))
-                        else "other" if occ.get(p) else "")}
-            for p in sorted(expected)
-        ]
-    except Exception as e:
-        out["ports"] = {"error": _safe_public_text(e, 240)}
+    out["ports"] = _ports_snapshot(cfg, fresh=True)
 
     out["upstreams"] = [
         {"name": u.get("name"), "port": u.get("port"),
@@ -7382,13 +8201,30 @@ def _diagnostics_payload(error_limit=60):
 
     out["license"] = {"edition": "community", "status": "active", "enforced": False}
 
+    # 一键自检结论（§16）：规则引擎只吃已收集的数据，失败也只记一条 input_errors
+    try:
+        import selfcheck
+        # 语言跟界面走：诊断包里的结论应与用户当时看到的同一语言
+        try:
+            _sc_lang = (request.args.get("lang") or "").strip()
+        except Exception:                                    # pragma: no cover
+            _sc_lang = ""
+        out["selfcheck"] = _scrub_selfcheck(selfcheck.run_selfcheck(_selfcheck_inputs(), lang=_sc_lang))
+    except Exception as e:
+        out["selfcheck"] = {"error": _safe_public_text(e, 240)}
+
     # 最近的异常事件。只留元数据 + 规则标签，items 连 preview 都不带
     # （preview 虽是打码的，但发给第三方时能少给一分是一分）
     try:
         bad = {"ERR", "BLOCK", "DNS_ERROR", "SCAN_WARN"}
         keep = ("ts", "type", "sid", "host", "path", "method", "status", "http_status",
                 "stream_mode", "stream_actual", "reason", "count", "restored",
-                "mask_ms", "total_ms")
+                "mask_ms", "total_ms",
+                # 诊断包同样要能看出 503 来源与降级原因（0.6.0）
+                "block_source", "degraded", "stream_degraded_reason", "upstream_ms",
+                "engine_queue_depth", "engine_queue_bytes", "engine_busy", "queue_wait_ms",
+                "aux_wait_ms",
+                "ner_global_throttled", "ner_sem_wait_ms")
         rows = []
         for e in fetch_events(since=0, limit=600, max_limit=EXPORT_MAX):
             if e.get("type") not in bad and int(e.get("http_status") or 0) < 400:
@@ -7425,6 +8261,50 @@ def _diagnostics_payload(error_limit=60):
 
     out["log_tail"] = [_scrub_text(x, 600) for x in list(log_buf)[-200:]]
     return out
+
+
+@app.get("/api/selfcheck")
+def api_selfcheck():
+    """一键自检：返回「结论 + 证据 + 动作」，供设置页「系统状态」区块展示。
+
+    ⚠️ 必须挂在 `/api/` 前缀下（走 api_guard 的三重校验）。绝不能扩 `/healthz`：
+    那是唯一免 token、免 Host/Origin 校验的存活探针，把运行态挂上去等于绕过
+    整个控制面防线（AGENTS.md 控制面红线 / C-1）。
+    """
+    try:
+        import selfcheck
+        ctx = _selfcheck_inputs()
+        # 语言由前端传入：英文界面不该出现中文结论（引擎按 lang 走英文分支）
+        lang = (request.args.get("lang") or "").strip()
+        result = _scrub_selfcheck(selfcheck.run_selfcheck(ctx, lang=lang))
+        return jsonify({"ok": True, "selfcheck": result,
+                        "engine_metrics_stale": bool((ctx.get("engine") or {}).get("metrics_stale"))})
+    except Exception as e:
+        # 自检自己崩了也要给得出原因（它恰恰在半死不活时才被点）
+        return jsonify({"ok": False, "error": _safe_public_text(e, 240)}), 500
+
+
+@app.get("/api/engine/metrics")
+def api_engine_metrics():
+    """引擎运行指标（脱敏池/队列、审计耗时、NER 治理器）+ 端口实况。
+
+    数据来自引擎进程写出的 `engine-runtime.json`（跨进程，见
+    `transparent.write_runtime_metrics`）；过期会被如实标记，不假装是新数据。
+    """
+    try:
+        eng = _project_engine_metrics(_read_engine_metrics())
+        cfg = load_config()
+        return jsonify({
+            "ok": True,
+            "engine": eng,
+            "stale": bool(eng.get("stale")) if eng else True,
+            "ports": _ports_snapshot(cfg),
+            "proxy": {"running": bool(state.get("proxy_running")),
+                      "fallback_mode": str(state.get("fallback_mode") or ""),
+                      "restarts": state.get("restarts")},
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": _safe_public_text(e, 240)}), 500
 
 
 @app.get("/api/diagnostics")

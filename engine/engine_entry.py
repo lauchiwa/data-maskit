@@ -77,6 +77,28 @@ def _autostart() -> None:
             pass
 
 
+def _warn_if_ner_unavailable() -> None:
+    """启动时检查「语义识别已开启但模型不可用」，命中就打印醒目告警。
+
+    只告警、不阻断：脱敏主链路的规则扫描不依赖 NER，缺模型只是能力降级，
+    把它当成致命错误让引擎起不来反而是更大的事故（AGENTS.md：可用性优先的兜底姿态）。
+    """
+    try:
+        import ner_engine
+        cfg = panel.load_config()
+        if not cfg.get("ner_enabled"):
+            return
+        if ner_engine.is_ner_available():
+            return
+        panel._emit_log(
+            "[engine] ⚠️ 语义识别（NER）已开启，但模型文件缺失 —— 实体识别不会生效。"
+            f"期望路径：{ner_engine.MODEL_DIR}（需要 config.json / tokenizer.json / "
+            "model_quantized.onnx 三个文件）。自建镜像请把模型拷进 engine/models/ner_mini_zh/，"
+            "或在设置页关闭语义识别。")
+    except Exception:  # noqa: BLE001
+        pass          # 预检失败绝不阻断启动
+
+
 def main() -> None:
     # -1. mitmdump 子进程模式：必须在任何 panel 初始化之前判断并接管，
     #     否则会在代理子进程里又起一个 Flask 面板、抢同一个端口。
@@ -95,6 +117,12 @@ def main() -> None:
         panel._purge_stale_legacy_autostart()
     except Exception:  # noqa: BLE001
         pass
+
+    # 0.7 语义识别可用性预检（C-3）：模型缺失时**显式告警**。
+    # 为什么放在启动而不是等用户触发：ner 开关打开但模型不在（自建镜像忘了拷
+    # models/、容器挂载漏了）时，功能会静默降级成"开了但没做"，用户只能靠
+    # 结果反推 —— 启动日志 + 自检 S21 两处同时说清楚。
+    _warn_if_ner_unavailable()
 
     # 1.5 代理自启/fallback：Flask 主线程阻塞期间由后台线程触发
     threading.Thread(target=_autostart, daemon=True).start()
