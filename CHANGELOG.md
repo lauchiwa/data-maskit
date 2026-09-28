@@ -24,7 +24,18 @@
 - 引擎：流式收尾（审计 + 响应扫描）下池，并去掉四处 O(body) 白烧（4MB 响应实测从 216ms 降到 ~1ms 循环占用）；审计只解码"会被用到的文本"（超 2MB 的响应不再为 128KB 扫描窗口把整份 body 解码成字符串），**响应哈希仍是全量 sha256**（证据语义不变）；同轮修掉"进程名取错 CSV 列导致每次端口判定都白跑一次 8s 超时 PowerShell"的老问题，端口快照改为一次 `tasklist` + 一次 CIM 批量归类（含 5s 缓存）。
   *Engine: the streaming finish path (audit + response scan) is now offloaded, and three needless O(body) passes were removed (a 4 MB response went from ~216 ms of loop time to ~1 ms). The audit now decodes only the text it actually uses (responses over 2 MB no longer get a full-body decode just to feed a 128 KB scan window) while the response hash stays a full sha256 (evidence semantics unchanged). The same pass fixed a long-standing bug where the process name was read from the wrong CSV column (so every port ownership check fell through to an 8 s-timeout PowerShell call); port snapshots now use one `tasklist` plus one batched CIM query with a 5 s cache.*
 
+- 修复：四处 P0 —— 非流式请求用量恒为 0（拿流式字段做判据）、整包路径 `_drop` 漏传 `expect` 会抹掉同会话新实例、S32 读错键名导致「事件库写失败」永不触发、S03 把自身端口误判成被占用。
+  *Fixed four P0 defects: non-streaming requests always reported zero usage (a stream-only field was used as the predicate), the whole-body path dropped the `expect` argument and could wipe a re-created session, S32 read the wrong key so "event DB writes failing" never fired, and S03 mistook Maskit's own port for a foreign one.*
+- 修复：自检的跨线程共享状态补锁（aux 统计、canary 注册表、`peak_wait_ms`），修掉 `_AUX_PENDING` 双减、S11 零样本误报与 OK_NOTES 与已触发结论自相矛盾；测试不再依赖执行顺序。
+  *Locked the self-check's cross-thread state (aux stats, canary registry, peak_wait_ms) and fixed the double decrement of `_AUX_PENDING`, S11's zero-sample false positive and OK_NOTES contradicting fired findings; tests no longer depend on execution order.*
+- 修复：审计探测窗口不再被模块级常量冻结（改 `audit.scan_max` 立即生效）、等待类指标不再因挂在错误的 gate 下永不显示、`peak_wait_ms` 峰值不再被并发覆盖、事件库队列字节默认值校正为 `max(32MB, workers × 8MB)`。
+  *The audit probe window is no longer frozen by a module-level constant (editing audit.scan_max takes effect immediately), wait metrics are no longer hidden behind the wrong gate, peak_wait_ms can no longer lose updates under concurrency, and the event-queue byte default is corrected to max(32MB, workers x 8MB).*
+- 引擎：语义识别预算不足时改为**有界等待**（`MASKIT_NER_WAIT_MS`，默认 2s）：等到即推理，等不到仍降级；新增 `budget_waited` 指标区分「补上了」与「真降级」。
+  *Engine: NER now waits inside a bounded window (MASKIT_NER_WAIT_MS, 2 s default) when the budget is exhausted — it infers if the budget returns, degrades otherwise; the new budget_waited metric separates "recovered" from real degradation.*
+
 ### 新增 / Added
+- 设置页：一键自检的结论文案跟随界面语言（中/英），英文界面下不再输出中文结论（含诊断包内嵌的同一份结论）。
+  *Settings: the one-click self-check conclusion now follows the UI language (Chinese/English); an English UI no longer shows Chinese conclusions, including the copy embedded in the diagnostics bundle.*
 - 引擎：503 增加来源归因（上游 / 本机熔断 / 兜底层），事件详情与自检都能一眼区分"是上游拒的还是本机拦的"。
   *Engine: 503s are now attributed (upstream / local fail-closed / fallback), so the event detail and the self-check tell upstream rejections apart from local blocking at a glance.*
 - 设置页：新增**一键自检**（设置 → 健康检查与恢复），把端口、队列、语义识别降级、审计截断、磁盘与容器 CPU 限流翻译成「问题 + 证据 + 建议动作」，只读本机数据、不联网；诊断包同步升级为 schema 2 并内嵌该结论。

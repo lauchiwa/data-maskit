@@ -8174,7 +8174,12 @@ def _diagnostics_payload(error_limit=60):
     # 一键自检结论（§16）：规则引擎只吃已收集的数据，失败也只记一条 input_errors
     try:
         import selfcheck
-        out["selfcheck"] = _scrub_selfcheck(selfcheck.run_selfcheck(_selfcheck_inputs()))
+        # 语言跟界面走：诊断包里的结论应与用户当时看到的同一语言
+        try:
+            _sc_lang = (request.args.get("lang") or "").strip()
+        except Exception:                                    # pragma: no cover
+            _sc_lang = ""
+        out["selfcheck"] = _scrub_selfcheck(selfcheck.run_selfcheck(_selfcheck_inputs(), lang=_sc_lang))
     except Exception as e:
         out["selfcheck"] = {"error": _safe_public_text(e, 240)}
 
@@ -8239,7 +8244,9 @@ def api_selfcheck():
     try:
         import selfcheck
         ctx = _selfcheck_inputs()
-        result = _scrub_selfcheck(selfcheck.run_selfcheck(ctx))
+        # 语言由前端传入：英文界面不该出现中文结论（引擎按 lang 走英文分支）
+        lang = (request.args.get("lang") or "").strip()
+        result = _scrub_selfcheck(selfcheck.run_selfcheck(ctx, lang=lang))
         return jsonify({"ok": True, "selfcheck": result,
                         "engine_metrics_stale": bool((ctx.get("engine") or {}).get("metrics_stale"))})
     except Exception as e:

@@ -9,6 +9,7 @@
  * **不做自动上报**——生成后由用户预览、自己决定发不发。
  */
 import { shieldFetch } from '@/lib/shield-fetch'
+import { getI18nLang } from '@/lib/i18n'
 
 export interface DiagnosticsBundle {
   schema: number
@@ -35,7 +36,8 @@ export function getDiagnostics(): Promise<DiagnosticsBundle> {
 }
 
 export function saveDiagnostics(): Promise<{ ok: boolean; path?: string; size?: number; error?: string }> {
-  return shieldFetch('/api/diagnostics/save', { method: 'POST', timeoutMs: 30000 })
+  // 结论跟界面语言走：英文界面导出的诊断包里不该出现中文结论。
+  return shieldFetch('/api/diagnostics/save?lang=' + encodeURIComponent(getI18nLang()), { method: 'POST', timeoutMs: 30000 })
 }
 
 /** 一键自检结论（§16）。与诊断包的分工：这里是**结论**，诊断包是**原始证据**。 */
@@ -70,5 +72,5 @@ export interface SelfCheckResponse {
 
 /** 跑一次自检（只读；不产生任何外发请求）。 */
 export function runSelfCheck(): Promise<SelfCheckResponse> {
-  return shieldFetch<SelfCheckResponse>('/api/selfcheck')
+  return shieldFetch<SelfCheckResponse>('/api/selfcheck?lang=' + encodeURIComponent(getI18nLang()))
 }

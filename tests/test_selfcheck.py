@@ -37,6 +37,25 @@ HEALTHY = {
 }
 
 
+# 多问题样本：用来验证「英文模式不残留中文」这种行为测试能真的跑出若干条结论
+# （只要 fired_ids 非空即可；具体触发哪几条不影响断言的有效性）。
+MESSY = json.loads(json.dumps(HEALTHY))
+MESSY["proxy"].update({"running": False, "stop_mode": "error", "restarts": 3,
+                       "last_error": "OSError: boom"})
+MESSY["proxy"]["ports"] = [{"port": 5801, "listening": True, "holder": "nginx"}]
+MESSY["env"].update({"cgroup_cpu_quota": 1.0, "nr_throttled_delta": 5,
+                     "disk_free_mb": 10, "disk_path": "/data"})
+MESSY["engine"]["mask_pool"] = {"busy_total": 3, "peak_wait_ms": 1200,
+                                 "queue_depth": 2, "workers": 4}
+MESSY["engine"]["audit"] = {"truncated": 2, "parse_skipped": 1, "p95_ms": 40}
+MESSY["ner"] = {"enabled": True, "available": True, "initialized": False, "failed": True,
+                "last_error": "model missing", "skips": {"global_throttled": 3}}
+MESSY["events"] = {"window_s": 600, "by_status": {"200": 10, "503": 7}, "per_minute": 90,
+                   "unresolved": 3,
+                   "by_block_source": {"upstream": 5, "engine": 2, "fallback": 0}}
+MESSY["settings"]["fail_closed"] = False
+
+
 class HealthyBaselineTests(unittest.TestCase):
     def test_healthy_fires_nothing(self):
         self.assertEqual(ids(HEALTHY), set(), "健康输入不该有任何结论（否则用户会习惯性忽略自检）")
@@ -312,6 +331,55 @@ class CrossProcessMetricsTests(unittest.TestCase):
         ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
         self.assertIn("engine-runtime.json", ignore,
                       "引擎指标是运行时产物，必须 gitignore（否则会被提交进仓库）")
+
+
+class BilingualTests(unittest.TestCase):
+    """自检结论必须跟语言走：英文界面出现中文结论 = 回归。
+
+    分两层：① 行为——英文模式跑一遍，断言结论里没有任何汉字；
+    ② 结构——逐条规则检查源码里带英文分支（新增规则漏译时立即报错，
+    不必等到那条规则恰好在测试环境里被触发）。
+    """
+
+    @staticmethod
+    def _text(out):
+        parts = [str(out.get("summary_line") or "")]
+        for f in out.get("findings", []):
+            parts += [str(f.get("title") or ""), str(f.get("evidence") or ""),
+                      str(f.get("action") or "")]
+        for o in out.get("ok_items", []):
+            parts.append(str(o.get("note") or ""))
+        return " ".join(parts)
+
+    def test_every_rule_has_an_english_branch(self):
+        """结构层：每条规则都必须给英文分支（漏译不再靠运气发现）。"""
+        import inspect
+        for rule in sc.RULES:
+            fn = getattr(rule, "__wrapped__", rule)
+            self.assertIn("_is_en()", inspect.getsource(fn),
+                          "%s 缺英文分支：英文界面会露出中文结论"
+                          % getattr(fn, "__name__", rule))
+
+    def test_english_mode_contains_no_chinese(self):
+        out = sc.run_selfcheck(json.loads(json.dumps(MESSY)), lang="en")
+        self.assertTrue(out["fired_ids"], "用例本身没触发任何规则，测试失去意义")
+        self.assertNotRegex(self._text(out), r"[\u4e00-\u9fff]",
+                            "英文模式残留中文结论：%s" % self._text(out)[:200])
+
+    def test_chinese_mode_stays_chinese(self):
+        out = sc.run_selfcheck(json.loads(json.dumps(MESSY)), lang="zh")
+        self.assertRegex(self._text(out), r"[\u4e00-\u9fff]")
+
+    def test_unknown_language_falls_back_to_chinese(self):
+        a = self._text(sc.run_selfcheck(json.loads(json.dumps(MESSY)), lang="xx"))
+        b = self._text(sc.run_selfcheck(json.loads(json.dumps(MESSY)), lang="zh"))
+        self.assertEqual(a, b, "非法语言必须回退中文，不能漏出半截英文")
+
+    def test_healthy_english_mode_has_no_chinese(self):
+        """全好路径也要英文：ok_items 的 note 与 summary_line 同样要跟语言走。"""
+        out = sc.run_selfcheck(json.loads(json.dumps(HEALTHY)), lang="en")
+        self.assertNotRegex(self._text(out), r"[\u4e00-\u9fff]",
+                            "健康路径残留中文：%s" % self._text(out)[:200])
 
 
 if __name__ == "__main__":
