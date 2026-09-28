@@ -203,7 +203,7 @@ class MaskPathAwarenessTests(unittest.TestCase):
                      "input": {"query": token, "name": "张三"}},
                 ]}, ensure_ascii=False).encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             got = json.loads(flow.response.content)
             self.assertEqual(got["content"][0]["id"], "tu_1")
             self.assertEqual(got["content"][0]["name"], "search")
@@ -1075,7 +1075,7 @@ class CredentialRedactionTests(unittest.TestCase):
                 content=json.dumps({"choices": [{"message": {"content": "收到 " + masked}}]},
                                    ensure_ascii=False).encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
         captured = self._capture(run)
         restore = [kw for typ, kw in captured if typ == "RESTORE"][0]
         self.assertTrue(restore["items"], "RESTORE 应有明细")
@@ -1110,8 +1110,7 @@ class CredentialRedactionTests(unittest.TestCase):
                 content=json.dumps({"choices": [{"message": {"content": f"配置完成: {tok} 密码为 Zq9xLm2pTv8w"}}]},
                                    ensure_ascii=False).encode("utf-8"),
             )
-            tr.response(f2)
-
+            asyncio.run(tr.response(f2))
         captured = self._capture(run_f2)
         restore2 = [kw for typ, kw in captured if typ == "RESTORE"][0]
         # dialog 与 resp_preview 必须已被清洗掉明文密码
@@ -1902,7 +1901,12 @@ class AuditResponseHardeningTests(unittest.TestCase):
         # ⚠️ 探针**必须显式 `return []`**。写成 `seen.setdefault(...) or []` 会返回
         # 记下的 int，`findings.extend(int)` 抛 TypeError，而 `_audit_response` 外层
         # 是「异常静默」——于是用例会因为函数中途夭折而给出误导性的 None（踩过）。
-        with mock.patch.object(tr, "_SCAN_BODY_MAX", cap), \
+        # A-1（0.6.0）：审计扫描窗口从 `_SCAN_BODY_MAX`(512KB) 收窄为
+        # `AUDIT_SCAN_MAX`(128KB)。本用例锁的是「扫描副本被截断、结构化解析
+        # 仍吃全量」这条结构，所以跟着换常量名，而不是删掉断言。
+        tr._AUDIT_FINDINGS_CACHE.clear()
+        tr._AUDIT_CFG_FP[0] = None
+        with mock.patch.object(tr, "AUDIT_SCAN_MAX", cap), \
              mock.patch.object(tr, "_parse_response_payload", spy_parse), \
              mock.patch.object(tr._audit, "scan_response_poison", spy_poison), \
              mock.patch.object(tr._audit, "scan_dangerous_action", spy_danger), \
@@ -1913,7 +1917,7 @@ class AuditResponseHardeningTests(unittest.TestCase):
             tr._audit_response(flow, sid, "api.openai.com", "POST",
                                "/v1/chat/completions", {})
         self.assertEqual(seen.get("poison_len"), cap,
-                         "送给扫描器的文本必须截断到 _SCAN_BODY_MAX")
+                         "送给扫描器的文本必须截断到 AUDIT_SCAN_MAX")
         self.assertEqual(seen.get("danger_len"), cap)
         self.assertGreater(seen.get("parse_len", 0), cap,
                            "结构化解析必须吃全量 body（截断只作用于扫描器那份副本）")
@@ -2326,6 +2330,7 @@ class SseStreamTerminatorTests(unittest.TestCase):
         self.assertIsInstance(tail, bytes)
         self.assertIn("hello", tail.decode("utf-8"))
         stream(b"")
+        tr.aux_drain()  # 收尾已投递 aux 池：等它落库再断言
 
     def test_last_chunk_may_return_empty_bytes(self):
         """末块（data=b""）走 EndOfMessage 分支，那里对 b"" 有过滤，返回 bytes 安全。"""
@@ -2826,7 +2831,8 @@ class StabilityFixTests(unittest.TestCase):
         f2 = mk_flow("text/event-stream", "gzip")
         tr.responseheaders(f2)
         self.assertIsNone(f2.response.stream)
-        self.assertEqual(f2.metadata.get("shield_stream_degraded"), "gzip")
+        # C-2：原因归一成 `content_encoding:<编码>`（前端直接显示"上游无视 identity"）
+        self.assertEqual(f2.metadata.get("shield_stream_degraded"), "content_encoding:gzip")
         # 整包 JSON：无帧边界需求，不接管
         f3 = mk_flow("application/json")
         tr.responseheaders(f3)
@@ -7492,8 +7498,7 @@ class MaskOffloadTests(unittest.TestCase):
                 content=json.dumps({"choices": [{"message": {"content": "收到"}}]},
                                    ensure_ascii=False).encode("utf-8"),
             )
-            tr.response(flow)
-
+            asyncio.run(tr.response(flow))
         for typ in ("MASK", "RESTORE"):
             ev = [kw for t, kw in events if t == typ]
             self.assertTrue(ev, "未发出 %s 事件" % typ)
@@ -7992,3 +7997,46 @@ class RecentTableThrottleTests(unittest.TestCase):
         tr._prune_recent()
         self.assertNotIn("久远", tr._RECENT_FWD, "直接调用仍须立刻清掉过期条目")
         self.assertLessEqual(len(tr._RECENT_FWD), tr._RECENT_MAX)
+
+
+class SingleParsePerRequestTests(unittest.TestCase):
+    """B-3 的真实形态：同一份 body 曾被解析两遍（实测 1MB 约 1.2ms × 2）。
+
+    为什么不做"把解析搬到 worker"：解析结果被 4 处**循环侧决策**消费（unknown_shape
+    早退、accept-encoding、enum 改写会就地改树、reasoning_effort 标注），搬走等于把
+    fail-closed/dup-key/splice 这一片最敏感的判定一起搬家；而实测解析成本只有
+    0.02ms(16KB)~1.2ms(1MB)，收益远小于回归面。所以只消掉重复的那一次。
+    """
+
+    class _BoomContent:
+        """一旦被读就断言失败：用来证明"没有第二次解析"。"""
+
+        def __getattr__(self, name):
+            raise AssertionError("请求体被重复解析了（B-3 回归）")
+
+    def _flow(self, ct="application/json"):
+        flow = mock.Mock()
+        flow.request.headers = {"content-type": ct}
+        flow.request.content = SingleParsePerRequestTests._BoomContent()
+        return flow
+
+    def test_reuses_parsed_body_without_reparsing(self):
+        flow = self._flow()
+        self.assertTrue(tr._looks_like_llm_request(flow, {"messages": [{"role": "user"}]}))
+
+    def test_non_llm_body_returns_false(self):
+        flow = self._flow()
+        self.assertFalse(tr._looks_like_llm_request(flow, {"foo": 1}))
+
+    def test_missing_content_type_is_not_llm(self):
+        """content-type 不含 json 时直接返回 False —— 与传不传 body 无关的既有语义。"""
+        self.assertFalse(tr._looks_like_llm_request(self._flow(ct="text/plain"), {"messages": []}))
+
+    def test_sentinel_distinguishes_parsed_null(self):
+        """`json.loads("null")` 的合法结果就是 None：不能用 None 当"没传"的默认值。"""
+        self.assertFalse(tr._looks_like_llm_request(self._flow(), None))
+        self.assertTrue(tr._looks_like_llm_request(self._flow(), {"prompt": "x"}))
+
+
+if __name__ == "__main__":
+    unittest.main()

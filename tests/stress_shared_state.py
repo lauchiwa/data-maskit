@@ -24,6 +24,7 @@
   5. `ner_engine._CACHE_CHARS` 与实际键长之和一致。
 """
 import argparse
+import asyncio
 import json
 import sys
 import tempfile
@@ -58,6 +59,8 @@ def main():
     ap.add_argument("--seconds", type=float, default=30.0)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--ner", action="store_true", help="同时压 NER 缓存读写（需模型）")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="脱敏池宽度：>1 时把 signer 经 _MASK_POOL 提交（A-5 之后才真生效）")
     args = ap.parse_args()
 
     tmp = Path(tempfile.mkdtemp())
@@ -80,8 +83,14 @@ def main():
     def signer(tid):
         try:
             i = 0
+            loop = asyncio.new_event_loop() if (pool is not None and args.workers > 1) else None
             while not stop.is_set():
-                out = tr.mask("编号%d %s %s" % (i, text, BASE_WORDS[2]), "st-%d" % tid)
+                payload = "编号%d %s %s" % (i, text, BASE_WORDS[2])
+                if loop is not None:
+                    out = loop.run_until_complete(
+                        loop.run_in_executor(pool, tr.mask, payload, "st-%d" % tid))
+                else:
+                    out = tr.mask(payload, "st-%d" % tid)
                 # 4) 热重载进行中也不许漏脱敏
                 for w in BASE_WORDS[:3]:
                     if w in out:
@@ -150,8 +159,21 @@ def main():
     if args.ner:
         threads.append(threading.Thread(target=ner_load, daemon=True))
 
-    print("压测 %ss：%d 个 signer + pruner + reloader%s + monitor"
-          % (args.seconds, args.threads, " + ner" if args.ner else ""))
+    # --workers：把 signer 从"直接调 mask（等价于无限并发）"改成"经 _MASK_POOL 提交"，
+    # 这样压的是真实调用路径（含队列宽度与队头阻塞）。A-5 之前池宽恒为 1，
+    # 这时脚本会明确告警而不是假装压了多 worker —— 免得基线差异被误读成回归。
+    pool = getattr(tr, "_MASK_POOL", None)
+    set_workers = getattr(tr, "set_mask_workers", None)
+    pool_note = ""
+    if args.workers and args.workers > 1:
+        if callable(set_workers):
+            set_workers(args.workers)
+            pool_note = "，池宽已设为 %d" % args.workers
+        else:
+            pool_note = "，⚠️ 引擎尚无 set_mask_workers（A-5 未落地），池宽仍是 1"
+
+    print("压测 %ss：%d 个 signer + pruner + reloader%s + monitor%s"
+          % (args.seconds, args.threads, " + ner" if args.ner else "", pool_note))
     t0 = time.perf_counter()
     for t in threads:
         t.start()

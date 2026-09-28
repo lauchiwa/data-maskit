@@ -43,6 +43,7 @@ import { useMutation } from '@tanstack/react-query'
 import type { ShieldConfig, UpstreamConfig } from '@/types/api'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
+import { runSelfCheck, saveDiagnostics, type SelfCheckResult } from '@/api/diagnostics'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
@@ -185,6 +186,8 @@ const NER_SKIP_ITEMS: { key: string; labelKey: string }[] = [
   { key: 'model_missing', labelKey: 'settings.sw.nerSkipModelMissing' },
   { key: 'om_compose', labelKey: 'settings.sw.nerSkipCompose' },
   { key: 'runtime', labelKey: 'settings.sw.nerSkipRuntime' },
+  { key: 'global_throttled', labelKey: 'settings.sw.nerSkipGlobalThrottled' },
+  { key: 'sem_timeout', labelKey: 'settings.sw.nerSkipSemTimeout' },
 ]
 
 function detectClientType(u: UpstreamConfig): string {
@@ -651,6 +654,10 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
   const [demoModel, setDemoModel] = useState('')
   const [realTesting, setRealTesting] = useState(false)
   const [healthInfo, setHealthInfo] = useState<Record<string, unknown> | null>(null)
+  // 一键自检（§16）：只手动触发；结论留在页面上直到用户重新跑，避免"看一眼就没了"
+  const [selfCheck, setSelfCheck] = useState<SelfCheckResult | null>(null)
+  const [selfCheckStale, setSelfCheckStale] = useState(false)
+  const [selfChecking, setSelfChecking] = useState(false)
   const [copiedMap, setCopiedMap] = useState<Record<string, boolean>>({})
   const [confirmDeleteCat, setConfirmDeleteCat] = useState<{ name: string; count: number } | null>(null)
 
@@ -2425,6 +2432,102 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                   {JSON.stringify(healthInfo, null, 2).slice(0, 1500)}
                 </pre>
               )}
+              {/*
+                一键自检（§16）：结论 + 证据 + 建议。
+                刻意**不自动跑**：它读日志做聚合，属于"用户要看的时候才做"的动作，
+                自动跑等于给每次打开设置页都加一次全表聚合。
+              */}
+              <div className="w-full space-y-2 border-t pt-3">
+                <div className="flex flex-wrap items-center gap-3">
+                  <Button size="sm" variant="outline" className="h-8" onClick={async () => {
+                    if (selfChecking) return
+                    setSelfChecking(true)
+                    try {
+                      const r = await runSelfCheck()
+                      if (!r.ok || !r.selfcheck) throw new Error(r.error || 'selfcheck failed')
+                      setSelfCheck(r.selfcheck)
+                      setSelfCheckStale(Boolean(r.engine_metrics_stale))
+                    } catch (e) { toast(tf('settings.selfcheck.fail', { e: String(e) }), 'error') } finally { setSelfChecking(false) }
+                  }} loading={selfChecking}>
+                    {selfCheck ? t('settings.selfcheck.rerun') : t('settings.selfcheck.run')}
+                  </Button>
+                  {selfCheck && (
+                    <Button size="sm" variant="outline" className="h-8" onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(selfCheck.summary_line + '\n' +
+                          selfCheck.findings.map((f) => `[${f.severity}] ${f.title} | ${f.evidence} | ${f.action}`).join('\n'))
+                        toast(t('settings.selfcheck.copied'), 'success')
+                      } catch (e) { toast(tf('settings.selfcheck.copyFail', { e: String(e) }), 'error') }
+                    }}>
+                      {t('settings.selfcheck.copy')}
+                    </Button>
+                  )}
+                  <Button size="sm" variant="ghost" className="h-8" onClick={async () => {
+                    try {
+                      const r = await saveDiagnostics()
+                      toast(r.ok ? t('settings.selfcheck.exported') : String(r.error || ''), r.ok ? 'success' : 'error')
+                    } catch (e) { toast(String(e), 'error') }
+                  }}>
+                    {t('settings.selfcheck.export')}
+                  </Button>
+                  <span className="text-[11px] text-muted-foreground">{t('settings.selfcheck.hint')}</span>
+                </div>
+                {selfCheck && (
+                  <div className="space-y-2">
+                    <div className={
+                      selfCheck.overall === 'high' ? 'text-xs font-medium text-destructive'
+                        : selfCheck.overall === 'medium' ? 'text-xs font-medium text-amber-600'
+                        : 'text-xs font-medium text-emerald-600'
+                    }>
+                      {selfCheck.overall === 'high'
+                        ? tf('settings.selfcheck.overallHigh', { n: String(selfCheck.findings.length) })
+                        : selfCheck.overall === 'medium'
+                          ? tf('settings.selfcheck.overallMedium', { n: String(selfCheck.findings.length) })
+                          : t('settings.selfcheck.overallOk')}
+                      {selfCheckStale ? ' ' + t('settings.selfcheck.stale') : ''}
+                    </div>
+                    <ul className="space-y-2">
+                      {selfCheck.findings.map((f) => (
+                        <li key={f.id} className="rounded-lg border bg-muted/20 p-2">
+                          <div className="flex items-start gap-2">
+                            <span className={
+                              f.severity === 'high' ? 'mt-0.5 shrink-0 rounded bg-destructive/15 px-1.5 py-0.5 text-[10px] font-semibold text-destructive'
+                                : f.severity === 'medium' ? 'mt-0.5 shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700'
+                                  : 'mt-0.5 shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-muted-foreground'
+                            }>
+                              {f.severity === 'high' ? t('settings.selfcheck.sevHigh')
+                                : f.severity === 'medium' ? t('settings.selfcheck.sevMedium')
+                                  : t('settings.selfcheck.sevLow')}
+                            </span>
+                            <div className="min-w-0 flex-1 space-y-1">
+                              <div className="text-xs font-medium">
+                                {f.title}
+                                {f.verified === false && (
+                                  <span className="ml-1 text-[10px] text-muted-foreground">({t('settings.selfcheck.unverified')})</span>
+                                )}
+                              </div>
+                              <div className="font-mono text-[11px] text-muted-foreground">{f.evidence}</div>
+                              <div className="text-[11px]">
+                                <span className="text-muted-foreground">{t('settings.selfcheck.action')}：</span>{f.action}
+                              </div>
+                            </div>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                    {selfCheck.ok_items && selfCheck.ok_items.length > 0 && (
+                      <div className="text-[11px] text-muted-foreground">
+                        {t('settings.selfcheck.okTitle')}：{selfCheck.ok_items.map((o) => o.note).join(' / ')}
+                      </div>
+                    )}
+                    {selfCheck.input_errors && selfCheck.input_errors.length > 0 && (
+                      <div className="text-[11px] text-amber-700">
+                        {t('settings.selfcheck.inputErrors')}：{selfCheck.input_errors.map((e) => e.error).join('；').slice(0, 300)}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
             </CardContent>
           </Card>
 

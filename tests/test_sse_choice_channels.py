@@ -328,6 +328,7 @@ class SseBufCapTests(unittest.TestCase):
             for offset in range(0, len(blob), 64):
                 out.append(stream(blob[offset:offset + 64]))
             out.append(stream(b""))
+            tr.aux_drain()
         joined = b"".join(b or b"" for b in out).decode("utf-8", "replace")
         # 强制还原路径不能丢失占位符：所有 token 都必须被还原成原值
         self.assertEqual(joined.count("Bob Builder"), 60, joined[:300])
@@ -345,6 +346,7 @@ class SseBufCapTests(unittest.TestCase):
             for _ in range(200):
                 stream(b"x" * 1024)
             stream(b"")  # 触发收尾
+        tr.aux_drain()  # 收尾已投递 aux 池：等它落库再断言（否则后面重建同 sid 会话会被延后 drop 撞上）
         # 收尾后通过新流验证还原逻辑正常
         tr._new_session(self.sid)
         token = "{{NAME_bcdfgh}}"

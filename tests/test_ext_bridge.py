@@ -1670,41 +1670,59 @@ if __name__ == "__main__":
 
 
 class ExtLockCoverageTests(unittest.TestCase):
-    """机械守住「panel 侧碰 transparent 共享态必须持 _EXT_LOCK」。
+    """机械守住 `_EXT_LOCK` 的**新**契约（B-6 收窄后）。
 
-    原来靠人工逐个线程核（`_watchdog` / `_do` / `_audit_scan_worker` / Flask 线程都有
-    碰 `tr.*` 的可能），漏一个就是并发改 transparent 的全局表 —— 而脱敏搬进专职线程
-    后，这类并发才真正会出现（后缀撞车 / 半填充词表 / 遍历时 dict 变长）。
+    历史：原先的契约是「panel 侧碰 transparent 共享态的调用必须持 `_EXT_LOCK`」，
+    于是 `tr.mask_body` / `mask_ooxml_bytes` / `restore_stream_chunk` 这些**重活**
+    全在锁内跑。扩展是多标签页并发的，锁内跑一次带 NER 的脱敏（可上百毫秒）等于
+    把所有页签串成一条队列 —— 用户视角就是「开了扩展之后越用越卡」。
 
-    改成扫 `panel.py` 的 AST：所有会碰共享可变态的 `tr.<name>` 访问必须落在某个
-    `with _EXT_LOCK:` 块内；新增裸调用会让本用例直接变红。
+    B-6 把契约改成**双向**的（依赖 B-1a：transparent 的全局表由自己的 `_STATE_LOCK`
+    负责，不再是"靠外部那把大锁顺手保护"）：
+      · 必须持锁：`_EXT_STATS` 的读改写、会话 `inflight` 字段、节流 sweep；
+      · 必须不持锁：重活调用（否则又退化成全局串行）。
+
+    为什么用静态检查而不是并发用例：并发用例只能证明「这次没撞上」，而这类回归的
+    形态是「后来者顺手把重活包回锁里」—— 只有扫源码才拦得住。
     """
 
-    # 会读或改 transparent 共享可变态的入口。新增此类入口时一并加进来。
-    # 故意**不含** `_emit` / `_emit_skip`：它们只 `enqueue_event()`，进的是事件库
-    # （自带队列与批量写线程的并发设计），不属 `_STATE_LOCK` 领地 —— 而且不该在
-    # 持状态锁时写库。
-    STATE_TOUCHING = {
-        "mask", "mask_body", "restore", "restore_stream_chunk",
-        "_maybe_reload", "_sweep", "_new_session", "_touch", "_mask_event_items",
-        "_take_orphans_without_session", "_prune_recent", "_recall_token",
-        "_sync_custom_word_mappings", "_drop",
-        "sessions", "_RECENT_REV", "_CUSTOM_WORD_REV", "_CUSTOM_WORD_FWD",
-        "_RECENT_FWD", "_RECENT_SUFFIX",
-    }
-    # 豁免：这些访问在「只在锁内被调用」的 helper 里，AST 看不到调用链。
-    # 豁免不是白名单豁免 —— 下面第二个用例会校验这些 helper 的**所有调用点**确实在锁内。
-    ALLOWED_OUTSIDE = {
-        ("_sweep_throttled", "_sweep"),
-        ("_convert_and_mask_legacy_office", "mask_body"),
-        ("mask_ooxml_bytes", "mask_body"),
-    }
+    # 重活：耗时随字节/推理量增长，绝不能在 `_EXT_LOCK` 内跑
+    HEAVY = {"mask", "mask_body", "restore", "restore_stream_chunk"}
+    HEAVY_HELPERS = {"mask_ooxml_bytes", "_convert_and_mask_legacy_office"}
+    # 禁止在 `_EXT_LOCK` 临界区内碰 panel 配置锁（cfg_lock）：反向获取即经典死锁
+    CFG_LOCK_FUNCS = {"load_config", "save_config", "_sync_runtime_config"}
+    # 豁免名单：这些调用写在"只在锁内被调用"的 helper 里，词法上看不出调用链。
+    # ⚠️ 豁免不是白名单豁免 —— 下面 test_exempted_helpers_are_only_called_locked
+    # 会校验这些 helper 的**所有调用点**确实在锁内，否则豁免本身就是个洞。
+    ALLOWED_OUTSIDE = {("_sweep_throttled", "_sweep")}
 
-    def _analyze(self):
-        """返回 (tr 属性访问, 普通函数调用) 两张表，各带「是否在 _EXT_LOCK 内 / 所在函数」。"""
+    # `transparent` 的别名：`import transparent as t` / `tr = transparent` 之后
+    # 属性访问写在别的名字上。原实现只认 Name("tr")，别名一换守卫就瞎了
+    # （外部审计指出的词法绕过面），这里按"实际导入绑定"收集。
+    def _transparent_aliases(self, tree):
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    if a.name == "transparent":
+                        names.add(a.asname or "transparent")
+            elif isinstance(node, ast.ImportFrom) and node.module == "transparent":
+                for a in node.names:
+                    names.add(a.asname or a.name)
+        names.add("tr")          # 习惯用法：函数内 `import transparent as tr`
+        return names
+
+    def _walk(self):
+        """遍历 panel.py 的 AST，收集带「是否在 _EXT_LOCK 内」标记的访问/调用/赋值。"""
         path = Path(__file__).resolve().parents[1] / "engine" / "panel.py"
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        attrs, calls = [], []
+        tr_aliases = self._transparent_aliases(tree)
+        attrs, calls, assigns = [], [], []
+
+        def base_name(node):
+            while isinstance(node, ast.Subscript):
+                node = node.value
+            return node
 
         def walk(node, locked, func):
             for child in ast.iter_child_nodes(node):
@@ -1715,36 +1733,100 @@ class ExtLockCoverageTests(unittest.TestCase):
                         ast.unparse(item.context_expr) == "_EXT_LOCK" for item in child.items):
                     l2 = True
                 if (isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name)
-                        and child.value.id == "tr"):
+                        and child.value.id in tr_aliases):
                     attrs.append((child.attr, locked, func, child.lineno))
-                if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
-                    calls.append((child.func.id, locked, func, child.lineno))
+                # 调用名同时收 `f(...)` 与 `obj.f(...)` 两种形态：
+                # 只认 Name 形态时，`panel.load_config()` 这种写法对 cfg-lock 禁令是隐形的。
+                if isinstance(child, ast.Call):
+                    fn = child.func
+                    if isinstance(fn, ast.Name):
+                        calls.append((fn.id, locked, func, child.lineno))
+                    elif isinstance(fn, ast.Attribute):
+                        calls.append((fn.attr, locked, func, child.lineno))
+                if isinstance(child, (ast.Assign, ast.AugAssign)):
+                    targets = child.targets if isinstance(child, ast.Assign) else [child.target]
+                    for t in targets:
+                        if isinstance(t, ast.Subscript):
+                            key = t.slice.value if isinstance(t.slice, ast.Constant) else None
+                            assigns.append((ast.unparse(base_name(t)), key, locked, func, child.lineno))
                 walk(child, l2, f2)
 
         walk(tree, False, "<module>")
-        return attrs, calls
+        return attrs, calls, assigns
 
-    def test_state_touching_calls_are_under_ext_lock(self):
-        attrs, _ = self._analyze()
-        bad = [
-            "line %d: tr.%s in %s()" % (ln, attr, func)
-            for attr, locked, func, ln in attrs
-            if attr in self.STATE_TOUCHING and not locked
-            and (func, attr) not in self.ALLOWED_OUTSIDE
-        ]
-        self.assertEqual(bad, [], "panel 侧碰 transparent 共享态的调用必须持 _EXT_LOCK：\n" + "\n".join(bad))
+    def test_heavy_work_is_never_inside_ext_lock(self):
+        """B-6 的核心：重活必须在锁外 —— 这正是本次收窄的唯一目的，必须有守卫。"""
+        attrs, calls, _ = self._walk()
+        bad = ["line %d: tr.%s 在 _EXT_LOCK 内（%s）" % (ln, a, func)
+               for a, locked, func, ln in attrs if a in self.HEAVY and locked]
+        bad += ["line %d: %s() 在 _EXT_LOCK 内（%s）" % (ln, n, func)
+                for n, locked, func, ln in calls if n in self.HEAVY_HELPERS and locked]
+        self.assertEqual(bad, [], "重活又回到 _EXT_LOCK 内，扩展请求会被串行化（B-6 回归）：\n" + "\n".join(bad))
 
-    def test_exempted_helpers_are_only_called_under_lock(self):
-        """豁免的 helper 必须真的只在锁内被调 —— 否则豁免本身就是个洞。
+    def test_ext_stats_updates_are_inside_lock(self):
+        """`+=` 是读改写三步，必须在锁内（否则计数丢更新，popup 的今日累计会飘）。"""
+        _, _, assigns = self._walk()
+        bad = ["line %d: %s[%s] = ... 在锁外（%s）" % (ln, n, k, func)
+               for n, k, locked, func, ln in assigns
+               if n == "_EXT_STATS" and not locked]
+        self.assertEqual(bad, [], "_EXT_STATS 的更新必须在 _EXT_LOCK 内：\n" + "\n".join(bad))
 
-        豁免可传递：`mask_ooxml_bytes` 是锁内专用，它内部再调
-        `_convert_and_mask_legacy_office` 同样只在锁内路径上（两者都在豁免名单里）。
+    def test_inflight_flag_writes_are_inside_lock(self):
+        """inflight 与 `_sweep` 的 TTL 回收互斥：写在锁外会出现「刚标记就被回收」。
+
+        那会表现为长生成过程中响应回来已查不到会话 → 占位符直接漏到页面上。
         """
-        _, calls = self._analyze()
-        helpers = {func for func, _ in self.ALLOWED_OUTSIDE}
-        bad = [
-            "line %d: %s() 在锁外被调用（%s）" % (ln, name, func)
-            for name, locked, func, ln in calls
-            if name in helpers and not locked and func not in helpers
-        ]
-        self.assertEqual(bad, [], "锁内专用 helper 被锁外调用：\n" + "\n".join(bad))
+        _, _, assigns = self._walk()
+        bad = ["line %d: %s[inflight] = ... 在锁外（%s）" % (ln, n, func)
+               for n, k, locked, func, ln in assigns
+               if k == "inflight" and not locked]
+        self.assertEqual(bad, [], "会话 inflight 标记必须在 _EXT_LOCK 内写：\n" + "\n".join(bad))
+
+    def test_hot_path_touches_session_inside_lock(self):
+        """`tr._touch` 必须在锁内：它是「这个会话还活着」的唯一刷新点。
+
+        还原路径每 chunk 调一次 `restore_stream_chunk`，锁外跑的前提是 ts 已在锁内
+        刷新过；把 `_touch` 也搬到锁外，就出现「ts 刷新与 TTL 回收赛跑」。
+        """
+        attrs, _, _ = self._walk()
+        bad = ["line %d: tr._touch 在锁外（%s）" % (ln, func)
+               for a, locked, func, ln in attrs if a == "_touch" and not locked]
+        self.assertEqual(bad, [], "tr._touch 必须在 _EXT_LOCK 内：\n" + "\n".join(bad))
+
+    def test_sessions_insert_delete_inside_lock(self):
+        """`_sweep` 与 `_new_session` 必须持锁：它们与面板侧会话插入是互斥关系。
+
+        `tr._touch` 已有同名守卫（hot_path_touches_session_inside_lock），但它只覆盖
+        "刷新"，不覆盖"插/删" —— 而 panel 侧约定用 `_EXT_LOCK` 串行化 `sessions` 的
+        增删（transparent 自己的 `_STATE_LOCK` 契约里，dict 插删靠 GIL，面板侧靠这把锁）。
+        新增会话的路径漏了锁，就会与 `_sweep` 的遍历抢同一个 dict。
+        """
+        attrs, _, _ = self._walk()
+        bad = ["line %d: tr.%s 在锁外（%s）" % (ln, a, func)
+               for a, locked, func, ln in attrs
+               if a in ("_sweep", "_new_session") and not locked
+               and (func, a) not in self.ALLOWED_OUTSIDE]
+        self.assertEqual(bad, [], "会话增删必须在 _EXT_LOCK 内：" + chr(10) + chr(10).join(bad))
+
+    def test_exempted_helpers_are_only_called_locked(self):
+        """豁免的 helper 必须**真的**只在锁内被调 —— 否则豁免就是一条后门。
+
+        这条是"豁免机制"的另一半：上面放行了 helper 内部的 `tr._sweep`，
+        这里保证没人从锁外调那个 helper（否则等于从锁外改 sessions）。
+        """
+        _, calls, _ = self._walk()
+        helpers = {name for name, _ in self.ALLOWED_OUTSIDE}
+        bad = ["line %d: %s() 在锁外被调用（%s）" % (ln, name, func)
+               for name, locked, func, ln in calls
+               if name in helpers and not locked and func not in helpers]
+        self.assertEqual(bad, [], "锁内专用 helper 被锁外调用：" + chr(10) + chr(10).join(bad))
+
+    def test_no_config_lock_inside_ext_lock(self):
+        """`_EXT_LOCK → cfg_lock` 是死锁禁令（见 panel.py 的锁序注释）。
+
+        静态守住比等死锁复现便宜得多：死锁只在特定时序下出现，事后几乎无法归因。
+        """
+        _, calls, _ = self._walk()
+        bad = ["line %d: %s() 在 _EXT_LOCK 内（%s）" % (ln, n, func)
+               for n, locked, func, ln in calls if n in self.CFG_LOCK_FUNCS and locked]
+        self.assertEqual(bad, [], "锁序违规（_EXT_LOCK → cfg_lock）：\n" + "\n".join(bad))

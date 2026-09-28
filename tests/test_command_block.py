@@ -7,6 +7,7 @@
 3. **删除不复活**——`patterns` 键缺失才灌内置种子，键存在（哪怕是 `[]`）一律尊重；
 4. **回声抑制 > 白名单 > 黑名单**——请求里已出现的命令既不记录也不改写。
 """
+import asyncio
 import json
 import os
 import sys
@@ -327,7 +328,7 @@ class BlockTests(CommandBlockTestBase):
         with mock.patch.object(tr, "is_target", lambda h, p: True), \
              mock.patch.object(tr, "_audit_response", lambda *a, **k: None), \
              mock.patch.object(tr, "_scan_response", lambda *a, **k: None):
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
         self.assertEqual(flow.response.status_code, 503)
         payload = json.loads(flow.response.content.decode("utf-8"))
         self.assertEqual(payload["error"]["code"], "shield_command_blocked")

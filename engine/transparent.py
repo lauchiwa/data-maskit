@@ -16,6 +16,7 @@ mitmproxy 本地显式代理 - 只拦目标站点聊天接口，脱敏请求 + �
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
 import asyncio
 import codecs
+import collections
 import concurrent.futures
 import threading
 import contextlib
@@ -24,6 +25,7 @@ import ipaddress
 import json
 import logging
 import os
+import random
 import re
 import time
 import secrets
@@ -394,6 +396,327 @@ AUDIT_FAIL_CLOSED = False
 # 「高风险操作时间线」会是空壳）。**只改成落库、不改档位**：severity 仍 LOW，
 # 因此首页/统计页的告警数（只数 HIGH/CRITICAL）不受影响。
 AUDIT_ALWAYS_RECORD = frozenset({"dangerous_action"})
+# 审计自身的异常只警告一次：既让"审计坏了"可见，又不至于每个响应刷一行日志。
+_AUDIT_WARNED = set()
+
+
+def _audit_warn_once(key, msg):
+    if key in _AUDIT_WARNED:
+        return
+    _AUDIT_WARNED.add(key)
+    _log(f"[audit] {msg}")
+
+# ---- A-1：审计扫描窗口 / 体积闸 / 时间预算（0.6.0，可用环境变量覆盖）----
+# 为什么**不**直接改 `_SCAN_BODY_MAX`：那个常量同时喂给请求侧命令拦截窗口
+# （`_cmd_find` 的 `cmd_req_window`，见本文件 :3779 与 :5894），动它等于缩小
+# 「危险命令拦截」的可见范围——安全判据不许被性能优化顺手削弱（设计文档 §3.2）。
+# 所以审计单独一个常数，两者互不影响。
+AUDIT_SCAN_MAX = 128 * 1024
+# 结构化解析（`_parse_response_payload` / 请求体 json.loads）的体积闸：
+# 实测 512KB ≈ 0.7ms（scripts/bench_mask.py），成本远低于正则扫描，但 32MB
+# 畸形体会变成几十毫秒 + 大对象分配，故设 2MB 上限并留痕。
+AUDIT_PARSE_MAX = 2 * 1024 * 1024
+# 单次响应审计的墙钟预算：只能在**步骤之间**检查（单个正则调用不可中断），
+# 因此最坏情况是「一步的过冲」。默认 250ms 远高于实测值（128KB 三段扫描
+# p50 ≈ 20ms），它兜的是正则灾难性回溯这类病态回归。
+AUDIT_TIME_BUDGET_S = 0.25
+
+
+def _env_int(name, default):
+    """读一个整数环境变量；非法值回落默认（不抛异常、不刷屏）。"""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name, default):
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+# 环境变量兜底（容器场景无法开面板时用）；config.json 里的值优先于它们。
+_ENV_AUDIT_SCAN_MAX = _env_int("MASKIT_AUDIT_SCAN_MAX", AUDIT_SCAN_MAX)
+_ENV_AUDIT_PARSE_MAX = _env_int("MASKIT_AUDIT_PARSE_MAX", AUDIT_PARSE_MAX)
+_ENV_AUDIT_TIME_BUDGET = _env_float("MASKIT_AUDIT_TIME_BUDGET_MS", AUDIT_TIME_BUDGET_S * 1000.0) / 1000.0
+
+
+def _env_float(name, default):
+    """读浮点环境变量；非法值回落默认。"""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
+def _clamp_int(value, default, lo, hi):
+    """整数取值 + 范围钳制：非法值回落默认（配置写坏了不能让引擎起不来）。"""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return int(default)
+    return max(int(lo), min(int(hi), n))
+
+
+def _clamp_float(value, default, lo, hi):
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return max(float(lo), min(float(hi), n))
+# A-2：同 body 的扫描结果复用。key 必须含 status 与 req_hash：
+#   · S1 error_leak 只在 status>=400 时跑；
+#   · S6/S9 有「请求里本来就有 → 不算上游注入」的回声抑制；
+#   · S2 identity_swap 拿请求 model 当基准真相。
+# 只用 response_hash 会把这些请求侧差异串味成错误结论。
+_AUDIT_FINDINGS_CACHE = collections.OrderedDict()
+_AUDIT_CACHE_TTL_S = 30.0
+_AUDIT_CACHE_MAX = 256
+_AUDIT_CACHE_LOCK = threading.Lock()
+# 运行时指标（C-1 的 /api/engine/metrics 从这里取数；只统计、不影响判定）
+_AUDIT_RUNTIME = {
+    "count": 0, "truncated": 0, "parse_skipped": 0,
+    "cache_hit": 0, "cache_miss": 0, "cache_store": 0,
+    # ⚠️ 必须**预置**：这个键由 aux 线程在跑审计时插入，而读侧
+    # `audit_runtime_stats()` 跑在 mask 池线程上做 Python 层 `.items()` 遍历 ——
+    # 首次插入会改变 dict 大小 → 读侧 RuntimeError → 被 write_runtime_metrics 吞掉
+    # （表现为"指标文件偶发不更新"，属静默丢数据）。预置 + 下面那把锁一起解决。
+    "cache_disabled": 0,
+    "total_ms": 0.0, "samples_ms": collections.deque(maxlen=200),
+}
+# 审计运行时计数器的读写锁：计数由 2 个 aux 线程 `+=`，快照由 mask 池线程读。
+# 叶子锁（只护 dict/deque 操作，不嵌套任何其他锁），不影响既有锁序。
+_AUDIT_STATS_LOCK = threading.Lock()
+
+
+# 缓存指纹：findings 是「body + 状态码 + 请求体 + **信号开关**」的函数。
+# 少了最后一项就会在用户刚关掉某个信号后，仍把 30s 内旧配置的结论端上来
+# （实测：测试里改开关后立刻读缓存，返回的是上一个开关组合的结果）。
+# `_maybe_reload` 每次都是整表换对象（不是就地改），所以拿对象 id 就能
+# 精确判断"配置换代了"，不必每次深比较。
+#
+# ⚠️ 指纹**刻意不包含扫描函数的 id()**：想过用它来"实现换了就失效"，但
+# `id()` 会被回收复用——临时函数（单测桩、热补丁 lambda）释放后下一个对象
+# 可能拿到同一地址，键看起来没变、结论却是上一个实现的（实测被这个坑咬过一次）。
+# 这里依赖的是**扫描器纯函数**这条不变式：findings 只由 (扫描文本, 开关, 上限)
+# 决定。谁要往扫描器里塞会话态/随机态，就得连带改这个键。
+_AUDIT_CFG_FP = [None, None]
+# 指纹是"检查-写两格"的读改写：审计跑在 aux 池（多线程）上，两个线程同时进来
+# 可能把 [0] 与 [1] 交叉写成"新签名 + 旧指纹"。后果不是崩溃，而是**键错配**
+# （按 A 配置的指纹命中 B 配置的结论），属静默错误，所以加锁。
+_AUDIT_CFG_FP_LOCK = threading.Lock()
+
+
+def _audit_config_fingerprint():
+    sig = AUDIT_SIGNALS
+    with _AUDIT_CFG_FP_LOCK:
+        if _AUDIT_CFG_FP[0] is not sig:
+            _AUDIT_CFG_FP[0] = sig
+            _AUDIT_CFG_FP[1] = (
+                tuple(sorted(k for k, v in (sig or {}).items() if v)),
+                int(AUDIT_SCAN_MAX), int(AUDIT_PARSE_MAX),
+            )
+        return _AUDIT_CFG_FP[1]
+
+
+def _audit_cache_get(key):
+    """取缓存的扫描结果（返回副本的副本语义由调用方保证：列表浅拷贝即可，
+    findings 元素本身不被就地改写）。过期条目顺手清掉。"""
+    now = time.time()
+    with _AUDIT_CACHE_LOCK:
+        rec = _AUDIT_FINDINGS_CACHE.get(key)
+        if not rec:
+            return None
+        ts, findings = rec
+        if now - ts > _AUDIT_CACHE_TTL_S:
+            _AUDIT_FINDINGS_CACHE.pop(key, None)
+            return None
+        _AUDIT_FINDINGS_CACHE.move_to_end(key)
+        return list(findings)
+
+
+def _audit_cache_put(key, findings):
+    with _AUDIT_CACHE_LOCK:
+        _AUDIT_FINDINGS_CACHE[key] = (time.time(), list(findings))
+        _AUDIT_FINDINGS_CACHE.move_to_end(key)
+        while len(_AUDIT_FINDINGS_CACHE) > _AUDIT_CACHE_MAX:
+            _AUDIT_FINDINGS_CACHE.popitem(last=False)
+
+
+def audit_runtime_stats():
+    """审计运行时指标快照（只读；供面板 /api/engine/metrics 使用）。"""
+    with _AUDIT_CACHE_LOCK:
+        cache_size = len(_AUDIT_FINDINGS_CACHE)
+    with _AUDIT_STATS_LOCK:
+        samples = list(_AUDIT_RUNTIME["samples_ms"])
+    p50 = p95 = 0.0
+    if samples:
+        ordered = sorted(samples)
+        p50 = ordered[len(ordered) // 2]
+        p95 = ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]
+    with _AUDIT_STATS_LOCK:
+        out = {k: v for k, v in _AUDIT_RUNTIME.items() if k != "samples_ms"}
+    out.update({
+        "p50_ms": round(p50, 2),
+        "p95_ms": round(p95, 2),
+        "last_ms": round(samples[-1], 2) if samples else 0.0,
+        "cache_size": cache_size,
+        "scan_max": AUDIT_SCAN_MAX,
+        "parse_max": AUDIT_PARSE_MAX,
+        "time_budget_s": AUDIT_TIME_BUDGET_S,
+    })
+    return out
+
+
+def _audit_record_timing(t_start, stats):
+    """把一次审计的耗时与截断情况记进运行时指标（永不影响流量）。"""
+    try:
+        ms = (time.perf_counter() - t_start) * 1000
+        # 计数是读改写：两个 aux 线程并发时会丢更新（用户看到的"审计被削过几次"
+        # 因此偏小）。整段放进锁里 —— 只护内存自增，纳秒级，不构成竞争点。
+        with _AUDIT_STATS_LOCK:
+            _AUDIT_RUNTIME["count"] += 1
+            _AUDIT_RUNTIME["total_ms"] += ms
+            _AUDIT_RUNTIME["samples_ms"].append(ms)
+            stats["ms"] = ms
+            if stats.get("truncated"):
+                _AUDIT_RUNTIME["truncated"] += 1
+            if stats.get("parse_skipped"):
+                _AUDIT_RUNTIME["parse_skipped"] += 1
+            if stats.get("cache_hit"):
+                _AUDIT_RUNTIME["cache_hit"] += 1
+            else:
+                _AUDIT_RUNTIME["cache_miss"] += 1
+    except Exception:
+        pass
+
+
+def _audit_mark(stats, stage):
+    """标记本次审计被预算截断，并记下截断发生在哪一段（排障要看得见）。"""
+    stats["truncated"] = True
+    stats.setdefault("truncated_at", stage)
+
+
+def _audit_scan_signals(flow, status_code, ct, scan_text, scan_req_text, body_text,
+                        hdrs_text, deadline, stats, body_oversize=False):
+    """跑 S1/S6/S9/S2/S4/S7 扫描（A-1：每段之间检查时间预算，超限即截断留痕）。
+
+    **只做 body 派生的判定**：会话作用域的合并（S9 槽位级命中、回声抑制）留在
+    调用方，这样 A-2 的缓存不会把 A 会话的命令证据串到 B 会话（见 §4.2）。
+    """
+    findings = []
+
+    if time.perf_counter() >= deadline:
+        _audit_mark(stats, "before_scan")
+        return findings
+
+    # S1 error_leak（被动+主动）
+    if AUDIT_SIGNALS.get("error_leak") and status_code >= 400:
+        # 上游域名检测已移除（2026-08-18）：错误页出现用户**已配置**的上游地址
+        # 是诊断信息而不是面向客户端的信息泄露，改由普通 ERR/状态日志排障；
+        # 留在这里只会把审计中心刷成上游错误页的噪音场。
+        findings.extend(_audit.scan_error_leak(status_code, scan_text, hdrs_text))
+
+    if time.perf_counter() >= deadline:
+        _audit_mark(stats, "after_s1")
+        return findings
+
+    # S6 response_poison（被动+主动，200/4xx 都扫）
+    if AUDIT_SIGNALS.get("response_poison") and scan_text:
+        findings.extend(_audit.scan_response_poison(scan_text, scan_req_text))
+
+    # S9 dangerous_action：模型下发的破坏性命令（rm -rf / / DROP DATABASE / 强推…）
+    # 必须扫**还原后**的文本：占位符状态下路径和主机名都是假的，判不准也没意义。
+    # 只告警不阻断——设计取舍见 audit_signals.scan_dangerous_action 的注释。
+    if AUDIT_SIGNALS.get("dangerous_action") and scan_text:
+        findings.extend(_audit.scan_dangerous_action(scan_text, scan_req_text))
+
+    if time.perf_counter() >= deadline:
+        _audit_mark(stats, "after_scan")
+        return findings
+
+    # S2 identity_swap + S4 sse_anomaly：需解析 body
+    if body_text and ("json" in ct or "event-stream" in ct):
+        # 单次解析产出 (text_chunks, model_field, events) — 避免三重解析
+        # A-1：结构化解析吃**全量** body，给它一个体积闸。超限则跳过并留痕
+        # （identity_swap 需要 model_field、sse_anomaly 需要 events，两者随之停摆；
+        #  这是刻意取舍：宁可少一项被动检测，也不让 32MB 畸形体吃满事件循环）。
+        text_chunks, model_field, events = ((), "", ())
+        # `body_oversize`：调用方已按体积闸只解了前缀，此时"文本很短"是**假象**，
+        # 不能因此就去做结构化解析（会解析一份截断的 JSON）——判定口径与
+        # "文本超 AUDIT_PARSE_MAX"完全一致。
+        if not body_oversize and len(body_text) <= AUDIT_PARSE_MAX:
+            text_chunks, model_field, events = _parse_response_payload(body_text, ct)
+        else:
+            stats["parse_skipped"] = True
+        if AUDIT_SIGNALS.get("identity_swap"):
+            # 对比式检测（借鉴 LiteLLM requested_model vs response_model）：
+            # 请求 model 是基准真相，响应 model 与之对比，不一致才是换芯——
+            # 零知识库、零硬编码，模型迭代/新厂商自动适配。
+            # A-1：优先复用请求阶段已解析出的 model（`request` 钩子里写进
+            # `flow.metadata["shield_model"]`），省掉一次全量 json.loads；
+            # 只有在 metadata 缺失、且请求体不超体积闸时才回退解析。
+            req_model = str(flow.metadata.get("shield_model") or "")
+            if not req_model:
+                _raw_req = getattr(flow.request, "content", None) or b""
+                if len(_raw_req) <= AUDIT_PARSE_MAX:
+                    try:
+                        req_model = _extract_model(json.loads(_raw_req))
+                    except Exception:
+                        pass
+                else:
+                    stats["parse_skipped"] = True
+            # ⚠️ 必须**只调一次**，不能放在 `for chunk in text_chunks` 里（审计 B4）。
+            # `scan_identity_swap` 的判据只有 `model_field` + `req_model`，第一个
+            # 参数（文本）完全不参与判定（见 audit_signals.scan_identity_swap）。
+            # 放进循环的后果是：tool_use-only / reasoning-only / 空文本响应
+            # （Anthropic 非流式 tool_use、流式 delta.partial_json、OpenAI
+            # content:null 拒答）的 `text_chunks` 为空 → 整段跳过 → 换芯检测
+            # 在编程助手最主流的响应形态上完全失效，而 `model_field` 明明已解析出来。
+            # 传第一个非空 chunk 只是为了将来若该参数被启用时仍有上下文。
+            findings.extend(_audit.scan_identity_swap(
+                text_chunks[0] if text_chunks else "", model_field, req_model))
+        # S4 sse_anomaly（仅 SSE）
+        if AUDIT_SIGNALS.get("sse_anomaly") and "event-stream" in ct:
+            findings.extend(_audit.scan_sse_anomaly(events))
+
+    if time.perf_counter() >= deadline:
+        _audit_mark(stats, "after_parse")
+        return findings
+
+    # S7 cross_request_pollution：仅主动探针模式。
+    # 当前请求自身携带的 nonce（current）不算「前序」；只有**没有携带任何
+    # nonce 的独立请求**响应里出现前序 nonce，才证明 relay 跨请求存了数据。
+    # S5「当前请求回显」已于 2026-08-18 移除：nonce 经 X-Shield-Canaries 头
+    # 注入且转发前被剥离，模型本看不到它；若探针还要求模型回显，正常模型
+    # 也会回显，不能证明泄漏。
+    if AUDIT_ACTIVE_PROBES and body_text:
+        # A-1：跨请求污染扫描同样按体积闸截断（主动探针默认关，影响面更小）
+        if body_oversize or len(body_text) > AUDIT_PARSE_MAX:
+            stats["parse_skipped"] = True
+        else:
+            current = set(flow.metadata.get("audit_canaries") or set())
+            # registry 是 dict {nonce: ts}，取 key 集合做 prior
+            prior = set(_AUDIT_CANARY_REGISTRY.keys()) - current
+            if AUDIT_SIGNALS.get("cross_request_pollution") and prior:
+                findings.extend(_audit.scan_cross_request_pollution(body_text, prior))
+
+    # S3 tool_call_rewrite：仅主动探针模式，由 audit_engine 直接判定（需 expected 对照）
+    # 此处被动模式跳过（无法区分正常 tool_call 与被改写的）
+    return findings
+
+
 # ========== 命令拦截（config.command_block）运行时状态 ==========
 # 结构：{"mode": "observe"|"rewrite"|"block", "channels": set, "patterns": [(id,label,rx)],
 #        "allow": [rx], "disabled": set(id)}
@@ -544,8 +867,20 @@ def _new_session(sid, source=None):
     }
 
 
-def _drop(sid):
+def _drop(sid, expect=None):
+    """丢弃会话。
+
+    `expect` 给定时**只在当前会话仍是同一个对象时才丢**。必要性来自延迟调用方：
+    aux 池里的流式收尾（`_stream_finish_offload`）投递即返回，等它跑 `_drop` 时，
+    同一个 sid 上可能已经有**新会话**了（同一 sid 的连续两次流，测试与生产都可能），
+    无条件 pop 会把新会话连同 rev 表一起抹掉 —— 表现为"占位符还原不回来"，
+    且成败取决于 GIL 调度（实测同一用例连跑时随机红/绿）。
+    返回 True 表示确实丢了。
+    """
+    if expect is not None and sessions.get(sid) is not expect:
+        return False
     sessions.pop(sid, None)
+    return True
 
 
 def _luhn_ok(num: str) -> bool:
@@ -917,6 +1252,11 @@ def _overlaps_exempt_conn(start: int, end: int, spans) -> bool:
 
 _prefix_rx_cache = None
 _prefix_rx_key = None
+# 记忆化是"检查-写两格"：`key == old_key` 与两个 global 的写入不是原子的。
+# 多线程可达（脱敏池 1~4 + aux 池 2，`_scan_response` 也会调本函数），交叉写会得到
+# "新键 + 旧正则" 或反过来的错配 —— 最坏后果是**用上一次的前缀配置扫凭据**
+# （API-key 掩码是安全路径，静默错配不可接受）。与我已修的 `_AUDIT_CFG_FP_LOCK` 同类。
+_prefix_rx_lock = threading.Lock()
 
 
 def _ip_public_ok(orig: str) -> bool:
@@ -997,6 +1337,16 @@ def _prefix_secret_regex():
     key = tuple(SECRET_PREFIXES)
     if key == _prefix_rx_key and _prefix_rx_cache is not None:
         return _prefix_rx_cache
+    with _prefix_rx_lock:
+        # 双检：并发首次调用只编译一次，且键与值成对写
+        if key == _prefix_rx_key and _prefix_rx_cache is not None:
+            return _prefix_rx_cache
+        return _prefix_secret_regex_locked(key)
+
+
+def _prefix_secret_regex_locked(key):
+    """编译前缀正则（调用方持 `_prefix_rx_lock`）。"""
+    global _prefix_rx_cache, _prefix_rx_key
     # - / _ 视为等价（审计规则专项 P2）：用户配 sk- 不会漏掉 sk_live_，配 ghp_ 也兼容 ghp-。
     # 把前缀中的 - 和 _ 都展开成 [-_] 字符类。逐字符安全转义，防二次替换嵌套。
     prefixes = ["".join("[-_]" if ch in ("-", "_") else re.escape(ch) for ch in p) for p in SECRET_PREFIXES if p]
@@ -1076,6 +1426,25 @@ def _new_token(label):
 # 读者可能看到半填充词表并把它当当前词表发布 —— 那一轮少脱敏用户自定义词，明文出网。
 #
 # 锁序（**必须遵守**）：`panel._EXT_LOCK` → 本文件的 `_SYNC_LOCK` → `_STATE_LOCK`。
+
+# ── B-1a：`sessions[sid]` 的并发契约（0.6.0 定稿）────────────────────────────
+# 背景（必须写清楚，否则下一个人会照抄过时注释）：`sessions` 及会话内的字段
+# **不是**"已经由 _STATE_LOCK 保护好了"的——`_STATE_LOCK` 原本只护
+# `_RECENT_*` / `_CUSTOM_WORD_*` 的签发与清理。0.6.0 之前，代理链路恰好只有
+# 一个脱敏线程（`_MASK_POOL(max_workers=1)`），会话态才"事实上"没出问题；
+# 放开并发宽度 + 把还原搬进 `_AUX_POOL` 之后，同一个 `sessions[sid]` 会同时被
+# N 个 worker、aux 池与事件循环读写。因此逐字段定下契约：
+#
+#   ① 只读 / 单次赋值（ts、source、model、scan_scope、upstream_name、resp_ts、
+#      stream_mode…）：并发只会读到旧值或新值，语义无害，**不加锁**。
+#   ② 计数与映射的读改写（restored / degraded / unresolved / restored_tokens /
+#      restored_origs / rev / fwd / labels）：**必须持 `_STATE_LOCK`**。
+#      少加一处的后果不是崩溃而是"数字对不上"——比崩溃更难查，所以宁可多拿锁。
+#   ③ 去重式追加（先判断再 append/add）：判断与写入是两步 → 持 `_STATE_LOCK`。
+#   ④ 字典本身的插入/删除（新会话、sweep）：靠 GIL 原子；**遍历一律 `list()` 快照**。
+#
+# `_STATE_LOCK` 是 RLock：签发路径已经在持它，这里再用不会自锁；
+# 也不引入新的锁序边（不新开锁层级）。
 # panel 侧先持 `_EXT_LOCK` 再进 transparent；本文件绝不持锁回调 panel 或做任何 I/O，
 # 因此不存在反向路径，没有死锁环。临界区必须保持微秒级：**严禁**在持锁期间做 NER
 # 推理、读写文件、发网络请求或遍历长会话。
@@ -1974,15 +2343,42 @@ _LLM_BODY_KEYS = (
 )
 
 
-def _looks_like_llm_request(flow):
-    """请求体是否像 LLM 补全请求。用于放行非白名单路径上的非 LLM 调用。"""
+_NO_BODY = object()          # 哨兵：区分"没传 body"与"解析结果就是 None/False"
+
+
+def _looks_like_llm_request(flow, body=_NO_BODY):
+    """请求体是否像 LLM 补全请求。用于放行非白名单路径上的非 LLM 调用。
+
+    `body` 传入**已解析**的请求体时跳过解析：主管线在调用本函数之前已经解析过一次
+    （`_load_json_pairs`），再解一次就是纯粹的重复开销 —— 实测 1MB 请求体
+    `json.loads` 约 1.2ms，**在事件循环上是白付的**（B-3 的真实形态：不是"解析该不该
+    下池"，而是"同一份 body 被解析了两遍"）。必须用哨兵而不是 `None` 作默认值：
+    `json.loads("null")` 的合法结果就是 None，用它表意会把"解析成功但为 null"误判成
+    "没传 body"。
+    """
     ct = flow.request.headers.get("content-type", "") or ""
     if "json" not in ct:
         return False
-    try:
-        body = json.loads(flow.request.content)
-    except Exception:
-        return True  # 声明 JSON 却解析失败，交给主管线按 fail-closed 处理
+    if body is _NO_BODY:
+        try:
+            raw = flow.request.content or b""
+        except Exception:
+            return True
+        # 超大 body 不在事件循环上解析。闸门用 `AUDIT_PARSE_MAX`（2MB）而**不是**
+        # 请求体积闸（32MB）：这条调用点在 32MB 闸门之前（未列入白名单的路径要先问
+        # "像不像 LLM 请求"），拿 32MB 当闸等于放行"2~32MB 的 JSON 在循环上解析"
+        # —— `json.loads` 在 1MB 级 JSON 上的实测约 90~95µs/KB（本机 3.13，
+        # 见 scripts/bench_mask.py 的 parse 段），30MB 约 2.8s，正是 A-1/A-3 要
+        # 消灭的冻结类。⚠️ 别拿它跟下面 29µs/KB（逐规则正则）、0.11ms/KB（三信号扫描）
+        # 比大小：三者量的是**不同**的东西（解析 vs 单规则正则 vs 三信号正则）。
+        # 返回 True 是**安全侧**默认：主管线随后按体积闸判定，非 LLM 形态在
+        # fail_closed 下同样会脱敏，不会因这里返回 True 而放行原文。
+        if len(raw) > AUDIT_PARSE_MAX:
+            return True
+        try:
+            body = json.loads(raw)
+        except Exception:
+            return True  # 声明 JSON 却解析失败，交给主管线按 fail-closed 处理
     return isinstance(body, dict) and any(k in body for k in _LLM_BODY_KEYS)
 
 
@@ -2026,17 +2422,21 @@ def _emit_skip(host, method, path, reason, content_type="", source=None, force=F
     )
 
 
-def _body_preview(raw, limit=1200):
+def _body_preview(raw, limit=1200, total_len=None):
     """请求/响应体预览（截断、去空白）。绝不包含敏感原文。
     先截断再正则：2MB body 全文空白折叠曾耗时 23ms/请求，截断后只剩 limit 字符。
-    截断前必须先存原长，否则折叠后算 len-text 会得到负数（曾显示 …(+N字) 负数）。"""
+    截断前必须先存原长，否则折叠后算 len-text 会得到负数（曾显示 …(+N字) 负数）。
+
+    `total_len`：调用方已经只给了**前缀**时，用真实总长计算 "+N字" 尾巴，
+    避免显示成"前缀长度"（否则 4MB 响应的预览会写 …(+261344字) 这种假数字）。
+    """
     if raw is None:
         return ""
     if isinstance(raw, (bytes, bytearray)):
         text = raw.decode("utf-8", errors="replace")
     else:
         text = str(raw)
-    raw_len = len(text)
+    raw_len = len(text) if total_len is None else int(total_len)
     if raw_len > limit:
         text = re.sub(r"\s+", " ", text[:limit]).strip()
         return text + f"…(+{raw_len - limit}字)"
@@ -2141,7 +2541,13 @@ def _extract_chat_dialog(raw, limit=4000):
     if "data:" in text or "\ndata:" in text:
         reasoning_buf = []
         content_buf = []
+        # 早退：输出最终只保留 limit 字，但原实现把**整段**流逐行 `json.loads`
+        # （256KB SSE ≈ 40ms/次，且这条路径在请求与响应收尾时都会被调用）。
+        # 助手正文攒够 limit 就够；思考段通常先于正文下发，此时也已到手。
+        _content_chars = 0
         for line in text.splitlines():
+            if _content_chars >= limit:
+                break
             line = line.strip()
             if not line.startswith("data:"):
                 continue
@@ -2160,6 +2566,7 @@ def _extract_chat_dialog(raw, limit=4000):
                 c = delta.get("content") if delta else None
                 if isinstance(c, str) and c:
                     content_buf.append(c)
+                    _content_chars += len(c)
                 rc = delta.get("reasoning_content") if delta else None
                 if not isinstance(rc, str) or not rc:
                     rc = delta.get("reasoning") if delta else None
@@ -2170,6 +2577,7 @@ def _extract_chat_dialog(raw, limit=4000):
                     mc = _msg_text(msg.get("content"))
                     if mc:
                         content_buf.append(mc)
+                        _content_chars += len(mc)
             # Anthropic SSE
             if obj.get("type") == "content_block_delta":
                 delta_obj = obj.get("delta")
@@ -2178,10 +2586,12 @@ def _extract_chat_dialog(raw, limit=4000):
                     reasoning_buf.append(delta["thinking"])
                 if isinstance(delta.get("text"), str):
                     content_buf.append(delta["text"])
+                    _content_chars += len(delta["text"])
             # OpenAI Responses API SSE
             et = obj.get("type")
             if et == "response.output_text.delta" and isinstance(obj.get("delta"), str):
                 content_buf.append(obj["delta"])
+                _content_chars += len(obj["delta"])
             elif et == "response.reasoning_text.delta" and isinstance(obj.get("delta"), str):
                 reasoning_buf.append(obj["delta"])
         sections = _assistant_sections(reasoning_buf, content_buf)
@@ -3474,15 +3884,17 @@ def restore(text, sid, channel="", escape=False, final=False):
             #
             # 能走到这里说明外层**已判定为双花括号占位符形态**，计数不会误伤：
             # 后缀是 6 位 hex 或 6 位纯辅音，普通文本不会自然出现 `{{ word_abcdfg }}`。
-            s["unresolved"] = s.get("unresolved", 0) + 1
-            _record_unresolved_sample(s, whole)
+            with _STATE_LOCK:      # B-1a ②
+                s["unresolved"] = s.get("unresolved", 0) + 1
+                _record_unresolved_sample(s, whole)
             return whole
-        s["restored"] = s.get("restored", 0) + 1
-        s["restored_tokens"].add(real_token or canon)
-        s.setdefault("restored_origs", set()).add(orig)
-        if via_suffix or whole != canon:
-            # 靠空格容错或改写容错救回来的，计入 degraded
-            s["degraded"] = s.get("degraded", 0) + 1
+        with _STATE_LOCK:          # B-1a ②：计数 + 集合去重追加必须一起进锁
+            s["restored"] = s.get("restored", 0) + 1
+            s["restored_tokens"].add(real_token or canon)
+            s.setdefault("restored_origs", set()).add(orig)
+            if via_suffix or whole != canon:
+                # 靠空格容错或改写容错救回来的，计入 degraded
+                s["degraded"] = s.get("degraded", 0) + 1
         return json.dumps(orig, ensure_ascii=False)[1:-1] if escape else orig
 
     out = _BRACED_PLACEHOLDER_RX.sub(_sub, confirmed)
@@ -3510,15 +3922,17 @@ def restore(text, sid, channel="", escape=False, final=False):
                 # 这里再计一次会让计数整体**翻倍**（实测：3 个孤儿报成 6 个）。
                 # 判据用「整段里有没有反斜杠」最直白，也与该遍的语义严格一致。
                 if "\\" in whole:
-                    s["unresolved"] = s.get("unresolved", 0) + 1
-                    _record_unresolved_sample(s, whole)
+                    with _STATE_LOCK:      # B-1a ②
+                        s["unresolved"] = s.get("unresolved", 0) + 1
+                        _record_unresolved_sample(s, whole)
                 return whole
-            s["restored"] = s.get("restored", 0) + 1
-            s["degraded"] = s.get("degraded", 0) + 1
-            s.setdefault("restored_origs", set()).add(orig)
-            # 记账用真实 token：RESTORE 明细按签发时的 token 比对 restored 标记，
-            # 存模型改写后的形态会查不到，该项被误标成「未还原」（假阴性）。
-            s["restored_tokens"].add(real)
+            with _STATE_LOCK:              # B-1a ②
+                s["restored"] = s.get("restored", 0) + 1
+                s["degraded"] = s.get("degraded", 0) + 1
+                s.setdefault("restored_origs", set()).add(orig)
+                # 记账用真实 token：RESTORE 明细按签发时的 token 比对 restored 标记，
+                # 存模型改写后的形态会查不到，该项被误标成「未还原」（假阴性）。
+                s["restored_tokens"].add(real)
             return json.dumps(orig, ensure_ascii=False)[1:-1] if escape else orig
         out = _ESCAPED_PLACEHOLDER_RX.sub(_esc_sub, out)
 
@@ -3557,14 +3971,16 @@ def restore(text, sid, channel="", escape=False, final=False):
                 # 「该片段其实查得到原文、本该被还原」的情况一起跳过——
                 # 实测这一版直接把 test_t7 打红（响应里该有的还原没了）。
                 if not (m.start() > 0 and m.string[m.start() - 1] == "\\"):
-                    s["unresolved"] = s.get("unresolved", 0) + 1
-                    _record_unresolved_sample(s, whole)
+                    with _STATE_LOCK:      # B-1a ②
+                        s["unresolved"] = s.get("unresolved", 0) + 1
+                        _record_unresolved_sample(s, whole)
                 return whole
-            s["restored"] = s.get("restored", 0) + 1
-            s["degraded"] = s.get("degraded", 0) + 1
-            s.setdefault("restored_origs", set()).add(orig)
-            if real is not None:
-                s["restored_tokens"].add(real)
+            with _STATE_LOCK:              # B-1a ②
+                s["restored"] = s.get("restored", 0) + 1
+                s["degraded"] = s.get("degraded", 0) + 1
+                s.setdefault("restored_origs", set()).add(orig)
+                if real is not None:
+                    s["restored_tokens"].add(real)
             return json.dumps(orig, ensure_ascii=False)[1:-1] if escape else orig
         out = _LOOSE_PLACEHOLDER_RX.sub(_loose_sub, out)
     return out
@@ -3763,6 +4179,7 @@ def _remember_request_cmd_snippets(sid, content):
     """请求期只**暂存有界窗口切片**，回声基线留到真正需要时再算（W2-1）。
 
     为什么不在这里直接扫：扫满 `_SCAN_BODY_MAX` 窗口 × 每条规则约 29µs/KB
+    （口径：**单条正则**扫描，与审计的三信号扫描 0.11ms/KB 不是同一指标）
     （512KB 实测 15ms、200KB 约 3ms），而这里在**每个请求**上都会执行 ——
     观测量级与既有 `mask()` 主链路同阶（512KB 时约占其 4 成），等于给默认档位
     白加一笔延迟，而绝大多数请求根本不会命中任何命令。
@@ -4471,19 +4888,24 @@ def _seed_known(text, sid):
     if not s or not text:
         return
     for token in set(_PLACEHOLDER_RX.findall(text)):
-        if token in s["rev"]:
-            continue
-        recent = _RECENT_REV.get(token)
-        if recent and time.time() - recent[2] <= _recent_ttl():
-            s["rev"][token] = recent[0]
-            _touch_recent(token, recent[0])
+        # B-1a ③：`in` 判断与写入是两步，多个 worker 同时处理同一会话时会重复写
+        # （本身幂等，但 `_touch_recent` 的续期与 `_RECENT_*` 的淘汰语义要一致）。
+        with _STATE_LOCK:
+            if token in s["rev"]:
+                continue
+            recent = _RECENT_REV.get(token)
+            if recent and time.time() - recent[2] <= _recent_ttl():
+                s["rev"][token] = recent[0]
+                _touch_recent(token, recent[0])
 
 
 # ===================== 浏览器扩展桥接（Browser Bridge v1）专用入口 =====================
 # 这两个 helper 是 panel 的 /api/ext/mask 端点复用的入口，**不经代理链路**。
-# 它们都必须由调用方（panel 侧）持 `_EXT_LOCK` 调用：本文件的 `sessions` /
-# `_RECENT_*` 是无锁全局态，panel 的 Flask 是 threaded，不加锁会让 `_prune_recent`
-# 的 `list()` 快照构造期撞上并发插入 → RuntimeError。
+# 它们都必须由调用方（panel 侧）持 `_EXT_LOCK` 调用。⚠️ 这条**不是**因为
+# "`sessions` 由 `_STATE_LOCK` 保护好了"——0.6.0 起 `sessions[sid]` 内的计数与
+# 映射才有 `_STATE_LOCK` 契约（见上方 B-1a），而**字典本身**的插入/删除仍靠
+# `list()` 快照兜住遍历期；panel 侧再叠一层 `_EXT_LOCK` 是为了把
+# "读配置 → 脱敏 → 写统计"当作一个整体串行化，避免与热重载互相踩。
 #
 # 代理链路自 2026-09-24 起也跑在自己的专职线程里（见 `_MASK_POOL`），与 panel 的
 # Flask 线程仍不同锁。代理链路的会话由事件循环侧在派发前 `_new_session()` 建好，
@@ -4700,10 +5122,19 @@ def _hash_body(content):
         return ""
 
 
-def _audit_response(flow, sid, host, method, path, source, streamed_text=None):
-    """响应审计：在 restore 完成后调用。只读不改 body，异常静默。"""
+def _audit_response(flow, sid, host, method, path, source, streamed_text=None,
+                    apply_block=True):
+    """响应审计：在 restore 完成后调用。只读不改 body，异常静默。
+
+    A-3：本函数会跑在 `_AUX_POOL` 线程里，因此**不得依赖 flow 的可写性**——
+    需要正文时由调用方用 `streamed_text` 显式传入（非流式路径传还原后的文本）。
+    `apply_block=False` 时只**构造**审计熔断的 503 响应对象并返回，由事件循环
+    回写（`flow.response = ...` 是 mitmproxy 状态，统一在循环线程碰）。
+    """
     if not AUDIT_ENABLED:
-        return
+        return None
+    block_resp = None
+    t_start = time.perf_counter()
     try:
         resp = flow.response
         if resp is None:
@@ -4715,49 +5146,101 @@ def _audit_response(flow, sid, host, method, path, source, streamed_text=None):
             content = streamed_text.encode("utf-8")
         else:
             content = resp.content or b""
-        body_text = content.decode("utf-8", errors="replace") if content else ""
+        # 只解出**真会被用到的部分**：唯一需要全量文本的消费者是结构化解析
+        # （`_parse_response_payload`），而它本身被 `AUDIT_PARSE_MAX` 闸住。
+        # 所以超过该闸时全量 decode 纯属浪费 —— 4MB 实测 3.6ms、16MB 11.5ms，
+        # 而且那份 str 会与 bytes 一起常驻（4MB 体多占数 MB 峰值，× 并发数）。
+        # 等价性（不是"近似"）：超闸时结构化解析与跨请求污染两条路径**本来都不执行**
+        # （下面用 `body_oversize` 保持同一判定，`parse_skipped` 照旧置位），
+        # 而 128KB 扫描窗口取的就是前缀。前缀按"4 字节/字上限 +4 字节"取，
+        # 保证窗口内不出现截断产生的替换符。
+        if content and len(content) > AUDIT_PARSE_MAX:
+            body_text = content[:_AUDIT_TEXT_PROBE_BYTES].decode("utf-8", errors="replace")
+            _body_oversize = True
+        else:
+            body_text = content.decode("utf-8", errors="replace") if content else ""
+            _body_oversize = False
         # 审计扫描的**输入上限**（审计 M1）。此前全量 body_text 直接喂给
         # `scan_error_leak` / `scan_response_poison` / `scan_dangerous_action`，
         # 而上游完全可以回一个 4xx + 几百 KB 的畸形 body：单是 PEM 正则的
         # 灾难性回溯就足以把 mitmproxy 事件循环 CPU 打满（实测 12KB 就要 3.4s）。
         # 响应侧扫描是**防御性**功能，前段命中已覆盖绝大多数幻觉/泄漏场景。
-        # ⚠️ 只截断送给扫描器的副本：`body_text` 本身要保持全量，
-        # `_parse_response_payload`（SSE/JSON 结构化解析）不能吃截断后的文本。
-        scan_text = body_text[:_SCAN_BODY_MAX] if body_text else ""
+        # ⚠️ 只截断送给扫描器的副本：需要全量文本的 `_parse_response_payload`
+        # （SSE/JSON 结构化解析）由上面的 decode 分支保证"要么拿到全量、要么明确知道
+        # 自己超闸"（`body_oversize`），不会吃到一份被悄悄截断的文本。
+        #
+        # A-1（0.6.0）把窗口从 `_SCAN_BODY_MAX`(512KB) 收到 `AUDIT_SCAN_MAX`(128KB)：
+        # 实测（scripts/bench_mask.py）三信号扫描约 0.11ms/KB（口径：error_leak +
+        # response_poison + dangerous_action **三条**一起扫），512KB 就是 ~55ms
+        # 纯事件循环 CPU，正是 503 重试风暴里被线性放大的那一块。
+        # ⚠️ **必须如实披露的能力变化**：`scan_text` 同时喂给 S1 `error_leak`，
+        # 而 `audit_fail_closed`（默认关）的熔断判据是「severity ≥ CRITICAL」，
+        # 当前只有 S1 的四类凭据能到 CRITICAL（:384 / audit_signals.py:194）。
+        # 所以用户打开「审计阻断」后，可检范围随窗口同步缩小——设置页与
+        # CHANGELOG 都写了这句，别让它只活在注释里。
+        # （危险命令拦截不受影响：它走还原侧 `_cmd_find`/`_cmd_record` 逐块扫全文。）
+        scan_text = body_text[:AUDIT_SCAN_MAX] if body_text else ""
         # 回声抑制用的请求体文本：请求里本来就有的危险命令/凭据不算「上游注入」。
         # 生产库实测这是最有效的一条去噪规则——编程助手的对话里 rm、curl|sh
         # 天天出现，只有上游凭空多出来的那条才值得报。
         try:
-            req_text = (getattr(flow.request, "content", None) or b"").decode("utf-8", errors="replace")
+            # 同上：请求文本只喂 128KB 窗口，全量 decode 是白烧（请求可达 32MB，
+            # 一次 decode ≈ 20ms 且多占几十 MB）。哈希仍用**全量字节**（见下）。
+            req_text = ((getattr(flow.request, "content", None) or b"")
+                        [:_AUDIT_TEXT_PROBE_BYTES]).decode("utf-8", errors="replace")
         except Exception:
             req_text = ""
-        scan_req_text = req_text[:_SCAN_BODY_MAX] if req_text else ""
+        scan_req_text = req_text[:AUDIT_SCAN_MAX] if req_text else ""
         req_hash = _hash_body(getattr(flow.request, "content", None))
         resp_hash = _hash_body(content)
         common = {
             "sid": sid, "host": host, "method": method, "path": path,
             "request_hash": req_hash, "response_hash": resp_hash,
         }
-        findings = []
+        # ---- A-1/A-2：预算 + 同 body 复用 ----
+        deadline = t_start + AUDIT_TIME_BUDGET_S
+        _stats = {"truncated": False, "parse_skipped": False, "cache_hit": False,
+                  "cache_miss": False, "scan_bytes": len(scan_text)}
+        # 响应头文本：S1 error_leak 用它识别「凭据出现在响应头里」。
+        # 必须在**算缓存键之前**就取好 —— 它是扫描输入之一，不参与键就等于
+        # "同 body 不同 header 回放 30s 的旧结论"（把 Set-Cookie/X-* 里的凭据漏掉）。
+        _hdrs_text = " ".join(f"{k}:{v}" for k, v in resp.headers.items())
+        # 缓存键必须覆盖**全部**扫描输入：body 摘要、状态码、请求摘要、信号开关、
+        # 以及下面这两个曾经漏掉的 —— `ct`（决定 S2/S4 是否走结构化解析分支）与
+        # 响应头摘要（S1 的凭据在头里）。漏了它们就是"输入变了、结论没变"的静默漏检。
+        _hdrs_sig = (hashlib.sha256(_hdrs_text.encode("utf-8", "replace")).hexdigest()[:16]
+                     if _hdrs_text else "")
+        _cache_key = (resp_hash, status_code, req_hash, bool(AUDIT_ACTIVE_PROBES),
+                      _audit_config_fingerprint(), (ct or "")[:64], _hdrs_sig)
+        # 什么时候**不能**用缓存：
+        #   ① 主动探针 + 跨请求污染信号：这一路的结论还取决于**活体** canary 注册表
+        #      （`prior = 注册表 − 本条 canary`），而注册表不在键里 —— 命中缓存等于
+        #      把"当时没扫出污染"回放成"现在也没有"，正是最该报的漏检被静默。
+        #   ② 被预算截断 / 解析被跳过：残缺结果不是"干净"，缓存它等于把一次过载
+        #      放大成整段 TTL 的系统性漏检（既有实现只挡了 truncated，漏了 parse_skipped）。
+        _cacheable = not (AUDIT_ACTIVE_PROBES
+                          and (AUDIT_SIGNALS or {}).get("cross_request_pollution"))
+        if not _cacheable:
+            with _AUDIT_STATS_LOCK:
+                _AUDIT_RUNTIME["cache_disabled"] += 1
+        findings = _audit_cache_get(_cache_key) if (resp_hash and _cacheable) else None
+        if findings is None:
+            # 响应头文本已在上面取好（它是缓存键的一部分，不能等到这里才算）。
+            findings = _audit_scan_signals(flow, status_code, ct, scan_text, scan_req_text,
+                                           body_text, _hdrs_text, deadline, _stats,
+                                           body_oversize=_body_oversize)
+            # 只缓存**完整扫完**的结果：被预算截断的列表是残缺的，缓存它就是
+            # 把一次过载放大成 30s 的系统性漏检。
+            if resp_hash and _cacheable and not _stats["truncated"] and not _stats["parse_skipped"]:
+                _audit_cache_put(_cache_key, findings)
+                with _AUDIT_STATS_LOCK:
+                    _AUDIT_RUNTIME["cache_store"] += 1
+        else:
+            _stats["cache_hit"] = True
+        _audit_record_timing(t_start, _stats)
 
-        # S1 error_leak（被动+主动）
-        if AUDIT_SIGNALS.get("error_leak") and status_code >= 400:
-            hdrs_text = " ".join(f"{k}:{v}" for k, v in resp.headers.items())
-            # 上游域名检测已移除（2026-08-18）：错误页出现用户**已配置**的上游地址
-            # 是诊断信息而不是面向客户端的信息泄露，改由普通 ERR/状态日志排障；
-            # 留在这里只会把审计中心刷成上游错误页的噪音场。
-            findings.extend(_audit.scan_error_leak(status_code, scan_text, hdrs_text))
-
-        # S6 response_poison（被动+主动，200/4xx 都扫）
-        if AUDIT_SIGNALS.get("response_poison") and scan_text:
-            findings.extend(_audit.scan_response_poison(scan_text, scan_req_text))
-
-        # S9 dangerous_action：模型下发的破坏性命令（rm -rf / / DROP DATABASE / 强推…）
-        # 必须扫**还原后**的文本：占位符状态下路径和主机名都是假的，判不准也没意义。
-        # 只告警不阻断——设计取舍见 audit_signals.scan_dangerous_action 的注释。
-        if AUDIT_SIGNALS.get("dangerous_action") and scan_text:
-            findings.extend(_audit.scan_dangerous_action(scan_text, scan_req_text))
-
+        # ⚠️ 槽位级合并（会话作用域）**必须在缓存之外**：`cmd_hits` 属于本次会话，
+        # 若把它并进 A-2 的缓存结果，B 会话就会拿到 A 会话的命令证据（跨会话串味）。
         # W2-1 / G1 契约：把**槽位级**命中（带通道来源）与全量 S9 扫描的结果合并。
         #   · 改写模式下命令已被就地替换，全量扫描看不见它们 → 槽位级是唯一来源；
         #   · 非改写模式下两者可能命中同一条命令，此处**以槽位级为准**（它带通道信息），
@@ -4792,47 +5275,6 @@ def _audit_response(flow, sid, host, method, path, source, streamed_text=None):
                 "kind": str(h.get("kind") or "dangerous_action"),
             })
 
-        # S2 identity_swap + S4 sse_anomaly：需解析 body
-        if body_text and ("json" in ct or "event-stream" in ct):
-            # 单次解析产出 (text_chunks, model_field, events) — 避免三重解析
-            text_chunks, model_field, events = _parse_response_payload(body_text, ct)
-            if AUDIT_SIGNALS.get("identity_swap"):
-                # 对比式检测（借鉴 LiteLLM requested_model vs response_model）：
-                # 请求 model 是基准真相，响应 model 与之对比，不一致才是换芯——
-                # 零知识库、零硬编码，模型迭代/新厂商自动适配。
-                req_model = ""
-                try:
-                    req_body = json.loads(flow.request.content or b"")
-                    req_model = _extract_model(req_body)
-                except Exception:
-                    pass
-                # ⚠️ 必须**只调一次**，不能放在 `for chunk in text_chunks` 里（审计 B4）。
-                # `scan_identity_swap` 的判据只有 `model_field` + `req_model`，第一个
-                # 参数（文本）完全不参与判定（见 audit_signals.scan_identity_swap）。
-                # 放进循环的后果是：tool_use-only / reasoning-only / 空文本响应
-                # （Anthropic 非流式 tool_use、流式 delta.partial_json、OpenAI
-                # content:null 拒答）的 `text_chunks` 为空 → 整段跳过 → 换芯检测
-                # 在编程助手最主流的响应形态上完全失效，而 `model_field` 明明已解析出来。
-                # 传第一个非空 chunk 只是为了将来若该参数被启用时仍有上下文。
-                findings.extend(_audit.scan_identity_swap(
-                    text_chunks[0] if text_chunks else "", model_field, req_model))
-            # S4 sse_anomaly（仅 SSE）
-            if AUDIT_SIGNALS.get("sse_anomaly") and "event-stream" in ct:
-                findings.extend(_audit.scan_sse_anomaly(events))
-
-        # S7 cross_request_pollution：仅主动探针模式。
-        # 当前请求自身携带的 nonce（current）不算「前序」；只有**没有携带任何
-        # nonce 的独立请求**响应里出现前序 nonce，才证明 relay 跨请求存了数据。
-        # S5「当前请求回显」已于 2026-08-18 移除：nonce 经 X-Shield-Canaries 头
-        # 注入且转发前被剥离，模型本看不到它；若探针还要求模型回显，正常模型
-        # 也会回显，不能证明泄漏。
-        if AUDIT_ACTIVE_PROBES and body_text:
-            current = set(flow.metadata.get("audit_canaries") or set())
-            # registry 是 dict {nonce: ts}，取 key 集合做 prior
-            prior = set(_AUDIT_CANARY_REGISTRY.keys()) - current
-            if AUDIT_SIGNALS.get("cross_request_pollution") and prior:
-                findings.extend(_audit.scan_cross_request_pollution(body_text, prior))
-
         # S3 tool_call_rewrite：仅主动探针模式，由 audit_engine 直接判定（需 expected 对照）
         # 此处被动模式跳过（无法区分正常 tool_call 与被改写的）
 
@@ -4857,6 +5299,11 @@ def _audit_response(flow, sid, host, method, path, source, streamed_text=None):
                 "severity": f.get("severity", "LOW"),
                 "evidence": f.get("evidence", ""),
                 "probe_id": probe_id,
+                # A-1/C-1：本次审计的耗时与截断留痕随条目落库，
+                # 排障时不必再猜「这条告警是不是扫描被削过的产物」。
+                "audit_ms": round(float(_stats.get("ms") or 0.0), 2),
+                "audit_scan_bytes": int(_stats.get("scan_bytes") or 0),
+                "audit_scan_truncated": bool(_stats.get("truncated")),
             })
             # 审计信号 fail-closed（默认关）：CRITICAL 信号触发时把**本次响应**换成 503。
             # 产品定位是脱敏代理，检测到上游确凿在窃取数据却继续把污染内容交给客户端
@@ -4869,25 +5316,33 @@ def _audit_response(flow, sid, host, method, path, source, streamed_text=None):
                 # evidence 已过 _redact_evidence 掩码/摘要（sha256），截断后落 BLOCK，
                 # 不含响应正文原文；upstream 只记配置名（flow.metadata 里的 name），不记 URL。
                 _emit("BLOCK",
-                      reason="audit_critical_signal",
+                      reason="audit_critical_signal", block_source="engine",
                       signal=str(f.get("signal", "")),
                       severity=str(f.get("severity", "")),
                       evidence=str(f.get("evidence", ""))[:200],
                       sid=sid, host=host, method=method, path=path.split("?")[0],
                       upstream=flow.metadata.get("shield_upstream") or "",
                       **source)
-                flow.response = http.Response.make(
+                block_resp = http.Response.make(
                     503, b'{"error":{"code":"shield_audit_blocked"}}',
                     {"Content-Type": "application/json"}
                 )
+                if apply_block:
+                    flow.response = block_resp
                 # _log 只收一个参数；这里原来写的是 _emit_log(msg, "warn")——
                 # 该函数在本模块根本不存在，NameError 被外层 except 吞掉，
                 # 结果 fail-closed 这条最该留痕的路径反而一行日志都没有。
                 _log(f"[audit] fail-closed 阻断：{f.get('signal')} ({str(f.get('evidence', ''))[:80]})")
                 break
-    except Exception:
-        # 审计失败永不影响流量
-        return
+    except Exception as e:
+        # 审计失败永不影响流量 —— 但**不能连自己坏了都不说**。
+        # 抽函数时踩过：helper 里引用了调用方的局部变量（NameError），
+        # 被这里静默吞掉，审计整条链路无声失效而单测只挂了一条断言。
+        # 同类只警告一次，避免刷屏。
+        _audit_warn_once("audit_error",
+                         f"审计异常已忽略（不影响流量）：{type(e).__name__}: {e}")
+        return None
+    return block_resp
 
 
 def _parse_response_payload(body_text, ct):
@@ -5177,7 +5632,7 @@ def _reasoning_effort_hint(reasoning_value):
 # 职责。冻机问题已由脱敏 offload 到专职线程解决（见 `_MASK_POOL`），而 NER 成本与
 # 正文长度近似线性（实测约 11µs/字节中文）——2.0s 在 200 条/43KB 的长会话上会让
 # **96/200 个「只有 NER 能识别」的中文人名明文出网**（实测，审计 2026-09-24）。
-# 产品承诺是「不泄漏」优先于「快」，所以预算现在只做一件事：病态输入别把单工作线程
+# 产品承诺是「不泄漏」优先于「快」，所以预算现在只做一件事：病态输入别把脱敏线程池
 # 占掉几分钟（32MB 请求体全量 NER 约 6 分钟）。
 #
 # 取值依据（`tests/measure_ner_coverage.py` 可复现，均为冷缓存实测）：
@@ -5199,7 +5654,7 @@ def _ner_req_budget(body_bytes):
     return min(_NER_REQ_BUDGET_MAX_S,
                _NER_REQ_BUDGET_BASE_S + mb * _NER_REQ_BUDGET_PER_MB_S)
 
-# 脱敏重活专用单工作线程。
+# 脱敏重活专用线程池（池宽按核数自适应 1~4，见 _default_mask_workers）。
 #
 # 为什么必须离开事件循环：`request` 若同步执行，mitmproxy 12 的
 # `addonmanager.invoke_addon` 就是直接在**事件循环线程**里 `res = func(*event.args())`
@@ -5208,15 +5663,275 @@ def _ner_req_budget(body_bytes):
 # 渲染的 502 Bad Gateway + `connection closed`（2026-09-24 实测事故，此前被误判成
 # 上游故障）。offload 之后，排队只增加该请求自身的延迟，不再牵连其他连接。
 #
-# workers=1 是刻意的：既保持「同一时刻只有一段脱敏在跑」这一原有前提
-# （sessions / _RECENT_* 是无锁全局态，见 _mask_event_items 上方的注释），
-# 又避免多线程同时抢 ONNX 推理。
+# workers 宽度自 0.6.0 起可配（MASKIT_MASK_WORKERS，默认按核数自适应）。
+# 之所以现在敢放开：会话态的并发契约已经在 0.6.0 里逐字段定下来
+# （见文件上方「B-1a：sessions[sid] 的并发契约」），NER 也不再是"每个 worker
+# 各自抢 ONNX 线程"——进程级信号量 + 令牌桶把推理收敛成受控的固定并发
+# （ner_engine 的 _NER_CONCURRENCY / _NER_BUDGET_MS_PER_S）。
 #
 # 残留窗口（已知、已评估）：线程里跑的同时，事件循环上的下一个请求会执行
 # `_maybe_reload()` / `_sweep()`。前者会重建词表（就地 clear/update），若刚好压在
 # 本线程遍历词表的瞬间会抛异常 —— 走既有 fail-closed 分支阻断，**不会**放行原文；
 # 后者只在会话空闲超过 TTL 时回收，本次会话刚建，不受影响。
-_MASK_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="maskit-mask")
+def _default_mask_workers():
+    """脱敏池默认宽度（§8.1 定稿）。
+
+    弱机（≤2 核）恒为 1：多 worker 在那种机器上只会互相抢核，还放大内存与
+    ONNX 线程数。其余机器取 min(4, max(2, 核数 // 2)) —— 这一段（JSON 解析 +
+    规则扫描）是百毫秒级的 CPU 活，4 个 worker 也压不满现代 CPU，收益主要体现在
+    "NER 期间不再让其他请求排队"。
+    """
+    if MASKIT_MASK_WORKERS_ENV:
+        return max(1, min(16, MASKIT_MASK_WORKERS_ENV))
+    cores = os.cpu_count() or 2
+    if cores <= 2:
+        return 1
+    return max(2, min(4, cores // 2))
+
+
+# 池宽与队列预算（环境变量在导入时读一次；set_mask_workers 供压测脚本动态调整）
+MASKIT_MASK_WORKERS_ENV = _env_int("MASKIT_MASK_WORKERS", 0)
+_MASK_WORKER_COUNT = _default_mask_workers()
+_MASK_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_MASK_WORKER_COUNT, thread_name_prefix="maskit-mask")
+# A-6/B-4：**按字节**限制"已提交但还没开跑"的请求体总量。
+# 为什么不是条数：单条上限 32MB，`4×workers` 条在最坏情况下就是 512MB 常驻
+# （而 B-4 的字节预算当时排在更后面的提交里）。按字节可以给出一个能算出来的上界：
+#   最坏常驻 ≈ 正在跑的 workers × 32MB + queue_bytes（默认 workers × 8MB）。
+# ⚠️ 下限必须是**单条 body 上限**（`_MAX_REQUEST_BODY`），不能只是 1MB：
+# 准入判据是 `queued_bytes + nbytes > 预算`，而 nbytes 就是这条请求自己的大小 ——
+# 预算比单条上限还小时，那条请求**永远**被自己顶出去（workers=1 时预算 8MB < 单条 32MB，
+# 于是 8~32MB 的 body 在 1~2 核机器上恒定 engine_busy，空闲机器也一样）。
+# 预算的用途是限制**堆积**（多条同时排队），不是限制单条：单条已由 32MB 闸门兜住。
+_MASK_QUEUE_BYTES = max(_MAX_REQUEST_BODY, _env_int(
+    "MASKIT_MASK_QUEUE_BYTES", _MASK_WORKER_COUNT * 8 * 1024 * 1024))
+# 同时在飞的请求条数上限：即使 body 都很小，条数也要有界（防线程池队列无界增长）
+_MASK_MAX_INFLIGHT = max(4, _MASK_WORKER_COUNT * 4)
+_MASK_ADMISSION_LOCK = threading.Lock()
+_MASK_ADMISSION = {"queued_bytes": 0, "inflight": 0, "busy": 0, "peak_queue_bytes": 0}
+# 端到端超时计数（B-5）：busy 是"没准入"，timeout 是"准入了但迟迟不回来"，两者要分开看。
+_MASK_TIMEOUTS = {"count": 0, "peak_wait_ms": 0.0}
+# 下限 5s：0 会让每个请求都 engine_timeout，负数会让 wait_for 抛 ValueError
+# （被最外层 fail-closed 兜成 503 mask_pipeline_failed）—— 都是"整个网关不可用"的配置事故，
+# 由环境变量误写触发，所以在这里夹住（其余旋钮如 NER 预算同样有下限）。
+_ENGINE_DEADLINE_S = max(5.0, float(_env_float("MASKIT_ENGINE_DEADLINE_S", 120.0)))
+
+
+def set_mask_workers(n):
+    """重建脱敏池（压测脚本 `--workers N` 与未来的运行时调参用）。
+
+    不提供"减容"语义：线程池无法安全收缩，只能整体换新（在飞任务由旧池跑完）。
+    """
+    global _MASK_POOL, _MASK_WORKER_COUNT, _MASK_QUEUE_BYTES, _MASK_MAX_INFLIGHT
+    n = max(1, min(16, int(n or 1)))
+    if n == _MASK_WORKER_COUNT:
+        return _MASK_WORKER_COUNT
+    old = _MASK_POOL
+    _MASK_WORKER_COUNT = n
+    # 与模块级同口径（见 _MASK_QUEUE_BYTES 的注释）：下限必须是单条 body 上限，
+    # 否则换池之后 8~32MB 的请求又会被自己的体积顶出去（恒定 engine_busy）。
+    _MASK_QUEUE_BYTES = max(_MAX_REQUEST_BODY, _MASK_WORKER_COUNT * 8 * 1024 * 1024)
+    _MASK_MAX_INFLIGHT = max(4, _MASK_WORKER_COUNT * 4)
+    _MASK_POOL = concurrent.futures.ThreadPoolExecutor(
+        max_workers=n, thread_name_prefix="maskit-mask")
+    try:
+        old.shutdown(wait=False)
+    except Exception:
+        pass
+    return n
+
+
+def _mask_admit(nbytes):
+    """准入判定（A-6/B-4）：字节预算 + 条数上限，**必须在任何签发副作用之前**。
+
+    返回 True 表示已占额，调用方必须在 worker 真正开跑时调用 `_mask_release`
+    把"排队中"的名额换成"在跑"（字节数在开跑时就减掉，队列预算只约束排队）。
+    """
+    with _MASK_ADMISSION_LOCK:
+        if (_MASK_ADMISSION["queued_bytes"] + nbytes > _MASK_QUEUE_BYTES
+                or _MASK_ADMISSION["inflight"] >= _MASK_MAX_INFLIGHT):
+            _MASK_ADMISSION["busy"] += 1
+            return False
+        _MASK_ADMISSION["queued_bytes"] += max(0, int(nbytes))
+        _MASK_ADMISSION["inflight"] += 1
+        if _MASK_ADMISSION["queued_bytes"] > _MASK_ADMISSION["peak_queue_bytes"]:
+            _MASK_ADMISSION["peak_queue_bytes"] = _MASK_ADMISSION["queued_bytes"]
+        return True
+
+
+def _mask_release(nbytes):
+    """请求彻底结束（成功/失败/超时）时归还 **in-flight 名额**。
+
+    ⚠️ 这里**不再**扣 `queued_bytes`（0.6.0 修）：排队的字节在 worker 开跑时已由
+    `_mask_dequeued` 扣过一次，再扣一次会抹掉**别的请求**的排队字节 —— 并发下
+    `queued_bytes` 会系统性偏小，B-4 的内存天花板随之失效（实测：A 出队后 B 入队，
+    A 结束时 B 的字节被抹成 0）。`nbytes` 参数保留是为了调用点签名一致与可读性，
+    不再参与扣减。
+    """
+    with _MASK_ADMISSION_LOCK:
+        _MASK_ADMISSION["inflight"] = max(0, _MASK_ADMISSION["inflight"] - 1)
+
+
+def _mask_abandon(nbytes):
+    """请求**从未开跑**就被放弃（提交进线程池失败）时归还全部名额。
+
+    单独的入口是必须的：worker 没跑 → 它的 `finally` 不会执行 → `_mask_dequeued`
+    与 `_mask_release` 都不会被调用。只还 inflight 会漏掉排队字节（内存预算被
+    永久占用），只还不扣字节会漏掉名额（准入池被锁死）。两者都在这里还。
+    """
+    with _MASK_ADMISSION_LOCK:
+        _MASK_ADMISSION["inflight"] = max(0, _MASK_ADMISSION["inflight"] - 1)
+        _MASK_ADMISSION["queued_bytes"] = max(0, _MASK_ADMISSION["queued_bytes"] - max(0, int(nbytes)))
+
+
+def _mask_dequeued(nbytes):
+    """worker 真正开跑：从"排队字节"里扣掉（在跑的由 workers 数量天然有界）。"""
+    with _MASK_ADMISSION_LOCK:
+        _MASK_ADMISSION["queued_bytes"] = max(0, _MASK_ADMISSION["queued_bytes"] - max(0, int(nbytes)))
+
+
+def mask_pool_stats():
+    """脱敏池/队列指标（C-1 的 /api/engine/metrics + 一键自检都读这里）。"""
+    depth = None
+    try:
+        depth = int(_MASK_POOL._work_queue.qsize())
+    except Exception:
+        depth = None
+    with _MASK_ADMISSION_LOCK:
+        adm = dict(_MASK_ADMISSION)
+    adm["engine_timeouts"] = _MASK_TIMEOUTS["count"]
+    adm["peak_wait_ms"] = round(float(_MASK_TIMEOUTS["peak_wait_ms"]), 1)
+    adm.update({
+        "workers": _MASK_WORKER_COUNT,
+        "queue_bytes_limit": _MASK_QUEUE_BYTES,
+        "max_inflight": _MASK_MAX_INFLIGHT,
+        "queue_depth": depth,
+        "deadline_s": _ENGINE_DEADLINE_S,
+        "busy_total": adm.get("busy", 0),
+    })
+    return adm
+
+
+async def _await_with_deadline(fut, timeout_s):
+    """等待脱敏结果，带端到端 deadline（B-5）。超时抛 `asyncio.TimeoutError`。
+
+    用 `shield` 包一层：超时只取消这层等待，**不取消**已经开跑的 worker
+    （线程池里的任务本来就取消不了，shield 让这个语义显式化而不是靠实现细节）。
+    调用方的责任：超时后给客户端结构化错误，并**丢弃**这次结果（不回写 flow），
+    孤儿 worker 可能的签发副作用记为已知边界（设计文档 §4.3）。
+    """
+    return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s)
+
+
+_RUNTIME_METRICS_FILE = "engine-runtime.json"
+_RUNTIME_METRICS_MIN_INTERVAL_S = 30.0
+_RUNTIME_METRICS_LAST = [0.0]
+
+
+def write_runtime_metrics(force=False):
+    """把本进程的运行指标写进数据目录（面板的 /api/engine/metrics 与自检读它）。
+
+    调用点挂在请求路径上（节流到 30s 一次）：引擎进程没有定时器，而挂在这里
+    意味着"有流量时才更新" —— 恰好也是指标有意义的时候。写失败只记一次日志，
+    绝不影响流量。
+    """
+    now = time.time()
+    if not force and now - _RUNTIME_METRICS_LAST[0] < _RUNTIME_METRICS_MIN_INTERVAL_S:
+        return False
+    _RUNTIME_METRICS_LAST[0] = now
+    try:
+        payload = {
+            "schema": 1,
+            "generated_at": int(now),
+            "pid": os.getpid(),
+            "mask_pool": mask_pool_stats(),
+            "aux_pool": aux_pool_stats(),
+            "audit": audit_runtime_stats(),
+            "engine_deadline_s": _ENGINE_DEADLINE_S,
+        }
+        try:
+            import ner_engine
+            payload["ner"] = {
+                "enabled": bool(NER_ENABLED),
+                "available": bool(ner_engine.is_ner_available()),
+                "initialized": bool(getattr(ner_engine, "_INITIALIZED", False)),
+                "failed": bool(getattr(ner_engine, "_INIT_FAILED", False)),
+                "last_error": str(getattr(ner_engine, "_LAST_ERROR", "") or "")[:300],
+                "governor": ner_engine.governor_status(),
+            }
+        except Exception as e:
+            payload["ner_error"] = "%s: %s" % (type(e).__name__, e)
+        tmp = _DATA_ROOT / (_RUNTIME_METRICS_FILE + ".tmp")
+        dst = _DATA_ROOT / _RUNTIME_METRICS_FILE
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(str(tmp), str(dst))     # 原子替换：读者不会看到半截 JSON
+        return True
+    except Exception as e:
+        _audit_warn_once("runtime_metrics_write",
+                         f"运行指标写入失败（面板的引擎指标会显示为过期）：{type(e).__name__}: {e}")
+        return False
+
+
+def _retry_after_seconds():
+    """busy 时的 Retry-After：**带抖动**，不能固定 1s。
+
+    固定值会让所有被拒客户端在同一时刻一起重试（正是本次故障里"503 重试风暴"
+    的形态）；抖动把重试摊开，指数上限避免无限等待。1~3s。
+    """
+    return round(1.0 + random.random() * 2.0, 2)
+
+# A-3：整包响应侧的重活池（解析/还原/序列化、RESTORE 摘要、审计、响应扫描）。
+# 为什么是 2 个线程：这些活彼此独立、CPU 密集但有 GIL 交替，2 个足够吃掉
+# 「一条大响应把事件循环占满」的问题，又不会在弱机上把核抢光。
+# 真正的并发上限由 B-4 的 in-flight 字节预算兜住（这里只是执行位）。
+# ⚠️ 已知边界：这条池**故意**没有字节准入与取消失败的机制 ——
+# 它承载的是响应侧还原/审计，投递项被拒或超时都意味着"把未还原的占位符交给用户"
+# （{{EMAIL_xxxx}} 直接漏到页面上），比排队更糟。所以这里只能测"慢"，不能测"丢"。
+# 真正的背压点在更上游（读取 flow 的速度），属独立改造。
+# 这条池承载响应侧还原/审计。它**不能**像脱敏池那样"满了就拒"：被拒或超时都意味着
+# 把未还原的占位符交给用户（占位符会直接漏到页面上），比排队更糟 ——
+# 所以这里的背压形态是**等**，不是**丢**（真正的"丢"只能在更上游：少读 flow）。
+# 能做的上限是：在 worker 里解码**之前**抢槽位，把"已解码副本"的数量钉在
+# `_AUX_MAX_INFLIGHT` 以内（排队项此时只持有 flow 引用，内容内存由 mitmproxy 自己兜）。
+_AUX_MAX_INFLIGHT = 4
+_AUX_SLOTS = threading.BoundedSemaphore(_AUX_MAX_INFLIGHT)
+# 预览/对话抽取的源文本上限：两个 helper 的输出上限是 800B / 4000 字，源文本给到
+# 256KB 早已远超需要（含超长 SSE 首包）。见 _emit_restore_summary 的注释。
+_PREVIEW_SRC_MAX = 64 * 1024
+# 审计文本探测的字节数上限：要覆盖 `AUDIT_SCAN_MAX` 个**字符**的最坏情况（UTF-8 最长
+# 4 字节/字），多留 4 字节让"被截断的那个字"落在窗口之外（否则窗口末尾会出现替换符）。
+_AUDIT_TEXT_PROBE_BYTES = AUDIT_SCAN_MAX * 4 + 4
+# "流式收尾已投递但可能还没跑完"的计数：流式回调是同步的，投递后不等待，
+# 所以"流结束了"不再等于"审计已经落库"。测试/诊断/关卡用 aux_drain() 对齐。
+_AUX_PENDING_LOCK = threading.Lock()
+_AUX_PENDING = [0]
+_AUX_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="maskit-aux")
+_AUX_STATS = {"submitted": 0, "completed": 0, "failed": 0}
+# 响应侧等待 aux 池多久才值得留痕。为什么是"留痕"而不是"超时放弃"：
+# 这条 await 之后就是"把还原结果写回 flow.response"，一旦超时放弃，客户端拿到的就是
+# **带占位符（或未还原明文）的响应** —— 那是本产品的核心承诺（本地还原后再出网/交付），
+# 比"慢"严重得多；改回 503 又会把一条已经成功的上游响应判死。
+# 两种"修法"都比等待更糟，所以这里**刻意不设硬超时**（与 request 侧 `_await_with_deadline`
+# 不同：那边超时是 fail-closed 拒绝未脱敏请求，方向一致）。
+# 但不留痕的等待是不可诊断的：弱机上多智能体并发时用户只会看到"响应很慢"。
+# 于是超过 `_AUX_WAIT_TRACE_S` 就发一条带 `aux_wait_ms` 的事件，让 /api/logs、
+# 导出的 CSV 与自检都能回答"慢在哪"。
+_AUX_WAIT_TRACE_S = 2.0
+_AUX_WAIT_TRACE_MS = [0.0]        # 本进程见过的最长等待（写进运行指标供自检读）
+
+
+def aux_pool_stats():
+    """aux 池的运行指标（C-1 的 /api/engine/metrics 用）。"""
+    depth = None
+    try:
+        depth = int(_AUX_POOL._work_queue.qsize())     # 私有 API，取不到就算了
+    except Exception:
+        depth = None
+    out = dict(_AUX_STATS)
+    out["queue_depth"] = depth
+    # 最长等待（ms）：0 = 从未超过留痕阈值
+    out["max_wait_ms"] = round(float(_AUX_WAIT_TRACE_MS[0]), 1)
+    return out
 
 
 class _MaskResult(NamedTuple):
@@ -5230,6 +5945,8 @@ class _MaskResult(NamedTuple):
     scan_scope: dict
     role_texts: dict
     ner_skips: dict              # 本轮语义识别降级原因计数（空 = 全程生效）
+    ner_metrics: dict            # 本轮 NER 治理器指标（等待/限流），空 = 无异常
+    queue_wait_ms: float = 0.0   # 脱敏池排队时长（提交 → 开跑），A-6/B-5
 
 
 def _ner_skips_of_this_round():
@@ -5245,110 +5962,157 @@ def _ner_skips_of_this_round():
         return {}
 
 
-def _mask_pipeline_worker(body, sid, raw_content, enum_changed, has_dup_keys, root_is_object):
+def _ner_metrics_of_this_round():
+    """本轮语义识别的运行指标（信号量等待 / 限流次数），取完即清。
+
+    `ner_sem_wait_ms` 与 `ner_global_throttled` 必须进事件：用户看到"开了 NER 但
+    这条没识别"时，第一个要回答的问题就是"是排队等不到，还是被限流了"。
+    与 `_ner_skips_of_this_round` 同源：都在本轮结束时取一次、清一次。
+    """
+    try:
+        import ner_engine
+        return ner_engine.request_metrics(reset=True)
+    except Exception:
+        return {}
+
+
+def _ner_metric_fields():
+    """构造事件里的 NER 指标字段（无等待、无限流时不加噪声字段）。"""
+    m = _ner_metrics_of_this_round() or {}
+    out = {}
+    wait_ms = float(m.get("sem_wait_ms") or 0.0)
+    infer_ms = float(m.get("infer_ms") or 0.0)
+    if wait_ms >= 1.0 or infer_ms > 0:
+        out["ner_sem_wait_ms"] = round(wait_ms, 1)
+    if int(m.get("global_throttled") or 0) > 0:
+        out["ner_global_throttled"] = int(m["global_throttled"])
+    return out
+
+
+def _mask_pipeline_worker(body, sid, raw_content, enum_changed, has_dup_keys,
+                          root_is_object, t_submit=0.0):
     """在 `_MASK_POOL` 线程里跑脱敏重活（纯计算 + 本模块全局态，不碰 mitmproxy 对象）。
 
     `body` 由调用方解析好传入，就地改写（原实现即如此，调用方后续还要用）。
     异常一律向上抛：由调用方的 fail-closed 分支决定阻断还是记录，绝不在这里静默放行。
     """
-    masked_bytes = None
-    first_diff_byte = -1
-    with _ner_doc_budget(_ner_req_budget(len(raw_content))):
-        # 脱敏前记录扫描范围 + 各角色文本（仅内存，归因用，不落原文）
-        scan_scope = _request_scope(body)
-        role_texts = _collect_role_texts(body)
-        # 递归脱敏所有承载正文的顶层字段。逐格式硬编码会漏掉工具调用参数等嵌套位置，
-        # 这里统一走 _mask_tree（内部路径感知：协议位置跳过、业务区强制扫描）。
-        # 注意：必须遍历 body 全部顶层 key——曾只处理白名单 key，顶层自定义业务对象
-        # （customer 等）整体绕过脱敏（审计验收点"任意 customer.id"实测漏检）。
-        # 非字符串/列表/字典（数字/bool/null）_mask_tree 原样返回，无副作用。
-        # body_changed 是单元素 list（可变），由 _mask_hit 在真的替换过时置 True。
-        body_changed = [False]
-        # 顶层**键名**也要过一遍（审计 B2 的「敏感值作键名」）。
-        #
-        # 为什么之前漏了：这里按顶层 key 逐个取值送进 `_mask_tree`，于是键名本身
-        # 一次都没经过 `mask()`。而扩展链路的 `mask_body` 是把整个 body 交给
-        # `_mask_tree`（其 dict 分支会脱敏键名）——**同一个 body 走两条链路结果不同**，
-        # `{"13800138000": "safe"}` 在扩展链路已打码、在代理链路仍原样上行。
-        #
-        # 判据与 `_mask_tree` 的 dict 分支**完全一致**（同一个白名单、同一个 `mask()`），
-        # 不另立一套，否则两边迟早再漂一次。
-        # ⚠️ `_ROOT_WRAP_KEY` 必须原样保留：非对象根（列表根）会被包成
-        # `{__shield_root__: [...]}`，键名一旦被改写，下面 `body[_ROOT_WRAP_KEY]`
-        # 直接 KeyError → 整个脱敏管线抛异常 → fail-closed 503，所有列表根请求全挂。
-        renamed = {}
-        for key in list(body.keys()):
-            new_key = key
-            if (isinstance(key, str) and key != _ROOT_WRAP_KEY
-                    and key not in _MASK_PROTECTED_KEY_NAMES):
-                masked_key = mask(key, sid)
-                if masked_key != key:
-                    new_key = masked_key
-                    body_changed[0] = True
-            # 传进去的仍是**原键**：`_leaf_exempt` 的协议位置判定必须看客户端真实的键名
-            # （同 `_mask_tree` dict 分支的注释）。
-            renamed[new_key] = _mask_tree(body[key], sid, key, flag=body_changed)
-        # 就地替换内容而非给 body 重新绑定：body 是调用方持有的对象，
-        # 下面 enum 清洗 / splice / `masked_root` 都还在用它，且要保持键的插入顺序。
-        body.clear()
-        body.update(renamed)
+    # C-1：顺手刷新运行指标（内部节流 30s，绝大多数请求是一次 time() 判断）。
+    # 放在**worker 线程**里而不是事件循环上：它要 write_text + os.replace，属阻塞 syscall，
+    # 而 A-3 的前提就是"循环上不做这类事"（节流只是让它变稀，不是让它变对）。
+    write_runtime_metrics()
+    # A-6：真正开跑 = 从"排队字节"里出列（在跑的数量由 workers 数量天然有界）。
+    # B-5：排队时长在这里记账（提交 → 开跑），用户与自检都靠它区分
+    # "是我算得慢"还是"是在排队等前面的请求"。
+    _mask_dequeued(len(raw_content))
+    queue_wait_ms = (time.perf_counter() - t_submit) * 1000 if t_submit else 0.0
+    if queue_wait_ms > _MASK_TIMEOUTS["peak_wait_ms"]:
+        _MASK_TIMEOUTS["peak_wait_ms"] = queue_wait_ms
+    # A-6：名额必须在 worker 自己结束（含异常）时归还——超时返回给客户端后
+    # 孤儿 worker 仍在跑，若由调用方归还，B-4 的并发上界就成了事后失真的数字。
+    try:
+        masked_bytes = None
+        first_diff_byte = -1
+        with _ner_doc_budget(_ner_req_budget(len(raw_content))):
+            # 脱敏前记录扫描范围 + 各角色文本（仅内存，归因用，不落原文）
+            scan_scope = _request_scope(body)
+            role_texts = _collect_role_texts(body)
+            # 递归脱敏所有承载正文的顶层字段。逐格式硬编码会漏掉工具调用参数等嵌套位置，
+            # 这里统一走 _mask_tree（内部路径感知：协议位置跳过、业务区强制扫描）。
+            # 注意：必须遍历 body 全部顶层 key——曾只处理白名单 key，顶层自定义业务对象
+            # （customer 等）整体绕过脱敏（审计验收点"任意 customer.id"实测漏检）。
+            # 非字符串/列表/字典（数字/bool/null）_mask_tree 原样返回，无副作用。
+            # body_changed 是单元素 list（可变），由 _mask_hit 在真的替换过时置 True。
+            body_changed = [False]
+            # 顶层**键名**也要过一遍（审计 B2 的「敏感值作键名」）。
+            #
+            # 为什么之前漏了：这里按顶层 key 逐个取值送进 `_mask_tree`，于是键名本身
+            # 一次都没经过 `mask()`。而扩展链路的 `mask_body` 是把整个 body 交给
+            # `_mask_tree`（其 dict 分支会脱敏键名）——**同一个 body 走两条链路结果不同**，
+            # `{"13800138000": "safe"}` 在扩展链路已打码、在代理链路仍原样上行。
+            #
+            # 判据与 `_mask_tree` 的 dict 分支**完全一致**（同一个白名单、同一个 `mask()`），
+            # 不另立一套，否则两边迟早再漂一次。
+            # ⚠️ `_ROOT_WRAP_KEY` 必须原样保留：非对象根（列表根）会被包成
+            # `{__shield_root__: [...]}`，键名一旦被改写，下面 `body[_ROOT_WRAP_KEY]`
+            # 直接 KeyError → 整个脱敏管线抛异常 → fail-closed 503，所有列表根请求全挂。
+            renamed = {}
+            for key in list(body.keys()):
+                new_key = key
+                if (isinstance(key, str) and key != _ROOT_WRAP_KEY
+                        and key not in _MASK_PROTECTED_KEY_NAMES):
+                    masked_key = mask(key, sid)
+                    if masked_key != key:
+                        new_key = masked_key
+                        body_changed[0] = True
+                # 传进去的仍是**原键**：`_leaf_exempt` 的协议位置判定必须看客户端真实的键名
+                # （同 `_mask_tree` dict 分支的注释）。
+                renamed[new_key] = _mask_tree(body[key], sid, key, flag=body_changed)
+            # 就地替换内容而非给 body 重新绑定：body 是调用方持有的对象，
+            # 下面 enum 清洗 / splice / `masked_root` 都还在用它，且要保持键的插入顺序。
+            body.clear()
+            body.update(renamed)
 
-        # has_dup_keys 必须一起算进脏标记：树里丢了被覆盖的值，判定「没改过」是假的。
-        if body_changed[0] or enum_changed or has_dup_keys:
-            # 只有真的改过才回写请求体。回写方式分三级，目标都是别把「前缀」整体挪位 ——
-            # 上游按前缀做 Prompt Cache，前缀字节一变就整段 miss：
-            #   1) 首选**字节级文本替换**（`_splice_mask`）：直接在客户端原始 JSON 文本上
-            #      做敏感值占位符替换，客户端 body 的排版（空格、缩进、数字写法、转义风格）
-            #      全部原样保留。实测一条带空格 + `\u` 转义的请求：敏感值在 byte 74，
-            #      整棵重序列化的差异位却在 byte 9 —— 中间 65 字节的前缀被白白改掉。
-            #      由等价校验确保结构正确。见 `_splice_mask`。
-            #   2) 替换结果必须通过 `json.loads(结果) == 脱敏后的树` 等价校验才采用；
-            #      不过（含 enum 清洗这类结构性改动，splice 表达不了）就退回下一级。
-            #   3) 退路是整棵重序列化，两个细节同样为了保前缀：
-            #      · separators 用紧凑形态：json.dumps 默认 (", ", ": ") 会在每个
-            #        逗号/冒号后插空格，把 SDK 普遍发的紧凑体整体改写（实测 113→123 字节）。
-            #      · ensure_ascii 跟随客户端已表现出的策略：正文里出现过 `\u` 转义，
-            #        说明客户端用 ensure_ascii=True，我们回写时也转义；否则这次重序列化
-            #        会把 `\u5f20\u4e09` 展开成「张三」，凭空扩大与客户端前缀的字节差异。
-            # 三级回写的都是**同一棵已经脱敏的树**，所以不存在放行原文的路径。
-            masked_root = body if root_is_object else body[_ROOT_WRAP_KEY]
-            masked_raw = None
-            # has_dup_keys 时禁用 splice：丢掉的重复键不在替换表里，而等价校验
-            # （json.loads(spliced) == masked_root）会因为「解析回来仍是那棵折叠后的树」
-            # 而误判通过，于是原文里的敏感值被原样带出去。直接重序列化脱敏树。
-            if BYTE_SPLICE and not enum_changed and not has_dup_keys:
-                try:
-                    spliced = _splice_mask(
-                        raw_content, masked_root,
-                        {o: t for o, t in (sessions.get(sid, {}).get("fwd") or {}).items() if t},
-                    )
-                except Exception:
-                    spliced = None
-                if spliced is not None:
+            # has_dup_keys 必须一起算进脏标记：树里丢了被覆盖的值，判定「没改过」是假的。
+            if body_changed[0] or enum_changed or has_dup_keys:
+                # 只有真的改过才回写请求体。回写方式分三级，目标都是别把「前缀」整体挪位 ——
+                # 上游按前缀做 Prompt Cache，前缀字节一变就整段 miss：
+                #   1) 首选**字节级文本替换**（`_splice_mask`）：直接在客户端原始 JSON 文本上
+                #      做敏感值占位符替换，客户端 body 的排版（空格、缩进、数字写法、转义风格）
+                #      全部原样保留。实测一条带空格 + `\u` 转义的请求：敏感值在 byte 74，
+                #      整棵重序列化的差异位却在 byte 9 —— 中间 65 字节的前缀被白白改掉。
+                #      由等价校验确保结构正确。见 `_splice_mask`。
+                #   2) 替换结果必须通过 `json.loads(结果) == 脱敏后的树` 等价校验才采用；
+                #      不过（含 enum 清洗这类结构性改动，splice 表达不了）就退回下一级。
+                #   3) 退路是整棵重序列化，两个细节同样为了保前缀：
+                #      · separators 用紧凑形态：json.dumps 默认 (", ", ": ") 会在每个
+                #        逗号/冒号后插空格，把 SDK 普遍发的紧凑体整体改写（实测 113→123 字节）。
+                #      · ensure_ascii 跟随客户端已表现出的策略：正文里出现过 `\u` 转义，
+                #        说明客户端用 ensure_ascii=True，我们回写时也转义；否则这次重序列化
+                #        会把 `\u5f20\u4e09` 展开成「张三」，凭空扩大与客户端前缀的字节差异。
+                # 三级回写的都是**同一棵已经脱敏的树**，所以不存在放行原文的路径。
+                masked_root = body if root_is_object else body[_ROOT_WRAP_KEY]
+                masked_raw = None
+                # has_dup_keys 时禁用 splice：丢掉的重复键不在替换表里，而等价校验
+                # （json.loads(spliced) == masked_root）会因为「解析回来仍是那棵折叠后的树」
+                # 而误判通过，于是原文里的敏感值被原样带出去。直接重序列化脱敏树。
+                if BYTE_SPLICE and not enum_changed and not has_dup_keys:
                     try:
-                        if json.loads(spliced) == masked_root:
-                            masked_raw = spliced.decode("utf-8")
+                        spliced = _splice_mask(
+                            raw_content, masked_root,
+                            {o: t for o, t in (sessions.get(sid, {}).get("fwd") or {}).items() if t},
+                        )
                     except Exception:
-                        masked_raw = None
-            if masked_raw is None:
-                masked_raw = json.dumps(
-                    masked_root,
-                    ensure_ascii=(b"\\u" in raw_content),
-                    separators=(",", ":"),
-                )
-            # 历史里带上来的、上一轮遗留的占位符：登记进本会话，响应侧仍能还原（自愈）
-            _seed_known(masked_raw, sid)
-            # 回写由事件循环侧完成（见 _MaskResult）；这里只算出最终字节与差异位。
-            masked_bytes = masked_raw.encode("utf-8")
-            first_diff_byte = _first_diff_byte(raw_content, masked_bytes)
-        else:
-            # 零改写透传：一个敏感词都没命中，就**一个字都不动** flow.request.content。
-            # 除了省一次序列化，更重要的是保证上游收到的字节与客户端发出的完全一致
-            # （含分隔符、键序、\u 转义、数字字面量写法），这是 Prompt Cache 命中的前提。
-            # _seed_known 照常跑：客户端历史里带来的占位符本轮响应若被模型复述仍要能还原。
-            _seed_known(raw_content.decode("utf-8", "replace"), sid)
-    return _MaskResult(masked_bytes, first_diff_byte, scan_scope, role_texts,
-                       _ner_skips_of_this_round())
+                        spliced = None
+                    if spliced is not None:
+                        try:
+                            if json.loads(spliced) == masked_root:
+                                masked_raw = spliced.decode("utf-8")
+                        except Exception:
+                            masked_raw = None
+                if masked_raw is None:
+                    masked_raw = json.dumps(
+                        masked_root,
+                        ensure_ascii=(b"\\u" in raw_content),
+                        separators=(",", ":"),
+                    )
+                # 历史里带上来的、上一轮遗留的占位符：登记进本会话，响应侧仍能还原（自愈）
+                _seed_known(masked_raw, sid)
+                # 回写由事件循环侧完成（见 _MaskResult）；这里只算出最终字节与差异位。
+                masked_bytes = masked_raw.encode("utf-8")
+                first_diff_byte = _first_diff_byte(raw_content, masked_bytes)
+            else:
+                # 零改写透传：一个敏感词都没命中，就**一个字都不动** flow.request.content。
+                # 除了省一次序列化，更重要的是保证上游收到的字节与客户端发出的完全一致
+                # （含分隔符、键序、\u 转义、数字字面量写法），这是 Prompt Cache 命中的前提。
+                # _seed_known 照常跑：客户端历史里带来的占位符本轮响应若被模型复述仍要能还原。
+                _seed_known(raw_content.decode("utf-8", "replace"), sid)
+        return _MaskResult(
+            masked_bytes, first_diff_byte, scan_scope, role_texts,
+            _ner_skips_of_this_round(), _ner_metric_fields(),
+            round(queue_wait_ms, 1),
+        )
+    finally:
+        _mask_release(len(raw_content))
 
 
 async def request(flow: http.HTTPFlow):
@@ -5394,7 +6158,7 @@ async def request(flow: http.HTTPFlow):
                 # 必须完整——关了脱敏还 503 拦 multipart/二进制，等于没关（审计 P2）。
                 if "json" not in ct_unlisted and FAIL_CLOSED and FILTER_ENABLED:
                     _emit("BLOCK", host=host, method=method, path=path.split("?")[0],
-                          reason="unlisted_non_json_blocked", upstream=up_name, **source)
+                          reason="unlisted_non_json_blocked", block_source="engine", upstream=up_name, **source)
                     flow.response = http.Response.make(
                         503,
                         json.dumps({"error": "shield_mask_failed", "reason": "unlisted_non_json_blocked"},
@@ -5460,7 +6224,7 @@ async def request(flow: http.HTTPFlow):
         # 可关 fail_closed 放行，此时记 BYPASS 让用户在日志里看得见。
         if FAIL_CLOSED:
             _emit("BLOCK", host=host, method=method, path=path.split("?")[0],
-                  reason="non_json_body", content_type=str(ct or "")[:80],
+                  reason="non_json_body", block_source="engine", content_type=str(ct or "")[:80],
                   upstream=up_name, **source)
             flow.response = http.Response.make(
                 503,
@@ -5484,7 +6248,7 @@ async def request(flow: http.HTTPFlow):
     # 正是脱敏代理绝不能做的事。
     if len(raw_content) > _MAX_REQUEST_BODY:
         _emit("BLOCK", host=host, method=method, path=path.split("?")[0],
-              reason="request_too_large", bytes=len(raw_content),
+              reason="request_too_large", block_source="engine", bytes=len(raw_content),
               upstream=up_name, **source)
         flow.response = http.Response.make(
             413,
@@ -5501,7 +6265,7 @@ async def request(flow: http.HTTPFlow):
     if body is None:
         # 声明了 JSON 却解析不了：无法确认里面没有原文。fail_closed 下必须拦。
         if FAIL_CLOSED:
-            _emit("BLOCK", host=host, method=method, path=path.split("?")[0], reason="invalid_json", upstream=up_name, **source)
+            _emit("BLOCK", host=host, method=method, path=path.split("?")[0], reason="invalid_json", block_source="engine", upstream=up_name, **source)
             flow.response = http.Response.make(
                 400,
                 json.dumps({"error": "shield_invalid_json", "reason": "invalid_json"}, ensure_ascii=False).encode("utf-8"),
@@ -5549,7 +6313,7 @@ async def request(flow: http.HTTPFlow):
     #   explicit/local —— is_target(host, path) 为真（域名与路径都命中用户配置），
     #                     否则前面已 _emit_skip("not_target") 返回
     # 所以这里只需要看 fail_closed 本身。
-    if root_is_object and not _looks_like_llm_request(flow) and not any(k in body for k in _LLM_BODY_KEYS):
+    if root_is_object and not _looks_like_llm_request(flow, body) and not any(k in body for k in _LLM_BODY_KEYS):
         if not FAIL_CLOSED:
             _emit_skip(host, method, path, "non_llm_json", ct, source=source, upstream=up_name)
             return
@@ -5560,6 +6324,10 @@ async def request(flow: http.HTTPFlow):
     # 非流式请求不动，保留压缩节省带宽。置于 LLM 形态判断之后：非 LLM 请求不白改。
     if stream_mode == "stream" and STREAM_RESPONSE and host not in STREAM_EXCLUDE_HOSTS:
         flow.request.headers["accept-encoding"] = "identity"
+    if stream_mode == "stream":
+        # 请求侧要了流式：响应侧据此判断"没走流式"到底算不算降级（C-2）。
+        # 不设这个标记的话，普通非流式请求（绝大多数）也会被记成 non_sse 降级。
+        flow.metadata["shield_stream_requested"] = True
 
     # 清洗 tools schema 的 enum 非字符串值（Gemini function_declarations 兼容）。
     # 仅限已知中转渠道（实测其 tools 转换器拒绝非字符串 enum）
@@ -5597,10 +6365,10 @@ async def request(flow: http.HTTPFlow):
     if canary_hdr:
         nonces = [n for n in canary_hdr.split(",") if n]
         flow.metadata["audit_canaries"] = set(nonces)
-        # 注册到全局表（dict {nonce: ts}），按 ts 清理过期
-        now = time.time()
-        for n in nonces:
-            _AUDIT_CANARY_REGISTRY[n] = now
+        # 注意：**只记在 flow 上，先不写全局表** —— 注册是"脱敏副作用"，
+        # 必须排在准入之后（见下方 _mask_admit 处的不变式 7）：被 busy/timeout 拒掉的
+        # 请求从未上行，注册进去只会留下永远不会被匹配的僵尸 nonce（占 TTL 表）。
+        # 头照旧立刻剥掉：无论本条最终走不走脱敏，它都不该转发给上游。
         flow.request.headers.pop("x-shield-canaries", None)
 
     if DEBUG:
@@ -5616,20 +6384,85 @@ async def request(flow: http.HTTPFlow):
     body_rewritten = False
     first_diff_byte = -1
     ner_skips = {}          # 管线异常时下面的 MASK 事件仍会走到（fail-open 分支），需先有默认值
+    ner_metrics = {}        # 同上：治理器指标也要有默认值，异常路径才不至于 NameError
     _mask_t0 = time.perf_counter()
+    # ---- A-6 / B-4：准入判定 ----
+    # 必须在**任何签发副作用之前**（§4.2 不变式 7）：队列满就干净利落地拒掉，
+    # 不能"先签了占位符再拒"——那会把复用表和 `_RECENT_*` 污染成"存在但从未上行"的条目。
+    # 判据是字节预算 + 条数上限（按条数算的最坏值会失控：16 条 × 32MB = 512MB）。
+    if not _mask_admit(len(raw_content)):
+        _st = mask_pool_stats()
+        _emit("BLOCK", host=host, method=method, path=path.split("?")[0], sid=sid,
+              reason="engine_busy", block_source="engine", engine_busy=True,
+              engine_queue_depth=_st.get("queue_depth"),
+              engine_queue_bytes=_st.get("queued_bytes"),
+              bytes=len(raw_content),
+              msg="脱敏队列已满，请求未脱敏且未上行（客户端应退避重试）",
+              upstream=up_name, **source)
+        flow.response = http.Response.make(
+            503,
+            json.dumps({"error": {"code": "shield_busy", "reason": "engine_busy"}},
+                       ensure_ascii=False).encode("utf-8"),
+            {"content-type": "application/json",
+             # 抖动退避：固定 Retry-After 会让被拒客户端同一时刻一起回来，
+             # 正是本次故障里"503 重试风暴"的形态。
+             "Retry-After": str(_retry_after_seconds())},
+        )
+        _drop(sid)
+        return
+    # 准入通过才注册 canary（不变式 7：任何签发/登记副作用都排在准入之后）
+    for _nonce in (flow.metadata.get("audit_canaries") or ()):
+        _AUDIT_CANARY_REGISTRY[_nonce] = time.time()
     try:
         # 重活交给专职线程（见 _MASK_POOL）：本函数是 async 钩子，mitmproxy 会在
         # 事件循环里 await 它——等待期间其他连接的收发照常进行，一条慢会话不再冻住整机。
-        _res = await asyncio.get_running_loop().run_in_executor(
-            _MASK_POOL, _mask_pipeline_worker,
-            body, sid, raw_content, enum_changed, has_dup_keys, root_is_object,
-        )
+        _t_submit = time.perf_counter()
+        try:
+            _fut = asyncio.get_running_loop().run_in_executor(
+                _MASK_POOL, _mask_pipeline_worker,
+                body, sid, raw_content, enum_changed, has_dup_keys, root_is_object, _t_submit,
+            )
+        except Exception:
+            # 任务没进池 → worker 的 finally 永不执行。不在这里归还，名额与排队字节
+            # 就是**永久**泄漏（几次之后所有请求都被判 engine_busy，网关等于挂了）。
+            _mask_abandon(len(raw_content))
+            raise
+        try:
+            # ---- B-5：端到端 deadline ----
+            _res = await _await_with_deadline(_fut, _ENGINE_DEADLINE_S)
+        except asyncio.TimeoutError:
+            _MASK_TIMEOUTS["count"] += 1
+            _emit("BLOCK", host=host, method=method, path=path.split("?")[0], sid=sid,
+                  reason="engine_timeout", block_source="engine",
+                  bytes=len(raw_content),
+                  msg=f"脱敏超过 {int(_ENGINE_DEADLINE_S)}s 未完成，请求已中止（未上行）",
+                  upstream=up_name, **source)
+            flow.response = http.Response.make(
+                503,
+                json.dumps({"error": {"code": "shield_timeout", "reason": "engine_timeout"}},
+                           ensure_ascii=False).encode("utf-8"),
+                {"content-type": "application/json", "Retry-After": "5"},
+            )
+            # 不 `_drop(sid)`：worker 还在跑（shield 没取消它），主协程 pop 掉同一个
+            # dict 就是"一边删一边写"的竞态。会话此刻 `inflight=False`（那是在脱敏
+            # 成功、请求出网前才设的），`_sweep` 会按 TTL 正常回收它，不会泄漏。
+            # 超时这件事本身已经由 BLOCK 事件（reason=engine_timeout）与
+            # `engine_timeouts` 指标留痕，不需要再往会话里塞一个没人读的标记。
+            # 孤儿 future 的异常必须被取走：否则 asyncio 会在 GC 时打
+            # "Future exception was never retrieved"，污染日志（而这条日志正是
+            # 用户排查时最需要干净的地方）。
+            try:
+                _fut.add_done_callback(lambda f: f.cancelled() or f.exception())
+            except Exception:
+                pass
+            return
         # scan_scope / role_texts 在脱敏前算好带回：后面的 MASK 事件与会话都要用。
         scan_scope = _res.scan_scope
         role_texts = _res.role_texts
         # 本轮语义识别有没有降级（空 dict = 全程生效）：MASK 事件如实上报，
         # 静默降级等于「以为开了、其实没脱」。
         ner_skips = _res.ner_skips
+        ner_metrics = _res.ner_metrics or {}
         if _res.masked_bytes is not None:
             # 回写必须在事件循环线程里做（flow 是 mitmproxy 的对象）。
             flow.request.content = _res.masked_bytes
@@ -5639,7 +6472,7 @@ async def request(flow: http.HTTPFlow):
         _drop(sid)
         emit_path_err = orig_path if CAPTURE_MODE == "reverse" else path
         if FAIL_CLOSED:
-            _emit("BLOCK", host=host, method=method, path=emit_path_err.split("?")[0], reason="mask_pipeline_failed", msg=str(e)[:200], upstream=matched_up["name"] if matched_up else "", **source)
+            _emit("BLOCK", host=host, method=method, path=emit_path_err.split("?")[0], reason="mask_pipeline_failed", block_source="engine", msg=str(e)[:200], upstream=matched_up["name"] if matched_up else "", **source)
             flow.response = http.Response.make(
                 503,
                 json.dumps({"error": "shield_mask_failed", "reason": "mask_pipeline_failed"}, ensure_ascii=False).encode("utf-8"),
@@ -5742,6 +6575,11 @@ async def request(flow: http.HTTPFlow):
                 # 降级明细存会话：详情弹窗按 `_detailSeq` 回源的是 **RESTORE** 事件，
                 # 只挂在 MASK 上的话列表合并行看得到、弹窗看不到（半可见）。
                 s_sess["ner_skips"] = ner_skips
+            if ner_metrics:
+                # 同一条坑的第三次（前两次：degraded / block_source）：治理器指标
+                # （等待时长、全局限流次数）原先只挂 MASK，配对的 RESTORE 行没有，
+                # 于是"降级可见"在弹窗里等于没做。
+                s_sess["ner_metrics"] = ner_metrics
     except Exception:
         pass
     _emit(
@@ -5765,6 +6603,11 @@ async def request(flow: http.HTTPFlow):
         # 语义识别降级审计：本轮是否有叶子没走 NER（预算耗尽 / 单条过长 / 单次超时 /
         # 模型不可用），以及各原因各几条。非空时事件行会标出来，用户不必再去翻日志。
         **({"ner_truncated": True, "ner_skip_reasons": ner_skips} if ner_skips else {}),
+        # A-6/C-1：排队时长单列（它与 mask_ms 是两回事：一个在等前面的请求，
+        # 一个是自己在算），排障时"慢"的归因靠它。
+        **({"queue_wait_ms": _res.queue_wait_ms} if _res.queue_wait_ms >= 1.0 else {}),
+        # B-2：治理器指标（信号量等待 / 全局限流次数）。缺省不加字段，避免噪声。
+        **(ner_metrics or {}),
         # 请求体形态：标准 LLM 形态不带该字段；非对象根 / 白名单外形态各记一种，
         # 便于用户在日志里发现「这条是靠兜底脱敏的」并反馈新协议形态。
         **({"body_shape": "non_object_root"} if not root_is_object
@@ -5779,7 +6622,159 @@ async def request(flow: http.HTTPFlow):
     )
 
 
-def response(flow: http.HTTPFlow):
+def _response_offload(flow, sid, host, method, emit_path, source, ct):
+    """整包响应侧的重活（A-3），跑在 `_AUX_POOL` 线程里。
+
+    只**读** flow，不改它的任何字段；需要正文的三处一律显式传 `streamed_text`
+    （restore 后的文本），回写统一交给调用它的协程（§4.2 不变式 3）。
+
+    返回 `(new_content, ok, err, block, debug_text)`：
+      new_content  None = 未还原（体积超限或非结构化 ct），事件循环保持原文；
+      err          非空 = 还原阶段抛异常（调用方记 ERR）；**审计与响应扫描照常执行**
+                   —— 它们是安全层，不能因为"还原没做"就整段跳过（见下方注释）；
+      block        非空 = 要把响应换成这个 503（命令拦截或审计熔断）。
+    """
+    _AUX_STATS["submitted"] += 1
+    # 先抢槽位再解码：本函数体内所有 O(body) 的工作（解码、还原、审计、扫描）
+    # 都在槽位保护下，"已解码副本"不会随并发请求数线性增长。
+    _waited0 = time.perf_counter()
+    _AUX_SLOTS.acquire()
+    try:
+        _AUX_STATS["peak_inflight"] = max(_AUX_STATS.get("peak_inflight", 0),
+                                          _AUX_MAX_INFLIGHT - _AUX_SLOTS._value)
+        _AUX_STATS["wait_ms_total"] = (_AUX_STATS.get("wait_ms_total", 0.0)
+                                      + (time.perf_counter() - _waited0) * 1000)
+        return _response_offload_locked(flow, sid, host, method, emit_path, ct, source)
+    finally:
+        _AUX_SLOTS.release()
+
+
+def _stream_finish_offload(flow, sid, host, method, emit_path, source, restored_text,
+                          session_ref=None):
+    """流式收尾的审计 + 响应扫描（0.6.0：从事件循环搬到 `_AUX_POOL`）。
+
+    为什么**可以**搬：整包路径的 `_response_offload` 早就在 aux 线程里调用同样的
+    `_audit_response` / `_scan_response`（含只读访问 flow.metadata）—— "审计/扫描在
+    非循环线程上跑"已是本仓库的既有事实，这里只是把同款模式用到流式路径上。
+
+    与整包路径唯一的差别：流式回调是**同步**的（mitmproxy 的 stream 回调没有 await
+    点），所以投递后不等待。由此带来一个必须一起处理的事：`_drop(sid)` 也放到这里，
+    否则会话可能在扫描读会话态之前就被丢掉（会静默少一次响应扫描）。
+
+    实测收尾成本（事件循环原被占住的时间）：64KB ≈ 15ms、1MB ≈ 127ms、4MB ≈ 216ms。
+    """
+    _waited0 = time.perf_counter()
+    _AUX_SLOTS.acquire()
+    try:
+        _AUX_STATS["peak_inflight"] = max(_AUX_STATS.get("peak_inflight", 0),
+                                          _AUX_MAX_INFLIGHT - _AUX_SLOTS._value)
+        _AUX_STATS["wait_ms_total"] = (_AUX_STATS.get("wait_ms_total", 0.0)
+                                      + (time.perf_counter() - _waited0) * 1000)
+        _AUX_STATS["stream_finish"] = _AUX_STATS.get("stream_finish", 0) + 1
+        # `apply_block=False`：流式响应此刻已逐块下发到客户端，**再写 flow.response
+        # 既拦不住也已经晚了**；而且这里是 aux 线程，`flow.response = ...` 是 mitmproxy
+        # 状态，按本模块不变式 3 只能在事件循环线程碰（整包路径同样显式传 False）。
+        # 熔断的**记录**不受影响：`_audit_response` 先 `_emit("BLOCK", ...)` 再判断是否回写，
+        # 所以流式路径上的语义是"审计熔断：只记录、不回写"，且如实写在这里。
+        _audit_response(flow, sid, host, method, emit_path, source,
+                        streamed_text=restored_text, apply_block=False)
+        _scan_response(flow, sid, host, method, emit_path, source,
+                       streamed_text=restored_text)
+    except Exception as e:
+        # 与整包路径同口径：失败必须留痕（审计是安全层，不能因为搬了线程就静默丢）
+        _AUX_STATS["failed"] = _AUX_STATS.get("failed", 0) + 1
+        _log("[stream] 收尾审计/扫描失败：%s: %s" % (type(e).__name__, str(e)[:120]))
+    finally:
+        _AUX_SLOTS.release()
+        # 只丢"自己那条"会话：投递到现在之间可能已经有同 sid 的新会话了（见 _drop 注释）
+        _drop(sid, expect=session_ref)
+        with _AUX_PENDING_LOCK:
+            _AUX_PENDING[0] -= 1
+
+
+def aux_drain(timeout=10.0):
+    """等"已投递但未完成"的 aux 任务收尾（测试 / 诊断 / 冒烟脚本用）。
+
+    流式收尾是投递即返回的，所以断言审计结果前必须先过这个闸口。
+    返回 True = 已排空；False = 超时（并留一行日志，不静默）。
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while time.monotonic() < deadline:
+        with _AUX_PENDING_LOCK:
+            if _AUX_PENDING[0] <= 0:
+                return True
+        time.sleep(0.005)
+    with _AUX_PENDING_LOCK:
+        left = _AUX_PENDING[0]
+    _log("[aux] drain 超时：仍有 %d 项未完成" % left)
+    return False
+
+
+def _response_offload_locked(flow, sid, host, method, emit_path, ct, source):
+    """`_response_offload` 的本体（已持槽位）。拆出来只为让 acquire/release 与业务
+    逻辑不交叉：任何提前 return 都不会漏掉 release。"""
+    raw = flow.response.content or b""
+    new_content = None
+    err = None
+    try:
+        if "text/event-stream" in ct:
+            new_content = _restore_sse_body(raw, sid)
+        elif _is_ndjson_ct(ct):
+            new_content = _restore_ndjson_body(raw, sid)
+        elif "json" in ct:
+            new_content = _restore_json_body(
+                raw, sid, host, method, emit_path,
+                flow.response.headers.get("content-type", "") or "")
+    except Exception as e:
+        # ⚠️ 这里**不能 return**（0.6.0 修 A-3 重构引入的 fail-open 回归）：
+        # 0.5.0 的等价分支只置 ok = False，紧接着的审计与响应扫描**无条件执行**；
+        # 本函数一度在异常时直接 return，于是"body 形态能诱发还原异常"就等价于
+        # "这条响应不做审计、不落响应扫描" —— 输入可控地关掉一层安全检测。
+        # 还原失败时下游按**未还原原文**继续扫（审计口径照旧只扫前 128KB）。
+        _AUX_STATS["failed"] += 1
+        err = str(e)[:200]
+    # 还原后的文本：审计与 S9 都必须扫**还原后**的文本（占位符状态下路径/主机名
+    # 都是假的，判不准也没意义）；未还原时退回原文，与旧路径一致。
+    text = new_content.decode("utf-8", errors="replace") if new_content is not None \
+        else raw.decode("utf-8", errors="replace")
+
+    block = None
+    cmd_blocked = (sessions.get(sid) or {}).get("cmd_blocked")
+    if cmd_blocked:
+        # W2-4：block 模式的**非流式**收敛——整包换成结构化错误。
+        # 流式路径无法回收已下发的字节，那条路径靠槽位置空截断下发（见 _cmd_process）。
+        block = http.Response.make(
+            503,
+            json.dumps({"error": {"code": "shield_command_blocked",
+                                   "reason": "dangerous_command_in_response"}},
+                       ensure_ascii=False).encode("utf-8"),
+            {"content-type": "application/json"},
+        )
+    ok = not cmd_blocked and not err
+    debug_text = text if (ok and DEBUG) else None
+    if ok:
+        _emit_restore_summary(flow, sid, host, method, emit_path, source, ok=True,
+                              streamed_text=text)
+    # 审计：apply_block=False —— 只构造熔断响应，回写由事件循环负责
+    audit_block = _audit_response(flow, sid, host, method, emit_path, source,
+                                  streamed_text=text, apply_block=False)
+    if audit_block is not None:
+        block = audit_block
+    # 响应侧扫描：检测模型回复中不在本会话映射里的 PII（幻觉/训练数据泄漏）
+    _scan_response(flow, sid, host, method, emit_path, source, streamed_text=text)
+    _AUX_STATS["completed"] += 1
+    return (new_content, ok, err, block, debug_text)
+
+
+async def response(flow: http.HTTPFlow):
+    """整包响应处理（A-3：重活下池，回写留在事件循环）。
+
+    mitmproxy 12 的 `addonmanager.invoke_addon` 对协程钩子会 `await`
+    （实测 `inspect.isawaitable(res) -> await res`），所以这里可以安全地
+    `await run_in_executor`。**注意**：`invoke_addon_sync` 遇到协程钩子会直接
+    抛 AddonManagerError，而它只用于 Load/Running/Configure 这类生命周期事件，
+    不涉及 response。
+    """
     sid = flow.metadata.get("session_id")
     if not sid:
         return
@@ -5806,44 +6801,40 @@ def response(flow: http.HTTPFlow):
     s_cur = sessions.get(sid)
     if s_cur is not None and s_cur.get("resp_ts") is None:
         s_cur["resp_ts"] = time.time()
-    ok = True
-    try:
-        if "text/event-stream" in ct:
-            _handle_sse(flow, sid)
-        elif _is_ndjson_ct(ct):
-            # NDJSON 必须先判：application/x-ndjson 里含 "json"，落到下面的分支会
-            # json.loads 整段失败 → 整条响应未还原透传（Ollama 流式实测如此）。
-            _handle_ndjson(flow, sid)
-        elif "json" in ct:
-            _handle_json(flow, sid)
-    except Exception as e:
-        ok = False
+    # A-3：解析/还原/序列化 + RESTORE 摘要 + 审计 + 响应扫描全部下池。
+    # 事件循环在这里只是 `await`，不再被 O(body) 的 CPU 活占住。
+    loop = asyncio.get_running_loop()
+    _aux_t0 = time.perf_counter()
+    new_content, ok, err, block, debug_text = await loop.run_in_executor(
+        _AUX_POOL, _response_offload, flow, sid, host, method,
+        emit_path.split("?")[0], source, ct)
+    # 等待留痕（不设硬超时的理由见 _AUX_WAIT_TRACE_S 的注释）
+    _aux_wait_ms = (time.perf_counter() - _aux_t0) * 1000.0
+    if _aux_wait_ms >= _AUX_WAIT_TRACE_MS[0]:
+        _AUX_WAIT_TRACE_MS[0] = _aux_wait_ms
+    _aux_wait_kw = {}
+    if _aux_wait_ms >= _AUX_WAIT_TRACE_S * 1000.0:
+        _aux_wait_kw["aux_wait_ms"] = round(_aux_wait_ms, 1)
+    if _aux_wait_kw:
+        # 慢在哪要给得出证据：这条事件让"响应很慢"从主观感受变成可导出的时间戳
+        _emit("ERR", host=host, method=method, path=emit_path.split("?")[0], sid=sid,
+              msg="响应侧等待脱敏线程池 %.0fms（池宽 %d，见 aux_pool_stats）" % (
+                  _aux_wait_ms, _AUX_POOL._max_workers),
+              reason="response_offload_wait", **_aux_wait_kw, **source)
+    if err:
         s_err = sessions.get(sid, {}) if sid else {}
-        _emit("ERR", host=host, method=method, path=emit_path.split("?")[0], sid=sid, msg=str(e)[:200],
+        _emit("ERR", host=host, method=method, path=emit_path.split("?")[0], sid=sid,
+              msg=err,
               upstream=s_err.get("upstream_name") or flow.metadata.get("shield_upstream") or "",
               model=s_err.get("model") or flow.metadata.get("shield_model") or "",
               **source)
-    # W2-4：block 模式的**非流式**收敛——整包换成结构化错误。
-    # 流式路径无法回收已下发的字节，那条路径靠槽位置空截断下发（见 _cmd_process）；
-    # 两条路径的边界在设置页写清楚，不用「已阻断」这种模糊说法掩盖差异。
-    if ok and (sessions.get(sid) or {}).get("cmd_blocked"):
-        flow.response = http.Response.make(
-            503,
-            json.dumps({"error": {"code": "shield_command_blocked",
-                                   "reason": "dangerous_command_in_response"}},
-                       ensure_ascii=False).encode("utf-8"),
-            {"content-type": "application/json"},
-        )
-        ok = False
-    if ok and DEBUG:
-        _debug(f"RESPONSE {host}{path.split('?')[0]} -- 还原后(返回客户端)", sid,
-               flow.response.content.decode("utf-8", errors="replace"))
-    if ok:
-        _emit_restore_summary(flow, sid, host, method, emit_path.split("?")[0], source, ok=True)
-    # 2.0 审计：restore 完成后只读扫描，不影响 body
-    _audit_response(flow, sid, host, method, emit_path.split("?")[0], source)
-    # 响应侧扫描：检测模型回复中不在本会话映射里的 PII（幻觉/训练数据泄漏），只记录不阻断
-    _scan_response(flow, sid, host, method, emit_path.split("?")[0], source)
+    # ---- 回写（只在事件循环线程碰 flow）----
+    if new_content is not None:
+        flow.response.content = new_content
+    if debug_text is not None:
+        _debug(f"RESPONSE {host}{path.split('?')[0]} -- 还原后(返回客户端)", sid, debug_text)
+    if block is not None:
+        flow.response = block
     _drop(sid)
 
 
@@ -5883,12 +6874,20 @@ def _scan_response(flow, sid, host, method, path, source, streamed_text=None):
         # 响应 JSON 可能带 \uXXXX 转义（部分 SDK 默认 ensure_ascii）：直接扫原文时，
         # 转义序列的十六进制尾巴（如 \u8bdd 末位 d）会粘住数字边界导致漏检。
         # 先解析重排为非转义文本再扫（解析失败保持原文，SSE 场景走这里）。
-        try:
-            parsed = json.loads(body)
-            if isinstance(parsed, (dict, list)):
-                body = json.dumps(parsed, ensure_ascii=False)
-        except Exception:
-            pass
+        # ⚠️ 解析本身是 O(body)：A-1 给审计加了 `AUDIT_PARSE_MAX`，这里曾漏掉同形态的一处
+        # —— 一个 30MB 的响应会在事件循环上白付一次全量 `json.loads`，而下面只扫前
+        # `_SCAN_BODY_MAX`。超过解析预算就**跳过解析**（与审计 parse_skipped 同口径），
+        # 直接扫原文：宁可少一层"转义归一"，也不在循环上做整份解析。
+        # ⚠️ 单位说明：这里是**字符数**与字节预算比较。对中文（UTF-8 3 字节/字）
+        # 等于放行约 3 倍字节量 —— 属刻意的近似（对 body 再 encode 一次反而更贵），
+        # 但确实意味着 CJK 大响应的解析开销比英文高 3 倍，故记在这里而非留给读者猜。
+        if len(body) <= AUDIT_PARSE_MAX:
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, (dict, list)):
+                    body = json.dumps(parsed, ensure_ascii=False)
+            except Exception:
+                pass
         # 超长 body 全量正则扫描会霸占事件循环（几 MB 文本 × N 条规则）：只扫前段。
         # 响应侧扫描是防御性功能，前段命中已覆盖大部分幻觉/泄漏场景，代价是可控的。
         if len(body) > _SCAN_BODY_MAX:
@@ -6374,8 +7373,13 @@ def _is_ndjson_ct(content_type):
 
 
 def _handle_ndjson(flow, sid):
-    """整包 NDJSON 还原（流式接管关闭或未触发时的回退路径）。"""
-    raw = flow.response.content.decode("utf-8", errors="replace")
+    """薄包装（保留给单测）：纯函数 + 回写。"""
+    flow.response.content = _restore_ndjson_body(flow.response.content or b"", sid)
+
+
+def _restore_ndjson_body(raw_bytes, sid):
+    """整包 NDJSON 还原（纯函数，A-3：由 aux 线程调用）。"""
+    raw = raw_bytes.decode("utf-8", errors="replace")
     lines = raw.split("\n")
     last = len(lines) - 1
     out = []
@@ -6387,7 +7391,7 @@ def _handle_ndjson(flow, sid):
     tail = _flush_pending(sid, framing="ndjson")
     if tail:
         out.append(tail.rstrip("\n"))
-    flow.response.content = "\n".join(out).encode("utf-8")
+    return "\n".join(out).encode("utf-8")
 
 
 def _restore_sse_event(block, sid, final=False):
@@ -6645,14 +7649,35 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
         if state["done"]:
             return
         state["done"] = True
+        # 收尾：还原摘要留在循环上（微秒级），审计与响应扫描投递 `_AUX_POOL`
+        # （实测原占住循环 64KB≈15ms / 1MB≈127ms / 4MB≈216ms）。
+        # 注意本回调是**同步**的（mitmproxy 的 stream 回调无 await 点），投递后不等待，
+        # 所以"流结束"≠"审计已落库" —— 需要对齐时用 `aux_drain()`。
+        # 另一条硬约束仍在：流式接管下绝不能设置 flow.response.content（会被 mitmproxy
+        # 标记成已改写 → 客户端收到连接重置），所以下池的活里也不许碰它。
         # 关键：流式接管下绝不能设置 flow.response.content —— mitmproxy 12 会把响应
         # 标记为已改写，导致客户端收到连接重置(0 字节)。还原后的完整文本已在
         # state["text"] 里，直接传给事件/审计/扫描，不再碰 flow.response.content。
         restored_text = "".join(state["text"])
+        state["text"] = []          # 文本已转入局部变量，提前释放列表引用
+        # 还原摘要留在循环上发（它只是读几个计数 + 800B 预览，已成微秒级）：
+        # 这样 RESTORE → AUDIT/SCAN 的事件顺序与搬走之前**完全一致**。
         _emit_restore_summary(flow, sid, host, method, emit_path, source, ok=True, streamed_text=restored_text, stream_actual="stream", stream_usage=state["usage"])
-        _audit_response(flow, sid, host, method, emit_path, source, streamed_text=restored_text)
-        _scan_response(flow, sid, host, method, emit_path, source, streamed_text=restored_text)
-        _drop(sid)
+        # 审计与响应扫描是 O(body)（512KB 正则 + 摘要抽取），投递到 aux 池执行。
+        # `_drop(sid)` 也交给它（见 _stream_finish_offload 的注释）。
+        with _AUX_PENDING_LOCK:
+            _AUX_PENDING[0] += 1
+        _session_ref = sessions.get(sid)
+        try:
+            _AUX_POOL.submit(_stream_finish_offload, flow, sid, host, method,
+                             emit_path, source, restored_text, _session_ref)
+        except Exception as e:
+            # 池已关（进程收尾）：宁可占一次循环，也不能把这次审计丢掉。
+            with _AUX_PENDING_LOCK:
+                _AUX_PENDING[0] -= 1
+            _log("[stream] aux 池不可用（%s），收尾改为内联执行" % type(e).__name__)
+            _stream_finish_offload(flow, sid, host, method, emit_path, source,
+                                   restored_text, _session_ref)
 
     def _stream(data: bytes):
         if state["done"]:
@@ -6835,8 +7860,14 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
     try:
         # 流式接管时用回调累积的文本；非流式读 flow.response.content
         if streamed_text is not None:
-            resp_preview = _body_preview(streamed_text.encode("utf-8"), 800)
-            resp_dialog = _extract_chat_dialog(streamed_text.encode("utf-8"), 4000)
+            # ⚠️ 这里曾写 `streamed_text.encode("utf-8")`：为了取 800 字节预览与
+            # 4000 字对话，把**整份**还原文本编码成 bytes（再被 helper decode 回来）
+            # —— 纯白的 O(body)，实测 4MB 响应 109ms，而这一步跑在事件循环上
+            # （流式收尾）。两个 helper 的输出上限就 800B/4000 字，只给前缀足够；
+            # 传 str 也免掉 helper 内部那次全量 decode。
+            _src = streamed_text[:_PREVIEW_SRC_MAX]
+            resp_preview = _body_preview(_src, 800, total_len=len(streamed_text))
+            resp_dialog = _extract_chat_dialog(_src, 4000)
         elif flow.response and flow.response.content:
             resp_preview = _body_preview(flow.response.content, 800)
             resp_dialog = _extract_chat_dialog(flow.response.content, 4000)
@@ -6850,11 +7881,15 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
     # token 用量（尽力而为）：非流式顶层 usage；流式最后带 usage 的 chunk
     usage = {}
     try:
-        if stream_usage:
-            # 流式接管路径：usage 已在收流过程中逐块采集，不受文本留存上限影响
+        if streamed_text is not None:
+            # 流式路径：usage 已由 `_keep()` 逐块采集（每块只解析自己那几行），
+            # **绝不再回退**到"整段文本重解析"——那是 O(留存文本 × 行数) 的重复劳动
+            # （实测 256KB ≈ 10ms、4MB ≈ 158ms），而结论不会更好：采集器逐块看过
+            # 每一个 chunk，它没找到就是流里确实没有。此处回退只会在收尾处
+            # （事件循环上）白烧，且"文本留存上限"一改就悄悄放大。
+            usage = dict(stream_usage or {})
+        elif stream_usage:
             usage = stream_usage
-        elif streamed_text is not None:
-            usage = _extract_usage(streamed_text)
         elif flow.response and flow.response.content:
             usage = _extract_usage(flow.response.content.decode("utf-8", errors="replace"))
     except Exception:
@@ -6923,6 +7958,10 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
     # 上游 4xx + 请求带可疑 reasoning_effort：附加排查提示。透明代理不改请求
     # （下游配置问题由下游修），但事件里把原因说清楚，面板一眼可见。
     hint = ""
+    # A-7：RESTORE 事件的 503 一律来自上游（引擎只是把上游的状态码如实记下来）。
+    # 四种 503 来源（上游 / 请求侧 fail-closed / 响应侧阻断 / 兜底占位）此前
+    # 混在一个 http_status 里，用户和我们都只能靠猜——这个字段是"归因"的唯一依据。
+    block_source = "upstream"
     try:
         hs = getattr(flow.response, "status_code", None)
         re_val = flow.metadata.get("shield_reasoning_effort")
@@ -6932,6 +7971,11 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
         pass
     _emit(
         "RESTORE",
+        block_source=block_source,
+        # C-2：为什么整包（content_encoding:gzip / excluded_host / non_sse）。
+        # 没有降级时**不带这个键**：前端按"有键才显示"处理，不给正常请求加噪声。
+        **({"stream_degraded_reason": _stream_degraded_reason(flow)}
+           if _stream_degraded_reason(flow) else {}),
         host=host,
         method=method,
         path=path,
@@ -6974,6 +8018,12 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
         # 两边都得有 —— 详情弹窗回源的是 RESTORE，只挂 MASK 等于弹窗里看不到降级。
         **({"ner_truncated": True, "ner_skip_reasons": s.get("ner_skips")}
            if s.get("ner_skips") else {}),
+        # 治理器派生字段（与 MASK 同源，从会话带过来）：详情弹窗回源的正是本条 RESTORE，
+        # 不带就永远渲染不出来（前端 EventDetailDialog 读 event.ner_global_throttled）。
+        **({"ner_global_throttled": int(m.get("global_throttled") or 0),
+            "ner_sem_wait_ms": round(float(m.get("sem_wait_ms") or 0.0), 1)}
+           if (m := (s.get("ner_metrics") or {}))
+           and (m.get("global_throttled") or m.get("sem_wait_ms")) else {}),
         **source,
     )
 
@@ -7012,7 +8062,7 @@ def responseheaders(flow: http.HTTPFlow):
                 enc0 = (headers0.get("content-encoding", "") or "").lower().strip()
                 if enc0 and enc0 != "identity":
                     _log(f"[stream] 过滤关闭但上游返回 content-encoding={enc0}，退回整包路径（失去流式）")
-                    flow.metadata["shield_stream_degraded"] = enc0
+                    _note_stream_degraded(flow, "content_encoding:" + enc0)
                     return
                 headers0.pop("content-length", None)
                 flow.response.stream = _raw_stream_passthrough
@@ -7026,6 +8076,10 @@ def responseheaders(flow: http.HTTPFlow):
     elif "text/event-stream" in content_type:
         framing = "sse"
     else:
+        # 响应不是 SSE/NDJSON。**只有请求侧明确要了流式**才算降级：普通非流式请求
+        # 走整包路径是设计如此，给每个 JSON 响应挂一条"降级"只会把真降级淹掉。
+        if flow.metadata.get("shield_stream_requested"):
+            _note_stream_degraded(flow, "non_sse")
         return
     host = getattr(flow.request, "host", None) or flow.request.pretty_host
     path = flow.request.path
@@ -7039,10 +8093,13 @@ def responseheaders(flow: http.HTTPFlow):
         # request() 已对流式请求声明 identity，走到这里说明上游无视了该头。
         # 静默退化会让「面板显示流式、客户端实际卡整段」无法归因，必须留痕。
         _log(f"[stream] {host} 返回 content-encoding={content_encoding}，退回整包路径（失去流式）")
-        flow.metadata["shield_stream_degraded"] = content_encoding
+        _note_stream_degraded(flow, "content_encoding:" + content_encoding)
         return
     if host in STREAM_EXCLUDE_HOSTS:
-        return  # 用户显式排除的上游：保持整包路径
+        # 用户显式排除的上游：保持整包路径。这条**必须记**——用户在设置页加了黑名单
+        # 之后"流式不见了"，唯一的解释来源就是这里（否则只能靠翻配置回忆起自己加过）。
+        _note_stream_degraded(flow, "excluded_host")
+        return
     _log(f"[LLM Shield] {framing.upper()} stream hook: {method} {host}{path.split('?')[0]} ct={content_type[:60]}")
     # 转换后长度不再等于上游 Content-Length；移除后由 mitmproxy 使用分块传输。
     headers.pop("content-length", None)
@@ -7052,35 +8109,78 @@ def responseheaders(flow: http.HTTPFlow):
     )
 
 
-def _handle_json(flow, sid):
-    raw = flow.response.content or b""
+def _stream_degraded_reason(flow):
+    """读取「本该流式、实际整包」的原因；没有/读不到都返回 ""。
+
+    防御式读取是必须的：`_emit_restore_summary` 会被无 `metadata` 的对象调用
+    （测试里的 mock flow、以及历史上直接构造的 SimpleNamespace），直接
+    `flow.metadata.get(...)` 会把"没有降级"变成 AttributeError —— 即
+    **新增一个只在特定 flow 形态下炸的崩溃点**，而它恰好在响应收尾路径上。
+    """
+    try:
+        return str(flow.metadata.get("shield_stream_degraded") or "")
+    except Exception:
+        return ""
+
+
+def _note_stream_degraded(flow, reason):
+    """记一次「本该流式、实际整包」的降级原因（C-2）。
+
+    只写 metadata、不在这里发事件：真正的事件在 RESTORE 时统一发（那时才有 sid/
+    会话计数），避免同一个请求因为降级多发一条半成品事件。
+    """
+    try:
+        flow.metadata["shield_stream_degraded"] = str(reason)[:60]
+    except Exception:
+        pass
+
+
+def _restore_json_body(raw, sid, host, method, path, content_type=""):
+    """整包 JSON 还原（纯函数，A-3：由 aux 线程调用，返回新字节）。
+
+    返回 None 表示"不还原"（体积超限等），调用方保持原文并已留痕。
+    """
     # 体积闸（与请求侧 _MAX_REQUEST_BODY 对齐）：见该常量的注释。超限时**不还原**
     # 但必须留痕——否则用户看到裸占位符会以为是引擎坏了，而事件页毫无线索。
     if len(raw) > _MAX_RESPONSE_RESTORE_BODY:
         _emit_skip(
-            host=getattr(flow.request, "host", None) or flow.request.pretty_host,
-            method=getattr(flow.request, "method", "") or "",
-            path=flow.metadata.get("shield_orig_path") or flow.request.path,
+            host=host, method=method, path=path,
             reason="response_too_large",
-            content_type=flow.response.headers.get("content-type", "") or "",
+            content_type=content_type or "",
             force=True,
         )
-        return
+        return None
     body = json.loads(raw)
     body = _restore_tree(body, sid)
-    flow.response.content = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    return json.dumps(body, ensure_ascii=False).encode("utf-8")
 
 
-def _handle_sse(flow, sid):
-    """整包 SSE 还原（流式接管失败时的回退路径，以及单测用）。"""
-    raw = flow.response.content.decode("utf-8", errors="replace").replace("\r\n", "\n")
-    blocks = raw.split("\n\n")
+def _restore_sse_body(raw, sid):
+    """整包 SSE 还原（纯函数）：流式接管失败时的回退路径，以及单测用。"""
+    text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n")
+    blocks = text.split("\n\n")
     out = [_restore_sse_event(b, sid) for b in blocks]
     body = "\n\n".join(out)
     tail = _flush_pending(sid)  # 流末仍有半截占位符：补一条事件，不能吞字
     if tail:
         body = body.rstrip("\n") + "\n\n" + tail
-    flow.response.content = body.encode("utf-8")
+    return body.encode("utf-8")
+
+
+def _handle_json(flow, sid):
+    """薄包装（保留给单测与其他调用点）：纯函数 + 回写。"""
+    raw = flow.response.content or b""
+    out = _restore_json_body(raw, sid,
+                             getattr(flow.request, "host", None) or flow.request.pretty_host,
+                             getattr(flow.request, "method", "") or "",
+                             flow.metadata.get("shield_orig_path") or flow.request.path,
+                             flow.response.headers.get("content-type", "") or "")
+    if out is not None:
+        flow.response.content = out
+
+
+def _handle_sse(flow, sid):
+    flow.response.content = _restore_sse_body(flow.response.content or b"", sid)
 
 
 
@@ -7285,6 +8385,19 @@ def _read_settings():
             k: bool(audit_signals_cfg.get(k, dflt))
             for k, dflt in DEFAULT_AUDIT_SIGNALS.items()
         },
+        # A-1：审计扫描窗口 / 体积闸 / 时间预算。上限锁在旧的 `_SCAN_BODY_MAX`
+        # 上——用户可以把窗口调回 512KB（回到 0.5.0 的覆盖范围），但不许超过，
+        # 因为再往上就是本次故障里被线性放大的那段成本。
+        "audit_scan_max": _clamp_int(
+            audit_cfg.get("scan_max", _ENV_AUDIT_SCAN_MAX), AUDIT_SCAN_MAX,
+            16 * 1024, _SCAN_BODY_MAX),
+        "audit_parse_max": _clamp_int(
+            audit_cfg.get("parse_max", _ENV_AUDIT_PARSE_MAX), AUDIT_PARSE_MAX,
+            64 * 1024, _MAX_RESPONSE_RESTORE_BODY),
+        "audit_time_budget": _clamp_float(
+            audit_cfg.get("time_budget_ms", _ENV_AUDIT_TIME_BUDGET * 1000.0) / 1000.0
+            if audit_cfg.get("time_budget_ms") is not None else _ENV_AUDIT_TIME_BUDGET,
+            AUDIT_TIME_BUDGET_S, 0.01, 5.0),
         "ner_enabled": bool(cfg.get("ner_enabled", False)),
         # 命令拦截（W2-3）：解析 + 编译在 _read_settings 里做（热重载时一次），
         # 而不是每个 chunk 都编译。非法条目在此丢弃并记日志。
@@ -7304,6 +8417,7 @@ def _maybe_reload(force=False):
     """热重载：config.json mtime 变了就刷新内存设置。每个请求调用，开销=一次 stat。"""
     global TARGET_DOMAINS, API_PATHS, CUSTOM_WORDS, SESSION_TTL, DEBUG, DIAGNOSTIC_UNMATCHED, DOMAINS_DISABLED, SECRET_PREFIXES, UPSTREAMS, CAPTURE_MODE, FILTER_ENABLED
     global AUDIT_ENABLED, AUDIT_PASSIVE, AUDIT_ACTIVE_PROBES, AUDIT_SEVERITY_FLOOR, AUDIT_SIGNALS
+    global AUDIT_SCAN_MAX, AUDIT_PARSE_MAX, AUDIT_TIME_BUDGET_S, _ENV_AUDIT_SCAN_MAX, _ENV_AUDIT_PARSE_MAX, _ENV_AUDIT_TIME_BUDGET
     global FAIL_CLOSED, RESPONSE_SCAN, STREAM_RESPONSE, STREAM_EXCLUDE_HOSTS
     global SENSITIVE_DISABLED, SENSITIVE_WORD_DISABLED, SENSITIVE_WORD_WHOLE, BUILTIN_RULES, EGRESS_PROXY
     global COMMAND_BLOCK, _EXTRA_HEADER_SKIP_WARNED, _CUSTOM_WORD_RX_CACHE
@@ -7359,6 +8473,11 @@ def _maybe_reload(force=False):
     global AUDIT_FAIL_CLOSED
     AUDIT_FAIL_CLOSED = bool(s.get("audit_fail_closed", False))
     AUDIT_SIGNALS = s["audit_signals"]
+    # A-1 预算：配置换代必须让缓存指纹同步换代（指纹含这两个值），
+    # 否则改了窗口大小还会拿到按旧窗口算出来的结论。
+    AUDIT_SCAN_MAX = int(s.get("audit_scan_max") or AUDIT_SCAN_MAX)
+    AUDIT_PARSE_MAX = int(s.get("audit_parse_max") or AUDIT_PARSE_MAX)
+    AUDIT_TIME_BUDGET_S = float(s.get("audit_time_budget") or AUDIT_TIME_BUDGET_S)
     # 命令拦截：整段替换（含编译好的正则）——不能就地改，否则已停用的条目
     # 会在下一轮热重载里「复活」（_parse_command_block 每次返回全新结构）
     COMMAND_BLOCK = s.get("command_block") or _parse_command_block(None)

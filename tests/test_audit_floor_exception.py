@@ -25,6 +25,13 @@ import transparent as tr
 
 
 class AlwaysRecordFloorExceptionTests(unittest.TestCase):
+    def setUp(self):
+        # A-2 的 findings 缓存按「真实输入 + 信号开关」做键；本类注入的是**桩函数**
+        # 产出的合成 finding（连 signal 名都和开关不匹配），属于故意越界用法，
+        # 因此每次用例前清缓存，保证测的是门槛逻辑本身。
+        tr._AUDIT_FINDINGS_CACHE.clear()
+        tr._AUDIT_CFG_FP[0] = None
+
     def _run(self, signal_name, floor):
         """跑一次 `_audit_response`，返回被写库的 finding 列表。"""
         captured = []

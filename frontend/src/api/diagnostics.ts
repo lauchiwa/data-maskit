@@ -35,3 +35,43 @@ export function getDiagnostics(): Promise<DiagnosticsBundle> {
 export function saveDiagnostics(): Promise<{ ok: boolean; path?: string; size?: number; error?: string }> {
   return shieldFetch('/api/diagnostics/save', { method: 'POST', timeoutMs: 30000 })
 }
+
+/** 一键自检结论（§16）。与诊断包的分工：这里是**结论**，诊断包是**原始证据**。 */
+export interface SelfCheckFinding {
+  id: string
+  severity: 'high' | 'medium' | 'low' | 'ok'
+  title: string
+  evidence: string
+  action: string
+  /** false = 数据不足，界面必须标出来（不要当成"没问题"） */
+  verified?: boolean
+}
+
+export interface SelfCheckResult {
+  schema: number
+  generated_at: number
+  overall: 'high' | 'medium' | 'ok'
+  /** 一句话结论：设计成能直接复制给别人看 */
+  summary_line: string
+  findings: SelfCheckFinding[]
+  fired_ids?: string[]
+  ok_items?: { id: string; note: string }[]
+  input_errors?: { rule?: string; source?: string; error: string }[]
+}
+
+export interface SelfCheckResponse {
+  ok: boolean
+  selfcheck?: SelfCheckResult
+  engine_metrics_stale?: boolean
+  error?: string
+}
+
+/** 跑一次自检（只读；不产生任何外发请求）。 */
+export function runSelfCheck(): Promise<SelfCheckResponse> {
+  return shieldFetch<SelfCheckResponse>('/api/selfcheck')
+}
+
+/** 引擎运行指标（脱敏池/队列、审计耗时、NER 治理器）与端口实况。 */
+export function getEngineMetrics(): Promise<Record<string, unknown>> {
+  return shieldFetch<Record<string, unknown>>('/api/engine/metrics')
+}

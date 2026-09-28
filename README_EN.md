@@ -267,6 +267,51 @@ Given two clients (path prefixes `/openai` and `/anthropic`), point external too
 
 ---
 
+---
+
+## 🔥 Concurrency Tuning & 503 Triage (Read This When Things Get Slow)
+
+Maskit's masking runs **only on your own machine** — every request costs local CPU. When many agents
+(Cursor + Claude Code + Codex + a script) share one gateway, the local CPU is the bottleneck, not the upstream.
+
+### Recommended settings
+
+| Scenario | What to do |
+|---|---|
+| 1–2 agents on a personal machine | Defaults are fine. Semantic recognition (NER) stays on. |
+| 4+ agents, or NER enabled on a 1–2 core box | Turn **NER off** in Settings, or give the container/machine more CPU. NER is the single biggest CPU consumer. |
+| Docker on a small VPS | Set `--cpus` to what you actually have (e.g. `--cpus=2`) and set `MASKIT_NER_THREADS=1`. Without `--cpus` the process happily uses every core it can see and looks "pinned at 100%". |
+| Large bodies / many parallel streams | Lower concurrency at the client; the queue budget (`MASKIT_MASK_QUEUE_BYTES`) is **backpressure, not throughput** — raising it only delays the rejection. |
+
+Masking pool width adapts to the core count (1–4) and can be overridden with `MASKIT_MASK_WORKERS`.
+Note that plain-Python rule scanning is GIL-bound: adding workers helps most with NER (ONNX releases the GIL)
+and with avoiding head-of-line blocking, not with raw regex throughput.
+
+### A 503 is not always "the gateway is overloaded"
+
+Since 0.6.0 every 503 is attributed. Open the event detail, or run **Settings → One-click self-check**:
+
+| `block_source` / reason | Meaning | What to do |
+|---|---|---|
+| `upstream` | The **upstream/relay** returned it (Maskit merely recorded it). Multiple agents on one API key is the usual cause | Lower concurrency, add retry backoff, or use separate keys |
+| `engine_busy` | The local masking queue hit its byte/count budget | Lower concurrency; raise `MASKIT_MASK_QUEUE_BYTES` only if the machine truly has headroom |
+| `engine_timeout` | One request exceeded the end-to-end deadline (`MASKIT_ENGINE_DEADLINE_S`, default 120s) | Check for a huge body or an overloaded box; the request result is discarded, the client may retry |
+| `fallback` | The proxy is stopped and the fallback listener is configured to answer 503 | Start the proxy, or set the stop mode to `passthrough` |
+
+**One-click self-check** (Settings → Health Check & Recovery) turns the same signals into
+"problem + evidence + suggested action", including bare-metal vs container CPU throttling
+(`nr_throttled`), NER degradation reasons, queue backlog and writer drops. It never uploads anything.
+
+> 📦 **The NER model is not distributed with the source repo**: `engine/models/ner_mini_zh/`
+> (a ~100MB quantized ONNX) is `.gitignore`d and ships only inside the **desktop installers** and the
+> **official Docker image**. When running from source or building your own image, place these three files
+> under `engine/models/ner_mini_zh/`: `config.json`, `tokenizer.json`, `model_quantized.onnx`.
+> Otherwise the "Semantic recognition" toggle can be turned on but will do nothing — the engine logs a
+> warning at startup, and **One-click self-check** in Settings reports the model as unavailable.
+
+
+---
+
 ### Option C: Run from Source
 
 ```bash

@@ -178,7 +178,7 @@ export function AuditEventDetailDialog({
   event: AuditEvent | null
   onOpenChange: (v: boolean) => void
 }) {
-  const { t } = useI18n()
+  const { t, tf } = useI18n()
   return (
     <Dialog open={event !== null} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-lg">
@@ -239,6 +239,22 @@ export function AuditEventDetailDialog({
                     <code className="rounded bg-muted/60 px-1.5 py-0.5 font-mono text-xs">
                       {[event.method, event.host, event.path].filter(Boolean).join(' ')}
                     </code>
+                  </div>
+                )}
+                {!isInfoMode && (typeof event.audit_ms === 'number' || event.audit_scan_truncated) && (
+                  <div className="rounded-lg border bg-muted/30 p-3 text-xs">
+                    <div className="mb-1 font-semibold text-muted-foreground">{t('audit.scanBudget')}</div>
+                    <div className="space-y-0.5">
+                      {typeof event.audit_ms === 'number' && (
+                        <div>{tf('audit.scanCostMs', { ms: String(Math.round(event.audit_ms)) })}</div>
+                      )}
+                      {typeof event.audit_scan_bytes === 'number' && event.audit_scan_bytes > 0 && (
+                        <div>{tf('audit.scanCostBytes', { kb: String(Math.round(event.audit_scan_bytes / 1024)) })}</div>
+                      )}
+                      {event.audit_scan_truncated && (
+                        <div className="text-amber-700 dark:text-amber-400">{t('audit.scanTruncated')}</div>
+                      )}
+                    </div>
                   </div>
                 )}
                 {!isInfoMode && event.probe_id && (

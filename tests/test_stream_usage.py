@@ -85,6 +85,7 @@ class StreamingUsageTests(unittest.TestCase):
             for offset in range(0, len(raw), 17):
                 stream(raw[offset:offset + 17])
             stream(b"")
+            tr.aux_drain()  # 收尾已投递 aux 池：等它落库再断言
         emit.assert_not_called()
         summary.assert_called_once()
         self.assertEqual(summary.call_args.kwargs["stream_usage"],

@@ -2,6 +2,42 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.6.0] - 2026-09-28
+
+### 修复 / Bug Fixes
+- 引擎：修掉"长会话拖慢整个代理"的队头阻塞——审计扫描窗口由 512KB 收到 128KB 并加时间预算，脱敏线程池按核数自适应（1~4），响应侧的**还原/审计/扫描整体移出事件循环**（流式收尾一并下池：实测每个流式响应原占用循环约 35ms）；实测 8 路并发语义识别请求总耗时 3.15s → 1.05s。
+  *Engine: fixed head-of-line blocking behind long conversations — the audit scan window is now 128KB (was 512KB) with a time budget, the masking pool adapts to the core count (1–4), and response-side restore/audit/scan moved off the event loop (**the streaming finish path included**: ~35 ms of loop time per streamed response before); measured 8 concurrent NER requests: 3.15 s → 1.05 s.*
+- 引擎：脱敏队列改为按字节预算与条数上限准入（超限回 503 + `Retry-After`，带抖动），并在 worker 异常路径上也归还名额；首次在内存上给并发设了天花板。
+  *Engine: the masking queue now admits by byte budget and in-flight count (over-limit answers 503 + a jittered `Retry-After`) and returns the quota even when a worker raises; concurrency finally has an explicit ceiling.*
+- 引擎：新增端到端上限（默认 120s，`MASKIT_ENGINE_DEADLINE_S`），超时回结构化 503 而不是无限等待；等待超时不会中断已在跑的 worker。
+  *Engine: added an end-to-end deadline (120 s by default, `MASKIT_ENGINE_DEADLINE_S`) that answers a structured 503 instead of waiting forever; hitting it does not kill the in-flight worker.*
+- 引擎：语义识别加进程级并发信号量与每秒推理预算，过载时**降级但不断链**并记录原因（`global_throttled`）；修掉初始化竞态（并发首调可能建出两个 ONNX 会话）。
+  *Engine: NER now has a process-wide inference semaphore and a per-second budget, degrading (with a recorded reason, `global_throttled`) instead of breaking the chain; fixed an init race where concurrent first calls could build two ONNX sessions.*
+- 引擎：浏览器扩展链路解除全局串行 —— 脱敏/文件脱敏/流式还原这些重活移出 `_EXT_LOCK`（多标签页并发时不再互相堵），并把「必须持锁」与「必须不持锁」两侧都写成静态守卫。
+  *Engine: removed global serialization on the browser-extension path — masking, document masking and stream restore moved out of `_EXT_LOCK` (concurrent tabs no longer queue behind each other), with static guards for both "must lock" and "must not lock".*
+- 修复：`audit.scan_max` / `parse_max` / `time_budget_ms` 手改 config.json 后被配置归一化抹掉（自检提示让用户改这三个键，却会被自检自己抹掉）；新增：响应侧等待脱敏线程池超过 2s 时留痕（`aux_wait_ms` 进事件、导出与审计弹窗），并把审计耗时/扫描字节/是否截断真正显示在审计详情弹窗里（此前只在后端落库，前端渲染的是永远取不到值的死分支）。
+  *Fixed: `audit.scan_max` / `parse_max` / `time_budget_ms` were silently erased from config.json by config normalization (the self-check told users to edit them, then wiped them itself). Added: response-side wait on the masking pool is now traced when it exceeds 2s (`aux_wait_ms` in events, exports and the event dialog), and audit cost/scan-bytes/truncation are now actually rendered in the audit detail dialog (previously DB-only, with the frontend rendering a branch that could never resolve).*
+- 引擎：修掉流式收尾下池引入的两处线程归属问题（延后 `_drop` 可能抹掉同一会话的新实例、审计熔断在 aux 线程回写 `flow.response`），并给审计运行时计数器加锁；审计缓存键补上 `ct` 与响应头摘要（同 body 不同头不再回放旧结论）。
+  *Engine: fixed two thread-ownership issues introduced by offloading the stream finish (a deferred `_drop` could wipe a re-created session, and the audit block wrote `flow.response` on an aux thread), locked the audit runtime counters, and added `ct` + response-header digest to the audit cache key (identical bodies with different headers no longer replay a stale verdict).*
+- 引擎：请求体不再被解析两遍（实测 1MB 请求省约 1.2ms 事件循环时间）；响应侧新增可读的「为什么整包」原因与每条请求的脱敏排队时长，事件详情直接可见。
+  *Engine: request bodies are no longer parsed twice (~1.2 ms of event-loop time saved on a 1 MB body); responses now carry a readable "why whole-body" reason and each request reports its mask-queue wait, both visible in the event detail.*
+- 引擎：流式收尾（审计 + 响应扫描）下池，并去掉四处 O(body) 白烧（4MB 响应实测从 216ms 降到 ~1ms 循环占用）；审计只解码"会被用到的文本"（超 2MB 的响应不再为 128KB 扫描窗口把整份 body 解码成字符串），**响应哈希仍是全量 sha256**（证据语义不变）；同轮修掉"进程名取错 CSV 列导致每次端口判定都白跑一次 8s 超时 PowerShell"的老问题，端口快照改为一次 `tasklist` + 一次 CIM 批量归类（含 5s 缓存）。
+  *Engine: the streaming finish path (audit + response scan) is now offloaded, and three needless O(body) passes were removed (a 4 MB response went from ~216 ms of loop time to ~1 ms). The audit now decodes only the text it actually uses (responses over 2 MB no longer get a full-body decode just to feed a 128 KB scan window) while the response hash stays a full sha256 (evidence semantics unchanged). The same pass fixed a long-standing bug where the process name was read from the wrong CSV column (so every port ownership check fell through to an 8 s-timeout PowerShell call); port snapshots now use one `tasklist` plus one batched CIM query with a 5 s cache.*
+
+### 新增 / Added
+- 引擎：503 增加来源归因（上游 / 本机熔断 / 兜底层），事件详情与自检都能一眼区分"是上游拒的还是本机拦的"。
+  *Engine: 503s are now attributed (upstream / local fail-closed / fallback), so the event detail and the self-check tell upstream rejections apart from local blocking at a glance.*
+- 设置页：新增**一键自检**（设置 → 健康检查与恢复），把端口、队列、语义识别降级、审计截断、磁盘与容器 CPU 限流翻译成「问题 + 证据 + 建议动作」，只读本机数据、不联网；诊断包同步升级为 schema 2 并内嵌该结论。
+  *Settings: added **One-click self-check** (Settings → Health Check & Recovery) turning ports, queueing, NER degradation, audit truncation, disk and container CPU throttling into "problem + evidence + suggested action". It reads local data only and never goes online; the diagnostics bundle is now schema 2 and embeds the conclusion.*
+- 引擎：新增 `/api/engine/metrics`（走 `/api/` 三重校验）暴露脱敏队列、审计耗时与语义识别治理器状态，供面板与自检共用。
+  *Engine: added `/api/engine/metrics` (behind the `/api/` triple guard) exposing mask-queue, audit-timing and NER-governor state for both the panel and the self-check.*
+
+### 文档 / Docs
+- 文档：`README` 增「多并发调优与 503 排查」章节（503 四种来源的分辨方法、容器 CPU 配额与 NER 的关系），`SECURITY.md` 登记本轮新增的环境变量并补上"审计扫描预算"这一能力边界。
+  *Docs: `README` gained a "concurrency tuning & 503 triage" section (how to tell the four 503 sources apart, why container CPU quotas matter for NER); `SECURITY.md` registers the new environment variables and documents the audit scan budget as an explicit capability boundary.*
+- 引擎：启动时对「语义识别已开启但模型缺失」显式告警，并在 README 说明 NER 模型不随源码仓库分发。
+  *Engine: warns loudly at startup when semantic recognition is enabled but the model is missing, and the README now states that the NER model is not distributed with the source repo.*
+
 ## [0.5.0] - 2026-09-24
 
 ### 新增 / Added

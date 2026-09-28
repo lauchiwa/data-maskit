@@ -207,7 +207,12 @@ class DiagnosticsPayloadTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         body = json.loads(r.data.decode("utf-8"))
         self.assertTrue(body["masked"])
-        self.assertEqual(body["schema"], 1)
+        # 0.6.0 起 schema=2：诊断包内嵌一键自检结论（结论给人看、证据给维护者，
+        # 同一个文件）。断 >= 2 而不是写死 2：版本再升时不该因为一个无关字段
+        # 让这条端到端用例变红。
+        self.assertGreaterEqual(body["schema"], 2)
+        self.assertIn("selfcheck", body)
+        self.assertIn("findings", body["selfcheck"])
 
     def test_endpoint_requires_token(self):
         """诊断包即便打过码也含端口/配置/错误信息，不能对无令牌请求开放。"""

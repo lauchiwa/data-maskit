@@ -156,6 +156,25 @@ export interface ShieldEvent {
   resp_preview?: string
   stream_mode?: 'stream' | 'whole'
   stream_actual?: 'stream' | 'whole' | 'stream_error'
+  /**
+   * A-7：本次的 503/错误是**谁**造成的。
+   * upstream = 上游/中转返回的（Maskit 只是如实记录）；engine = 本机 fail-closed 拦的；
+   * fallback = 代理已停时兜底层占位回的。没有这个字段，用户只能靠猜。
+   */
+  block_source?: 'upstream' | 'engine' | 'fallback'
+  /** 队列满被拒（engine_busy）时的现场数据，用于判断"是我并发太高还是机器太小" */
+  engine_busy?: boolean
+  engine_queue_depth?: number
+  engine_queue_bytes?: number
+  /** 语义识别因全局速率预算/信号量被跳过时的计数与等待时长 */
+  ner_global_throttled?: number
+  ner_sem_wait_ms?: number
+  /** C-2：本该流式却走整包的原因（content_encoding:gzip / excluded_host / non_sse） */
+  stream_degraded_reason?: string
+  /** 脱敏池排队时长（毫秒）：只在本条真的排过队（≥1ms）时才带 */
+  queue_wait_ms?: number
+  /** 响应侧等待脱敏线程池的时长（毫秒）：只在本条等超过阈值（默认 2s）时才带 */
+  aux_wait_ms?: number
   mask_ms?: number
   first_byte_ms?: number
   upstream_ms?: number
@@ -348,6 +367,10 @@ export interface AuditEvent {
   probe_id?: string
   request_hash?: string
   response_hash?: string
+  /** A-1：本条审计的耗时 / 扫描字节 / 是否被预算截断（老数据为 null） */
+  audit_ms?: number | null
+  audit_scan_bytes?: number | null
+  audit_scan_truncated?: boolean | null
   [key: string]: unknown
 }
 

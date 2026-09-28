@@ -63,6 +63,11 @@ const NER_SKIP_LABELS: Record<string, string> = {
   model_missing: 'settings.sw.nerSkipModelMissing',
   om_compose: 'settings.sw.nerSkipCompose',
   runtime: 'settings.sw.nerSkipRuntime',
+  // B-2（0.6.0）：治理器新增的两个降级原因。加它们不是"多列两项"——
+  // 契约测试（test_regressions.NerSkipReasonSurfacesTests）会要求引擎报出的
+  // 每个键在两个界面上都有落点，否则用户看到的又是静默降级。
+  global_throttled: 'settings.sw.nerSkipGlobalThrottled',
+  sem_timeout: 'settings.sw.nerSkipSemTimeout',
 }
 
 /**
@@ -276,6 +281,77 @@ export function EventDetailDialog({
                     </Badge>
                   </>
                 )}
+              </div>
+            )}
+
+            {/* A-7 / C-1：503 归因 + 队列现场 + 语义识别降级计数。
+                这是"503 到底怪谁"这个问题的唯一答案来源——字段一直进了事件库与导出，
+                但此前**前端一个都没渲染**（等于用户看不到），所以在这里按"有则显示"补齐。
+                注意：审计耗时/扫描字节那三个字段**不属于这里** —— 它们只存在于
+                audit_events 表，渲染在 AuditEventDetailDialog；挂在这里是死分支
+                （真这么写过一次：永远读到 undefined，比不渲染更糟）。 */}
+            {(event.block_source || event.engine_busy || event.ner_global_throttled) && (
+              <div className="space-y-1 rounded-lg border bg-muted/30 p-2.5 text-xs">
+                {event.block_source && (
+                  <div>
+                    <span className="text-muted-foreground">{t('detail.blockSource')}：</span>
+                    {t(`detail.blockSource.${event.block_source}`) === `detail.blockSource.${event.block_source}`
+                      ? event.block_source
+                      : t(`detail.blockSource.${event.block_source}`)}
+                  </div>
+                )}
+                {event.engine_busy && (
+                  <div className="text-amber-700 dark:text-amber-400">
+                    {tf('detail.engineBusy', {
+                      d: String(event.engine_queue_depth ?? '-'),
+                      b: String(event.engine_queue_bytes ?? '-'),
+                    })}
+                  </div>
+                )}
+                {typeof event.ner_global_throttled === 'number' && event.ner_global_throttled > 0 && (
+                  <div className="text-amber-700 dark:text-amber-400">
+                    {tf('detail.nerGlobalThrottled', { n: String(event.ner_global_throttled) })}
+                  </div>
+                )}
+                {typeof event.aux_wait_ms === 'number' && event.aux_wait_ms >= 1 && (
+                  <div className="text-muted-foreground">
+                    {tf('detail.auxWait', { ms: String(Math.round(event.aux_wait_ms)) })}
+                  </div>
+                )}
+                {typeof event.ner_sem_wait_ms === 'number' && event.ner_sem_wait_ms >= 1 && (
+                  <div className="text-muted-foreground">
+                    {tf('detail.nerSemWait', { ms: String(Math.round(event.ner_sem_wait_ms)) })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* C-2：本该流式却整包——把"为什么"直接写出来。
+                用户看到的只是"字一个个蹦 vs 一坨蹦"，没有这条就只能翻配置猜。
+                三种原因的可操作性不同，所以文案分开：编码问题是上游行为（改不了），
+                排除名单是自己加的（改得了）。 */}
+            {event.stream_degraded_reason && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs leading-relaxed text-amber-700 dark:text-amber-400">
+                <div className="font-semibold">{t('detail.streamDegraded')}</div>
+                <div className="mt-1">
+                  {event.stream_degraded_reason.startsWith('content_encoding:')
+                    ? tf('detail.streamDegraded.encoding', {
+                        enc: event.stream_degraded_reason.slice('content_encoding:'.length),
+                      })
+                    : event.stream_degraded_reason === 'excluded_host'
+                      ? t('detail.streamDegraded.excluded')
+                      : event.stream_degraded_reason === 'non_sse'
+                        ? t('detail.streamDegraded.non_sse')
+                        : tf('detail.streamDegraded.other', { reason: event.stream_degraded_reason })}
+                </div>
+              </div>
+            )}
+
+            {/* C-2 附带：本条的脱敏排队时长（只在真排过队时出现）。
+                它是"我这台机器/这套并发到底吃不吃得消"的直接证据，比看 CPU 直观。 */}
+            {typeof event.queue_wait_ms === 'number' && event.queue_wait_ms >= 1 && (
+              <div className="text-xs text-muted-foreground">
+                {tf('detail.queueWait', { ms: String(Math.round(event.queue_wait_ms)) })}
               </div>
             )}
 

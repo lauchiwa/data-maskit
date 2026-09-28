@@ -463,7 +463,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow.response = SimpleNamespace(
                     headers={"content-type": "application/json"}, status_code=200,
                     content=json.dumps({"choices": [{"message": {"content": "好的"}}]}).encode("utf-8"))
-                tr.response(flow)
+                asyncio.run(tr.response(flow))
             finally:
                 tr._emit = old_emit
             evs = {t: kw for t, kw in captured}
@@ -960,7 +960,7 @@ class ShieldEngineTests(unittest.TestCase):
                 headers={"content-type": "application/json"},
                 content=json.dumps({"choices": [{"message": {"content": "收到：" + masked_prompt}}]}, ensure_ascii=False).encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             got = json.loads(flow.response.content)
             self.assertEqual(got["choices"][0]["message"]["content"], "收到：客户张三的电话是13812345678")
         self._with_no_reload(run)
@@ -985,7 +985,7 @@ class ShieldEngineTests(unittest.TestCase):
                 content=("data: %s\n\n" % json.dumps(
                     {"choices": [{"delta": {"content": masked}}]}, ensure_ascii=False)).encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             self.assertIn("13812345678", flow.response.content.decode("utf-8"),
                           "大小写/空白的 content-type 也必须走还原")
         self._with_no_reload(run)
@@ -1012,7 +1012,7 @@ class ShieldEngineTests(unittest.TestCase):
             try:
                 tr._emit_skip = lambda **kw: skips.append(kw)
                 with mock.patch.object(tr, "_MAX_RESPONSE_RESTORE_BODY", 8):
-                    tr.response(flow)
+                    asyncio.run(tr.response(flow))
             finally:
                 tr._emit_skip = old_skip
             self.assertEqual(flow.response.content, raw, "超限时不得改动 body")
@@ -1037,7 +1037,7 @@ class ShieldEngineTests(unittest.TestCase):
                 status_code=200,
                 content=json.dumps({"choices": [{"message": {"content": "收到：" + masked}}]}, ensure_ascii=False).encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
         finally:
             tr._emit = old_emit
             tr._maybe_reload = old_reload
@@ -1061,7 +1061,7 @@ class ShieldEngineTests(unittest.TestCase):
                 headers={"content-type": "application/json"},
                 content=json.dumps({"choices": [{"text": "摘要：" + masked_prompt}]}, ensure_ascii=False).encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             got = json.loads(flow.response.content)
             self.assertEqual(got["choices"][0]["text"], "摘要：请总结李四的邮箱lisi@example.com")
         self._with_no_reload(run)
@@ -1080,7 +1080,7 @@ class ShieldEngineTests(unittest.TestCase):
                 headers={"content-type": "application/json"},
                 content=json.dumps({"content": [{"type": "text", "text": sent["system"] + "|" + sent["messages"][0]["content"]}]}, ensure_ascii=False).encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             got = json.loads(flow.response.content)["content"][0]["text"]
             self.assertIn("password=ServerPass123!", got)
             self.assertIn("token=abcdefghijklmnopqrstuvwxyz123456", got)
@@ -1101,7 +1101,7 @@ class ShieldEngineTests(unittest.TestCase):
                 headers={"content-type": "application/json"},
                 content=json.dumps({"output_text": masked, "output": [{"content": [{"type": "output_text", "text": masked}]}]}, ensure_ascii=False).encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             got = json.loads(flow.response.content)
             self.assertIn("sk-proj-abcdefghijklmnopqrstuvwxyz123456", got["output_text"])
             self.assertIn("联系张三", got["output"][0]["content"][0]["text"])
@@ -1150,7 +1150,7 @@ class ShieldEngineTests(unittest.TestCase):
                      "input": {"query": token}},
                 ]}, ensure_ascii=False).encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             got = json.loads(flow.response.content)
             self.assertEqual(got["content"][0]["input"]["query"], "张三")
             self.assertEqual(got["content"][0]["name"], "search")
@@ -1181,7 +1181,7 @@ class ShieldEngineTests(unittest.TestCase):
                 status_code=200,
                 content=json.dumps({"choices": [{"message": {"content": "关于" + tok1}}]}, ensure_ascii=False).encode("utf-8"),
             )
-            tr.response(f2)
+            asyncio.run(tr.response(f2))
             self.assertIn("关于张三", json.loads(f2.response.content)["choices"][0]["message"]["content"])
         self._with_no_reload(run)
 
@@ -1228,6 +1228,7 @@ class ShieldEngineTests(unittest.TestCase):
             tail = stream(b"data: [DONE]\n\n")
             self.assertIn("[DONE]", tail.decode("utf-8"))
             stream(b"")
+            tr.aux_drain()  # 收尾已投递 aux 池：等它落库再断言
         self._with_no_reload(run)
 
     def test_ndjson_whole_body_is_restored(self):
@@ -1251,7 +1252,7 @@ class ShieldEngineTests(unittest.TestCase):
                 status_code=200,
                 content=body.encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             out = flow.response.content.decode("utf-8")
             self.assertIn("你好张三", out)
             self.assertNotIn(token, out)
@@ -1289,6 +1290,7 @@ class ShieldEngineTests(unittest.TestCase):
                 ensure_ascii=False) + "\n").encode("utf-8"))
             self.assertIn("张三在", second.decode("utf-8"))
             stream(b"")
+            tr.aux_drain()  # 收尾已投递 aux 池：等它落库再断言
         self._with_no_reload(run)
 
     def test_ndjson_stream_holds_incomplete_line(self):
@@ -1311,6 +1313,7 @@ class ShieldEngineTests(unittest.TestCase):
             out = stream(b'"}}\n')
             self.assertIn("half", out.decode("utf-8"))
             stream(b"")
+            tr.aux_drain()  # 收尾已投递 aux 池：等它落库再断言
         self._with_no_reload(run)
 
     def test_ndjson_content_type_detection(self):
@@ -1356,6 +1359,7 @@ class ShieldEngineTests(unittest.TestCase):
             self.assertIsInstance(done, bytes)
             self.assertIn("你好", done.decode("utf-8"))
             stream(b"")
+            tr.aux_drain()  # 收尾已投递 aux 池：等它落库再断言
         self._with_no_reload(run)
 
     def test_sse_stream_restores_partial_placeholder_in_reasoning_field(self):
@@ -1392,6 +1396,7 @@ class ShieldEngineTests(unittest.TestCase):
             self.assertIn("张三", chunk2, "跨 chunk 半截应拼合还原")
             self.assertNotIn("{{", chunk2)
             stream(b"")
+            tr.aux_drain()  # 收尾已投递 aux 池：等它落库再断言
         self._with_no_reload(run)
 
     def test_reasoning_restore_survives_tcp_split_events(self):
@@ -1497,7 +1502,10 @@ class ShieldEngineTests(unittest.TestCase):
                     status_code=200, content=b"", stream=None,
                 )
                 tr.responseheaders(flow)
-                self.assertEqual(flow.metadata.get("shield_stream_degraded"), "gzip")
+                # C-2：原因归一成 `content_encoding:<编码>`，前端可直接显示
+                # "上游无视 identity，返回 gzip"，比裸 "gzip" 更说明问题。
+                self.assertEqual(flow.metadata.get("shield_stream_degraded"),
+                                 "content_encoding:gzip")
                 # 未接管：stream 回调没装，交回 response() 整包路径
                 self.assertIsNone(flow.response.stream)
                 self.assertNotIn("shield_streamed", flow.metadata)
@@ -1540,6 +1548,7 @@ class ShieldEngineTests(unittest.TestCase):
                      "usage": {"prompt_tokens": 11, "completion_tokens": 22}})).encode("utf-8"))
                 stream(b"data: [DONE]\n\n")
                 stream(b"")
+                tr.aux_drain()  # 收尾已投递 aux 池：等它落库再断言
                 ev = captured.get("RESTORE") or {}
                 self.assertEqual(ev.get("usage"),
                                  {"prompt_tokens": 11, "completion_tokens": 22},
@@ -1584,6 +1593,7 @@ class ShieldEngineTests(unittest.TestCase):
             self.assertNotIn("{{", chunk2)
             self.assertIn("正文完毕", chunk3, "正文通道不受 reasoning 缓冲影响")
             stream(b"")
+            tr.aux_drain()  # 收尾已投递 aux 池：等它落库再断言
             # dialog 分段：reasoning_text 与 output_text 分开
             raw = 'event: response.reasoning_text.delta\ndata: {"type":"response.reasoning_text.delta","delta":"想"}\n\n' \
                   'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"答"}\n\n'
@@ -1623,6 +1633,7 @@ class ShieldEngineTests(unittest.TestCase):
                 )
                 stream(event.encode("utf-8"))
                 stream(b"")
+                tr.aux_drain()  # 收尾已投递 aux 池：等它落库再断言
                 restores = [kw for t, kw in emitted if t == "RESTORE"]
                 self.assertEqual(len(restores), 1, "流末必须发 RESTORE")
                 self.assertEqual(restores[0].get("restore_status"), "restored")
@@ -1653,7 +1664,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow.response = SimpleNamespace(
                     headers={"content-type": "application/json"}, status_code=200,
                     content=json.dumps({"choices": [{"message": {"content": "好的"}}]}).encode("utf-8"))
-                tr.response(flow)
+                asyncio.run(tr.response(flow))
                 flow2 = self._flow("api.openai.com", "/v1/chat/completions", {
                     "messages": [{"role": "user", "content": "联系人张三"}],
                 })
@@ -1662,7 +1673,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow2.response = SimpleNamespace(
                     headers={"content-type": "application/json"}, status_code=200,
                     content=json.dumps({"choices": [{"message": {"content": "好的"}}]}).encode("utf-8"))
-                tr.response(flow2)
+                asyncio.run(tr.response(flow2))
             finally:
                 tr._emit = old_emit
             mk = {kw["sid"]: kw for t, kw in captured if t == "MASK"}
@@ -1691,6 +1702,7 @@ class ShieldEngineTests(unittest.TestCase):
             self.assertIn("第一段", out)
             self.assertIn("data:", out)
             stream(b"")
+            tr.aux_drain()  # 收尾已投递 aux 池：等它落库再断言
         self._with_no_reload(run)
 
     def test_log_dialog_keeps_all_user_messages(self):
@@ -1802,7 +1814,7 @@ class ShieldEngineTests(unittest.TestCase):
                 headers={"content-type": "application/json"},
                 content=json.dumps({"choices": [{"message": {"tool_calls": [{"function": {"arguments": args}}]}}]}, ensure_ascii=False).encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             restored_args = json.loads(json.loads(flow.response.content)["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])
             self.assertEqual(restored_args["name"], "查询张三")
         self._with_no_reload(run)
@@ -1821,7 +1833,7 @@ class ShieldEngineTests(unittest.TestCase):
                     "output": [{"type": "function_call", "name": "lookup", "arguments": args}]
                 }, ensure_ascii=False).encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             got = json.loads(flow.response.content)["output"][0]["arguments"]
             self.assertEqual(json.loads(got)["name"], "查询张三")
         self._with_no_reload(run)
@@ -1842,7 +1854,7 @@ class ShieldEngineTests(unittest.TestCase):
                 headers={"content-type": "text/event-stream"},
                 content=("data: " + json.dumps(event, ensure_ascii=False) + "\ndata: [DONE]\n").encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             line = next(line for line in flow.response.content.decode("utf-8").splitlines() if line.startswith("data: {"))
             got = json.loads(line[6:])["response"]["output"][0]["arguments"]
             self.assertEqual(json.loads(got)["name"], "查询张三")
@@ -1863,7 +1875,7 @@ class ShieldEngineTests(unittest.TestCase):
                 headers={"content-type": "text/event-stream"},
                 content=("data: " + json.dumps(event, ensure_ascii=False) + "\ndata: [DONE]\n").encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             line = next(line for line in flow.response.content.decode("utf-8").splitlines() if line.startswith("data: {"))
             got = json.loads(line[6:])["item"]["content"][0]["text"]
             self.assertEqual(got, "明白：我是张三又是李四")
@@ -1881,7 +1893,7 @@ class ShieldEngineTests(unittest.TestCase):
                 headers={"content-type": "text/event-stream"},
                 content=("data: " + json.dumps(event, ensure_ascii=False) + "\ndata: [DONE]\n").encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             line = next(line for line in flow.response.content.decode("utf-8").splitlines() if line.startswith("data: {"))
             got = json.loads(line[6:])["part"]["text"]
             self.assertEqual(got, "收到：我是张三")
@@ -1904,7 +1916,7 @@ class ShieldEngineTests(unittest.TestCase):
                 headers={"content-type": "text/event-stream"},
                 content=raw.encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             lines = [line for line in flow.response.content.decode("utf-8").splitlines() if line.startswith("data: {")]
             text = "".join(json.loads(line[6:])["choices"][0]["delta"]["content"] for line in lines)
             self.assertEqual(text, "回复：客户张三")
@@ -1937,7 +1949,7 @@ class ShieldEngineTests(unittest.TestCase):
                 headers={"content-type": "text/event-stream"},
                 content=raw.encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             lines = [line for line in flow.response.content.decode("utf-8").splitlines() if line.startswith("data: {")]
             text = "".join(json.loads(line[6:])["choices"][0]["delta"]["content"] for line in lines)
             # 还原后应得到原文，占位 token 不应残留（masked 含“邮箱”前缀，还原后保留）
@@ -2057,7 +2069,7 @@ class ShieldEngineTests(unittest.TestCase):
                 headers={"content-type": "application/json"},
                 content=json.dumps({"content": [{"type": "text", "text": "已记录" + masked}]}, ensure_ascii=False).encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             got = json.loads(flow.response.content)["content"][0]["text"]
             self.assertEqual(got, "已记录联系人张三电话13812345678")
         self._with_no_reload(run)
@@ -2135,7 +2147,7 @@ class ShieldEngineTests(unittest.TestCase):
                     headers={"content-type": "application/json"},
                     content=json.dumps({"choices": [{"message": {"content": "好的" + masked + "新号码13911112222"}}]}, ensure_ascii=False).encode("utf-8"),
                 )
-                tr.response(flow)
+                asyncio.run(tr.response(flow))
             finally:
                 tr._emit = old_emit
                 tr.RESPONSE_SCAN = False
@@ -2181,7 +2193,7 @@ class ShieldEngineTests(unittest.TestCase):
                     headers={"content-type": "application/json"},
                     content=json.dumps({"choices": [{"message": {"content": "张三的电话是" + token}}]}, ensure_ascii=False).encode("utf-8"),
                 )
-                tr.response(flow2)
+                asyncio.run(tr.response(flow2))
             finally:
                 tr._emit = old_emit
                 tr.RESPONSE_SCAN = False
@@ -2214,7 +2226,7 @@ class ShieldEngineTests(unittest.TestCase):
                 headers={"content-type": "application/json"},
                 content=json.dumps({"content": [{"type": "text", "text": "回复" + body}]}, ensure_ascii=False).encode("utf-8"),
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             got = json.loads(flow.response.content)["content"][0]["text"]
             self.assertEqual(got, "回复联系人张三电话13812345678")
             tr.FILTER_ENABLED = True  # 恢复
@@ -2237,7 +2249,7 @@ class ShieldEngineTests(unittest.TestCase):
                     headers={"content-type": "application/json"},
                     content=json.dumps({"choices": [{"message": {"content": "收到" + masked}}]}, ensure_ascii=False).encode("utf-8"),
                 )
-                tr.response(flow)
+                asyncio.run(tr.response(flow))
             finally:
                 tr._emit = old_emit
             paths = {typ: kw["path"] for typ, kw in emitted if typ in {"MASK", "RESTORE"}}
@@ -2465,7 +2477,7 @@ class ShieldEngineTests(unittest.TestCase):
                     "meta": {"tokens": {"input_tokens": 42}}
                 }).encode("utf-8")
             )
-            tr.response(flow)
+            asyncio.run(tr.response(flow))
             resp_data = json.loads(flow.response.content)
             self.assertEqual(resp_data["results"][0]["relevance_score"], 0.98)
             # 验证 Rerank 响应的 tokens 用量被正确提取（兼容 Cohere meta.tokens 与 total_tokens）
@@ -4980,6 +4992,12 @@ class AuditFailClosedBlockTests(unittest.TestCase):
     （此前只有一行 _log，Dashboard 告警数完全看不到）。
     全部 mock（_emit / enqueue_audit_event / 扫描函数），不碰真实端口、进程、DB。
     """
+
+    def setUp(self):
+        # A-2 的审计 findings 缓存键只看真实输入；本类用同一个 body 反复跑不同断言，
+        # 必须每次清缓存，否则第二条用例会拿到上一条的结论（缓存本身另有专属测试）。
+        tr._AUDIT_FINDINGS_CACHE.clear()
+        tr._AUDIT_CFG_FP[0] = None
 
     def _run(self, body, status=500, ct="text/plain"):
         emitted = []
