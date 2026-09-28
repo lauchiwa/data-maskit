@@ -331,6 +331,42 @@ class BudgetWaitTests(unittest.TestCase):
                                 "不等待时就该如实记降级")
         self.assertIn("global_throttled", ner._SKIP_STATS)
 
+    def test_budget_waited_is_visible_in_governor_status(self):
+        """等到额度的次数必须有一个出口（只写线程本地等于没写）。
+
+        回归背景：`budget_waited` 写入后无任何消费者，而 CHANGELOG / SECURITY 已把
+        “它能区分补上了与真降级”当卖点写上——指标不可见就不算存在。
+        """
+        before = int(ner.governor_status().get("budget_waited") or 0)
+        self._drain_bucket()
+        with mock.patch.object(ner, "_init_ner", lambda: True), \
+             mock.patch.object(ner, "_current_deadline",
+                               lambda: time.monotonic() + 30.0), \
+             mock.patch.object(ner, "_decode_chunks", lambda text, deadline: ([], True)):
+            ner.extract_entities("张三在北京工作，联系李四")
+        after = int(ner.governor_status().get("budget_waited") or 0)
+        self.assertGreater(after, before,
+                           "budget_waited 未进入 governor_status（面板/自检看不到）")
+
+    def test_budget_wait_leaves_room_for_the_slot(self):
+        """deadline 只够槽位等待时，预算等待必须收缩为 0。
+
+        否则净效果是：先白等 2 秒、再因槽位窗口只剩 50ms 而 sem_timeout 跳过——
+        多花时间、仍不做识别，还占住一个脱敏 worker。
+        """
+        self._drain_bucket()
+        with mock.patch.object(ner, "_init_ner", lambda: True), \
+             mock.patch.object(ner, "_current_deadline",
+                               lambda: time.monotonic() + 1.0), \
+             mock.patch.object(ner, "_decode_chunks", lambda text, deadline: ([], True)):
+            t0 = time.monotonic()
+            out = ner.extract_entities("张三在北京工作")
+            elapsed = time.monotonic() - t0
+        self.assertEqual(out, [])
+        self.assertLess(elapsed, 0.5,
+                        "deadline 剩余不足槽位上限时不该先花时间等预算（实测 %.2fs）" % elapsed)
+        self.assertIn("global_throttled", ner._SKIP_STATS)
+
     def test_extract_entities_still_uses_bounded_wait(self):
         """源码守卫：额度不足的分支必须走 `_bucket_wait`（别退回“立刻跳过”）。"""
         src = Path(ner.__file__).read_text(encoding="utf-8")

@@ -180,16 +180,10 @@ Assert-LastExit "git add -u"
 if (Test-Path "docs\architecture-en.png") { git add docs\architecture-en.png docs\architecture-zh.png; Assert-LastExit "git add 架构图" }
 if (Test-Path "release.ps1") { git add release.ps1; Assert-LastExit "git add release.ps1" }
 # 列出全部新文件：`git add -A` 会把构建产物/临时文件一并暂存，这里按路径精确添加。
-# 新增任何需随发版提交的文件时，请同步追加到本列表。
-$newFiles = @(
-  "engine\credential_labels.py",
-  "frontend\src\lib\credential-labels.ts",
-  "frontend\src\pages\Extension.tsx",
-  "scripts\pack-extension.py",
-  "scripts\verify-all.py",
-  "tests\test_config_patch.py",
-  "tests\test_event_store_selfheal.py"
-)
+# 改成**动态列举**：硬编码白名单会在发版前新增源文件时静默漏掉（0.6.0 前置里
+# 新增的整批 tests/、scripts/ 与 engine/selfcheck.py 都不在旧列表里）。
+# `--exclude-standard` 会排除 .gitignore 覆盖的构建产物与临时文件。
+$newFiles = @(git ls-files --others --exclude-standard)
 foreach ($f in $newFiles) {
   if (Test-Path $f) { git add -- $f; Assert-LastExit "git add $f" }
 }

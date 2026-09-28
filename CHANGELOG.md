@@ -5,8 +5,8 @@
 ## [0.6.0] - 2026-09-28
 
 ### 修复 / Bug Fixes
-- 引擎：修掉"长会话拖慢整个代理"的队头阻塞——审计扫描窗口由 512KB 收到 128KB 并加时间预算，脱敏线程池按核数自适应（1~4），响应侧的**还原/审计/扫描整体移出事件循环**（流式收尾一并下池：实测每个流式响应原占用循环约 35ms）；实测 8 路并发语义识别请求总耗时 3.15s → 1.05s。
-  *Engine: fixed head-of-line blocking behind long conversations — the audit scan window is now 128KB (was 512KB) with a time budget, the masking pool adapts to the core count (1–4), and response-side restore/audit/scan moved off the event loop (**the streaming finish path included**: ~35 ms of loop time per streamed response before); measured 8 concurrent NER requests: 3.15 s → 1.05 s.*
+- 引擎：修掉"长会话拖慢整个代理"的队头阻塞——审计扫描窗口由 512KB 收到 128KB 并加时间预算，脱敏线程池按核数自适应（1~4），响应侧的**还原/审计/扫描整体移出事件循环**（流式收尾一并下池）。
+  *Engine: fixed head-of-line blocking behind long conversations — the audit scan window is now 128KB (was 512KB) with a time budget, the masking pool adapts to the core count (1–4), and response-side restore/audit/scan moved off the event loop (**the streaming finish path included**).*
 - 引擎：脱敏队列改为按字节预算与条数上限准入（超限回 503 + `Retry-After`，带抖动），并在 worker 异常路径上也归还名额；首次在内存上给并发设了天花板。
   *Engine: the masking queue now admits by byte budget and in-flight count (over-limit answers 503 + a jittered `Retry-After`) and returns the quota even when a worker raises; concurrency finally has an explicit ceiling.*
 - 引擎：新增端到端上限（默认 120s，`MASKIT_ENGINE_DEADLINE_S`），超时回结构化 503 而不是无限等待；等待超时不会中断已在跑的 worker。
@@ -23,7 +23,6 @@
   *Engine: request bodies are no longer parsed twice (~1.2 ms of event-loop time saved on a 1 MB body); responses now carry a readable "why whole-body" reason and each request reports its mask-queue wait, both visible in the event detail.*
 - 引擎：流式收尾（审计 + 响应扫描）下池，并去掉四处 O(body) 白烧（4MB 响应实测从 216ms 降到 ~1ms 循环占用）；审计只解码"会被用到的文本"（超 2MB 的响应不再为 128KB 扫描窗口把整份 body 解码成字符串），**响应哈希仍是全量 sha256**（证据语义不变）；同轮修掉"进程名取错 CSV 列导致每次端口判定都白跑一次 8s 超时 PowerShell"的老问题，端口快照改为一次 `tasklist` + 一次 CIM 批量归类（含 5s 缓存）。
   *Engine: the streaming finish path (audit + response scan) is now offloaded, and three needless O(body) passes were removed (a 4 MB response went from ~216 ms of loop time to ~1 ms). The audit now decodes only the text it actually uses (responses over 2 MB no longer get a full-body decode just to feed a 128 KB scan window) while the response hash stays a full sha256 (evidence semantics unchanged). The same pass fixed a long-standing bug where the process name was read from the wrong CSV column (so every port ownership check fell through to an 8 s-timeout PowerShell call); port snapshots now use one `tasklist` plus one batched CIM query with a 5 s cache.*
-
 - 修复：四处 P0 —— 非流式请求用量恒为 0（拿流式字段做判据）、整包路径 `_drop` 漏传 `expect` 会抹掉同会话新实例、S32 读错键名导致「事件库写失败」永不触发、S03 把自身端口误判成被占用。
   *Fixed four P0 defects: non-streaming requests always reported zero usage (a stream-only field was used as the predicate), the whole-body path dropped the `expect` argument and could wipe a re-created session, S32 read the wrong key so "event DB writes failing" never fired, and S03 mistook Maskit's own port for a foreign one.*
 - 修复：自检的跨线程共享状态补锁（aux 统计、canary 注册表、`peak_wait_ms`），修掉 `_AUX_PENDING` 双减、S11 零样本误报与 OK_NOTES 与已触发结论自相矛盾；测试不再依赖执行顺序。

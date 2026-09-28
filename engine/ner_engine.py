@@ -219,6 +219,7 @@ def governor_status():
     with _SKIP_LOCK:
         throttled = int(_SKIP_STATS.get("global_throttled", 0))
         sem_timeouts = int(_SKIP_STATS.get("sem_timeout", 0))
+        waited = int(_BUDGET_WAITED["n"])
     with _SEM_STATS_LOCK:
         out = dict(_SEM_STATS)
     out.update({
@@ -227,6 +228,7 @@ def governor_status():
         "bucket_tokens_ms": tokens,
         "skipped_throttled": throttled,
         "skipped_sem_timeout": sem_timeouts,
+        "budget_waited": waited,
         "intra_threads": _INTRA_THREADS,
     })
     out["wait_ms_total"] = round(float(out.get("wait_ms_total") or 0.0), 1)
@@ -266,6 +268,11 @@ _SKIP_STATS = {}
 # （此前无锁，极端情况下会丢计数）。只在真发生跳过时拿，不是热路径。
 _SKIP_LOCK = threading.Lock()
 _SKIP_LOGGED = set()
+# 「曾经缺额度、但等到补上了」的进程级计数（与 `_SKIP_STATS` 共用 `_SKIP_LOCK`）。
+# 它与跳过计数是**不同结论**（补上了 vs 降级），混进 skip 表会让面板把它读成降级；
+# 但它同样必须有个出口 —— 只写进线程本地的 request_metrics 就等于没有（实测：写入后
+# 无任何消费者，而 CHANGELOG / SECURITY 已经把它当卖点写上了）。
+_BUDGET_WAITED = {"n": 0}
 
 
 def _bump_skip_stat(key):
@@ -429,6 +436,10 @@ def status() -> Dict:
     available 只代表模型文件齐备；真正能否推理要看 initialized。
     这两者都不成立时必须让用户看得见，否则「开了 NER 却没打码」无从归因。
     """
+    # 快照必须在锁内取：skip 计数由蒙版线程与 Flask 线程并发累加，口径与
+    # `governor_status()` 一致（不要一个持锁、一个不持）。
+    with _SKIP_LOCK:
+        skips = dict(_SKIP_STATS)
     return {
         "available": is_ner_available(),
         "initialized": bool(_INITIALIZED),
@@ -440,7 +451,7 @@ def status() -> Dict:
         "cache_size": len(_CACHE),
         "cache_max": _CACHE_MAX,
         "cache_chars": _CACHE_CHARS,
-        "skips": dict(_SKIP_STATS),
+        "skips": skips,
         # B-2/A-4：并发与限流可见性（面板与自检都读这里）
         "governor": governor_status(),
     }
@@ -698,10 +709,15 @@ def extract_entities(text: str) -> List[Dict]:
         # 额度不足：先在**有界**窗口内等一等（默认 2s，且不超过本轮剩余 deadline）。
         # 等到就照常推理（记 budget_waited，“曾经缺额度但补上了”可见）；
         # 等不到仍按原策略降级 —— 不阻断、不断链，只如实记原因。
+        # 给「取并发槽位」留出完整窗口：预算等待若把 deadline 吃光，紧接着的槽位
+        # 等待就只剩 max(0.05, ...) 的残值 —— 净效果是多等 2 秒、仍然不做识别，
+        # 还白占一个脱敏 worker（比直接降级更差）。所以这里先减掉槽位等待上限。
         budget_wait_s = min(_NER_BUDGET_WAIT_MS / 1000.0,
-                            max(0.0, deadline - time.monotonic()))
+                            max(0.0, deadline - time.monotonic() - _SEM_WAIT_MAX_S))
         if budget_wait_s > 0 and _bucket_wait(est_ms, budget_wait_s):
             _metric_add("budget_waited", 1)
+            with _SKIP_LOCK:
+                _BUDGET_WAITED["n"] += 1
         else:
             _metric_add("global_throttled", 1)
             _note_skip("global_throttled",

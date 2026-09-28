@@ -41,7 +41,7 @@ HEALTHY = {
 # （只要 fired_ids 非空即可；具体触发哪几条不影响断言的有效性）。
 MESSY = json.loads(json.dumps(HEALTHY))
 MESSY["proxy"].update({"running": False, "stop_mode": "error", "restarts": 3,
-                       "last_error": "OSError: boom"})
+                       "last_error": "模型文件缺失（应为 /data/engine/models/ner_mini_zh 下的 model_quantized.onnx）"})
 MESSY["proxy"]["ports"] = [{"port": 5801, "listening": True, "holder": "nginx"}]
 MESSY["env"].update({"cgroup_cpu_quota": 1.0, "nr_throttled_delta": 5,
                      "disk_free_mb": 10, "disk_path": "/data"})
@@ -49,7 +49,8 @@ MESSY["engine"]["mask_pool"] = {"busy_total": 3, "peak_wait_ms": 1200,
                                  "queue_depth": 2, "workers": 4}
 MESSY["engine"]["audit"] = {"truncated": 2, "parse_skipped": 1, "p95_ms": 40}
 MESSY["ner"] = {"enabled": True, "available": True, "initialized": False, "failed": True,
-                "last_error": "model missing", "skips": {"global_throttled": 3}}
+                "last_error": "模型文件缺失（应为 /data/engine/models/ner_mini_zh 下的 model_quantized.onnx）",
+                "skips": {"global_throttled": 3}}
 MESSY["events"] = {"window_s": 600, "by_status": {"200": 10, "503": 7}, "per_minute": 90,
                    "unresolved": 3,
                    "by_block_source": {"upstream": 5, "engine": 2, "fallback": 0}}

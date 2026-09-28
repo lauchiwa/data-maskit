@@ -44,6 +44,21 @@ def _en(fid, severity, title, evidence, action, verified=True):
             "action": action, "verified": bool(verified)}
 
 
+def _en_detail(text, empty=""):
+    """英文结论里的**叙述性中文**兜底。
+
+    引擎自己的错误串是中文（模型缺失、权限不足…），英文分支直接插值就会冒出中文结论
+    （实测：S04/S21 把 `ner.last_error` 原样带出）。命中 CJK 就换成英文定述 —— 原文没丢，
+    它仍在诊断包与事件库里，中文界面照常显示。
+    """
+    s = str(text or "")
+    if not s:
+        return empty
+    if any("\u4e00" <= ch <= "\u9fff" for ch in s):
+        return "(Chinese error text; see the diagnostics bundle)"
+    return s
+
+
 def _dig(data, path, default=None):
     """按点号路径取值（自检规则里的字段引用很多，写成一串 get 太啰嗦）。"""
     cur = data
@@ -220,7 +235,7 @@ def _s04(ctx):
         return None
     if _is_en():
         return _en("S04", "high", "Engine restarted repeatedly or reported errors",
-                   "restarts=%d; last_error=%s" % (restarts, last_err[:200] or "(empty)"),
+                   "restarts=%d; last_error=%s" % (restarts, _en_detail(last_err[:200], "(empty)")),
                    "Export the diagnostics bundle to inspect the crash site; verify the data dir is writable and dependencies are complete")
     return _finding("S04", "high", "引擎反复重启或最近报错",
                     "restarts=%d；last_error=%s" % (restarts, last_err[:200] or "（空）"),
@@ -364,7 +379,8 @@ def _s21(ctx):
         return _en("S21", "high",
                    "Semantic recognition looks enabled but is not running: model unavailable",
                    "available=%s initialized=%s failed=%s last_error=%s"
-                   % (available, initialized, failed, str(_dig(ctx, "ner.last_error", "") or "")[:160]),
+                   % (available, initialized, failed,
+                      _en_detail(str(_dig(ctx, "ner.last_error", "") or "")[:160])),
                    "Verify models/ner_mini_zh has all three files and onnxruntime/tokenizers are installed; "
                    "container images must be built with the model (local builds ship no model)")
     return _finding("S21", "high",
@@ -679,7 +695,9 @@ def run_selfcheck(ctx, lang="zh"):
             "schema": SCHEMA,
             "generated_at": int(time.time()),
             "overall": "medium",
-            "summary_line": "自检结论组装失败（%s）：请导出诊断包进一步排查。"
+            "summary_line": ("Self-check assembly failed (%s); export the diagnostics bundle for details."
+                             % type(e).__name__) if _is_en() else
+                            "自检结论组装失败（%s）：请导出诊断包进一步排查。"
                             % type(e).__name__,
             "findings": [],
             "fired_ids": [],

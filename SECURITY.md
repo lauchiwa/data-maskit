@@ -138,7 +138,7 @@ Data Maskit 是一个**本地脱敏代理**：拦截本机 LLM API 请求，敏�
 | `MASKIT_MASK_QUEUE_BYTES` | `max(32MB, workers × 8MB)`（4 核默认 32MB；1~2 核被单条下限抬到 32MB） | 脱敏队列的**总字节预算**，超限即拒（503 `engine_busy` + `Retry-After`） | 这是背压保护而非吞吐参数：调大只推迟拒绝时刻，不增加算力。并发高且 body 大时先降并发 |
 | `MASKIT_ENGINE_DEADLINE_S` | `120` | 单个请求的端到端脱敏等待上限（秒），超时回 503 `engine_timeout` | 超时**不会**中断已在跑的 worker（Python 线程不可中断）：该请求结果被丢弃，但已签发的占位符仍在会话表里 |
 | `MASKIT_NER_CONCURRENCY` | 按核数自适应 | NER 同时推理数上限（信号量） | 过高会把 CPU 吃满，导致规则扫描与事件循环饥饿 |
-| `MASKIT_NER_BUDGET` | 按核数自适应（≥50） | NER 每秒可用推理毫秒预算（令牌桶） | 预算用尽时**降级但不断链**：本次不做实体识别并记 `global_throttled`（自检 S22 可见） |
+| `MASKIT_NER_BUDGET` | 按核数自适应（≥50） | NER 每秒可用推理毫秒预算（令牌桶） | 预算用尽时**降级但不断链**：先在短窗口内等（见下一行），等不到就跳过并记 `global_throttled`（自检 S22 可见）。⚠️ 单条估价会**夹到桶容量**，长文本按封顶值而非实际耗时计费（估高了退还、估低了不追缴）——这是**速率粗限流**，不是精确计量，别据此推算吞吐 |
 | `MASKIT_NER_WAIT_MS` | `2000` | 预算不足时等待的上限（毫秒，`0` = 立即跳过不等待） | 有界等待：等到就照常推理（记 `budget_waited`），等不到仍降级。等待会占住脱敏 worker，别设太大 |
 | `MASKIT_NER_THREADS` | 按核数自适应 | `onnxruntime` 的 intra-op 线程数 | 弱机（1~2 核）应设为 1，否则 NER 会与规则扫描抢核 |
 | `MASKIT_AUDIT_SCAN_MAX` | `131072`（128KB） | 单次审计的扫描窗口字节数 | 调大=线性增加每次审计的 CPU/事件循环占用；调小=更早截断，检出面缩小 |
