@@ -290,7 +290,12 @@ export function EventDetailDialog({
                 注意：审计耗时/扫描字节那三个字段**不属于这里** —— 它们只存在于
                 audit_events 表，渲染在 AuditEventDetailDialog；挂在这里是死分支
                 （真这么写过一次：永远读到 undefined，比不渲染更糟）。 */}
-            {(event.block_source || event.engine_busy || event.ner_global_throttled) && (
+            {(event.block_source || event.engine_busy || event.ner_global_throttled
+              // 等待类指标必须单独放行：它们由不同的事件发出（aux 等待是
+              // reason=response_offload_wait 的 ERR，只带 client 来源字段），
+              // 挂在上面那三个字段的 gate 里就永远渲染不出来（死分支）。
+              || typeof event.aux_wait_ms === 'number'
+              || typeof event.ner_sem_wait_ms === 'number') && (
               <div className="space-y-1 rounded-lg border bg-muted/30 p-2.5 text-xs">
                 {event.block_source && (
                   <div>

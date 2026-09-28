@@ -135,7 +135,7 @@ Data Maskit 是一个**本地脱敏代理**：拦截本机 LLM API 请求，敏�
 | `MASKIT_BYTE_SPLICE` | `1` | 命中敏感词时只就地替换被脱敏的字符串字面量（保住客户端 body 排版与上游前缀缓存）；设 `0` 退回整棵重序列化 | 只影响回写字节与 CPU，**不改变发往上游的内容**：替换结果必须通过 `json.loads(结果) == 脱敏后的树` 等价校验，不过即退回重序列化 |
 | `MASKIT_BIND_HOST` | `127.0.0.1` | `docker-compose.yml` 的主机侧绑定地址 | 公网部署必须显式确认 |
 | `MASKIT_MASK_WORKERS` | 按核数自适应（1~4） | 脱敏线程池宽度；1~2 核机器自动为 1，可用本变量覆盖（上限 16） | 纯 Python 规则扫描受 GIL 约束，加宽收益有限；主要受益方是 NER（ONNX 推理释放 GIL）与避免队头阻塞。**加宽会同步放大并发 × 单请求内存**，容器里请对照 `--cpus` 设置 |
-| `MASKIT_MASK_QUEUE_BYTES` | `33554432`（32MB） | 脱敏队列的**总字节预算**，超限即拒（503 `engine_busy` + `Retry-After`） | 这是背压保护而非吞吐参数：调大只推迟拒绝时刻，不增加算力。并发高且 body 大时先降并发 |
+| `MASKIT_MASK_QUEUE_BYTES` | `max(32MB, workers × 8MB)`（4 核默认 32MB；1~2 核被单条下限抬到 32MB） | 脱敏队列的**总字节预算**，超限即拒（503 `engine_busy` + `Retry-After`） | 这是背压保护而非吞吐参数：调大只推迟拒绝时刻，不增加算力。并发高且 body 大时先降并发 |
 | `MASKIT_ENGINE_DEADLINE_S` | `120` | 单个请求的端到端脱敏等待上限（秒），超时回 503 `engine_timeout` | 超时**不会**中断已在跑的 worker（Python 线程不可中断）：该请求结果被丢弃，但已签发的占位符仍在会话表里 |
 | `MASKIT_NER_CONCURRENCY` | 按核数自适应 | NER 同时推理数上限（信号量） | 过高会把 CPU 吃满，导致规则扫描与事件循环饥饿 |
 | `MASKIT_NER_BUDGET` | 按核数自适应（≥50） | NER 每秒可用推理毫秒预算（令牌桶） | 预算用尽时**降级但不断链**：本次不做实体识别并记 `global_throttled`（自检 S22 可见） |

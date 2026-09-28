@@ -267,8 +267,6 @@ Given two clients (path prefixes `/openai` and `/anthropic`), point external too
 
 ---
 
----
-
 ## 🔥 Concurrency Tuning & 503 Triage (Read This When Things Get Slow)
 
 Maskit's masking runs **only on your own machine** — every request costs local CPU. When many agents

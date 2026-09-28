@@ -434,22 +434,6 @@ def _env_int(name, default):
 
 
 def _env_float(name, default):
-    raw = (os.environ.get(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
-# 环境变量兜底（容器场景无法开面板时用）；config.json 里的值优先于它们。
-_ENV_AUDIT_SCAN_MAX = _env_int("MASKIT_AUDIT_SCAN_MAX", AUDIT_SCAN_MAX)
-_ENV_AUDIT_PARSE_MAX = _env_int("MASKIT_AUDIT_PARSE_MAX", AUDIT_PARSE_MAX)
-_ENV_AUDIT_TIME_BUDGET = _env_float("MASKIT_AUDIT_TIME_BUDGET_MS", AUDIT_TIME_BUDGET_S * 1000.0) / 1000.0
-
-
-def _env_float(name, default):
     """读浮点环境变量；非法值回落默认。"""
     raw = (os.environ.get(name) or "").strip()
     if not raw:
@@ -458,6 +442,12 @@ def _env_float(name, default):
         return float(raw)
     except ValueError:
         return float(default)
+
+
+# 环境变量兜底（容器场景无法开面板时用）；config.json 里的值优先于它们。
+_ENV_AUDIT_SCAN_MAX = _env_int("MASKIT_AUDIT_SCAN_MAX", AUDIT_SCAN_MAX)
+_ENV_AUDIT_PARSE_MAX = _env_int("MASKIT_AUDIT_PARSE_MAX", AUDIT_PARSE_MAX)
+_ENV_AUDIT_TIME_BUDGET = _env_float("MASKIT_AUDIT_TIME_BUDGET_MS", AUDIT_TIME_BUDGET_S * 1000.0) / 1000.0
 
 
 def _clamp_int(value, default, lo, hi):
@@ -5164,7 +5154,7 @@ def _audit_response(flow, sid, host, method, path, source, streamed_text=None,
         # 而 128KB 扫描窗口取的就是前缀。前缀按"4 字节/字上限 +4 字节"取，
         # 保证窗口内不出现截断产生的替换符。
         if content and len(content) > AUDIT_PARSE_MAX:
-            body_text = content[:_AUDIT_TEXT_PROBE_BYTES].decode("utf-8", errors="replace")
+            body_text = content[:_audit_text_probe_bytes()].decode("utf-8", errors="replace")
             _body_oversize = True
         else:
             body_text = content.decode("utf-8", errors="replace") if content else ""
@@ -5196,7 +5186,7 @@ def _audit_response(flow, sid, host, method, path, source, streamed_text=None,
             # 同上：请求文本只喂 128KB 窗口，全量 decode 是白烧（请求可达 32MB，
             # 一次 decode ≈ 20ms 且多占几十 MB）。哈希仍用**全量字节**（见下）。
             req_text = ((getattr(flow.request, "content", None) or b"")
-                        [:_AUDIT_TEXT_PROBE_BYTES]).decode("utf-8", errors="replace")
+                        [:_audit_text_probe_bytes()]).decode("utf-8", errors="replace")
         except Exception:
             req_text = ""
         scan_req_text = req_text[:AUDIT_SCAN_MAX] if req_text else ""
@@ -5911,7 +5901,12 @@ _AUX_SLOTS = threading.BoundedSemaphore(_AUX_MAX_INFLIGHT)
 _PREVIEW_SRC_MAX = 64 * 1024
 # 审计文本探测的字节数上限：要覆盖 `AUDIT_SCAN_MAX` 个**字符**的最坏情况（UTF-8 最长
 # 4 字节/字），多留 4 字节让"被截断的那个字"落在窗口之外（否则窗口末尾会出现替换符）。
-_AUDIT_TEXT_PROBE_BYTES = AUDIT_SCAN_MAX * 4 + 4
+#
+# ⚠️ 必须是**函数**而不是模块级常量：`audit.scan_max` 运行时可改（`_maybe_reload`
+# 会更新 `AUDIT_SCAN_MAX`），常量在 import 时就冻结了 —— 于是"把窗口调到 512KB"
+# 只对扫描生效、对 decode 窗口不生效，设置页承诺的可检范围被悄悄腰斩（改了没反应）。
+def _audit_text_probe_bytes():
+    return AUDIT_SCAN_MAX * 4 + 4
 # "流式收尾已投递但可能还没跑完"的计数：流式回调是同步的，投递后不等待，
 # 所以"流结束了"不再等于"审计已经落库"。测试/诊断/关卡用 aux_drain() 对齐。
 _AUX_PENDING_LOCK = threading.Lock()
@@ -6037,8 +6032,10 @@ def _mask_pipeline_worker(body, sid, raw_content, enum_changed, has_dup_keys,
     # "是我算得慢"还是"是在排队等前面的请求"。
     _mask_dequeued(len(raw_content))
     queue_wait_ms = (time.perf_counter() - t_submit) * 1000 if t_submit else 0.0
-    if queue_wait_ms > _MASK_TIMEOUTS["peak_wait_ms"]:
-        _MASK_TIMEOUTS["peak_wait_ms"] = queue_wait_ms
+    # 读-改-写必须持锁：≤4 个 worker 会并发走到这里，无锁时峰值会被彼此覆盖（少记）
+    with _MASK_ADMISSION_LOCK:
+        if queue_wait_ms > _MASK_TIMEOUTS["peak_wait_ms"]:
+            _MASK_TIMEOUTS["peak_wait_ms"] = queue_wait_ms
     # A-6：名额必须在 worker 自己结束（含异常）时归还——超时返回给客户端后
     # 孤儿 worker 仍在跑，若由调用方归还，B-4 的并发上界就成了事后失真的数字。
     try:

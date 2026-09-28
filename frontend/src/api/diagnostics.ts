@@ -17,6 +17,8 @@ export interface DiagnosticsBundle {
   fatal?: string
   app?: Record<string, unknown>
   proxy?: Record<string, unknown>
+  /** schema 2 起内嵌：结论给人看、证据给维护者，同一个文件。 */
+  selfcheck?: SelfCheckResult
   ports?: unknown
   upstreams?: unknown[]
   settings?: Record<string, unknown>
@@ -69,9 +71,4 @@ export interface SelfCheckResponse {
 /** 跑一次自检（只读；不产生任何外发请求）。 */
 export function runSelfCheck(): Promise<SelfCheckResponse> {
   return shieldFetch<SelfCheckResponse>('/api/selfcheck')
-}
-
-/** 引擎运行指标（脱敏池/队列、审计耗时、NER 治理器）与端口实况。 */
-export function getEngineMetrics(): Promise<Record<string, unknown>> {
-  return shieldFetch<Record<string, unknown>>('/api/engine/metrics')
 }
