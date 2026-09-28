@@ -2,6 +2,12 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [Unreleased]
+
+### 修复 / Bug Fixes
+- 按协议路径保护缓存相关键名与合法保留策略，敏感缓存键沿用稳定脱敏映射，避免同名业务字段漏检及 Schema 定义与引用不一致。
+  *Protect cache-related keys and valid retention policies only at protocol paths; reuse stable masking for sensitive cache keys without exempting business data or breaking schema references.*
+
 ## [0.102.0] - 2026-09-22
 
 基于上游 v0.4.0（`xiaYuTian11/maskit`）。上游 `0.4.0` 的全部变更见下方对应章节，本节只记录本分支自身的处理。

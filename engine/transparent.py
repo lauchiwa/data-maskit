@@ -3804,6 +3804,20 @@ _MASK_PROTECTED_KEY_NAMES = frozenset(
 # 取一个绝不会与真实字段重名、且不落在任何跳过名单里的名字，保证叶子照常被扫描。
 _ROOT_WRAP_KEY = "__shield_root__"
 
+# 这些名字也常见于业务对象及 JSON Schema 的 properties，只保护真实协议位置。
+# 全局保护会让 properties.user_id 不变、required 中的 "user_id" 却被词表改写。
+# 值仍照常扫描：prompt_cache_key 也可能含敏感标识，沿用现有跨请求稳定映射，
+# 不需要以明文豁免换缓存亲和。模型规则显式注入的值仍走原有的脱敏后注入路径。
+_MASK_PROTOCOL_KEY_PATHS = frozenset({
+    ("prompt_cache_key",), ("prompt_cache_retention",),
+    ("user_id",), ("client_metadata",), ("metadata", "user_id"),
+})
+
+
+def _mask_key_exempt(key, path):
+    """path 是包含数组下标的父路径；代理与扩展共用同一键名保护判据。"""
+    return key in _MASK_PROTECTED_KEY_NAMES or path + (key,) in _MASK_PROTOCOL_KEY_PATHS
+
 
 # 首个差异字节的扫描上限。超过就不算（记 -1）。
 # 实测（二分 + 切片比较，差异位置越靠后越贵）：1MB 14.5ms、8MB 173ms、32MB 约 700ms。
@@ -3998,6 +4012,10 @@ def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0, flag=None):
         raise ValueError("json_depth_exceeded: 请求嵌套超过脱敏递归上限，拒绝透传")
     in_business = any(k in _MASK_BUSINESS_KEYS for k in path)
     if isinstance(obj, str):
+        # 仅顶层 retention 的合法协议枚举保真；同名业务值、数组及非法值照常扫描。
+        # 不放进全局标量豁免，避免 customer / schema const 等位置漏检。
+        if path == ("prompt_cache_retention",) and obj in ("in-memory", "24h"):
+            return obj
         # 业务区（tool_use.input / function.arguments 等参数容器）内一律扫描：
         # 不应用任何全局字段名豁免——input 里的 type/role/model/id 都可能是业务数据
         # （审计实测：input.type 放手机号曾原文上行）。只有业务区外的协议位置才跳过。
@@ -4026,7 +4044,9 @@ def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0, flag=None):
             return out
         return obj
     if isinstance(obj, list):
-        return [_mask_tree(v, sid, key, parent, path, depth + 1, flag) for v in obj]
+        # 下标不能丢：否则列表根会冒充对象根，metadata[] 也会冒充 metadata 对象。
+        return [_mask_tree(v, sid, key, parent, path + (i,), depth + 1, flag)
+                for i, v in enumerate(obj)]
     if isinstance(obj, dict):
         # 协议元数据对象整棵跳过。必须放在 dict 分支——str 分支的
         # _MASK_SKIP_SCALAR_KEYS 对对象值无效（见该集合上方的注释）。
@@ -4036,15 +4056,15 @@ def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0, flag=None):
         # 键名承载结构语义、自定义短词误命中会把协议骨架打坏。这个顾虑成立，
         # 但它同时让 {"13800138000": "safe"} 这种 PII-as-key 形态整条明文上行。
         #
-        # 现在的判据翻转成**结构键白名单**：`_MASK_PROTECTED_KEY_NAMES` 内的键永不
-        # 脱敏，集合外一律当数据键扫描。于是「用户加个 con 命中 content」这类误伤
+        # 结构词汇全局保护、缓存等字段按完整路径保护，统一由 _mask_key_exempt 判定。
+        # 其余一律当数据键扫描。于是「用户加个 con 命中 content」这类误伤
         # 被白名单挡住，而手机号/身份证当键名时能被打上。
         # 注意 path 仍用**原键** k 推进：in_business 判定必须看客户端真实的键名，
         # 用脱敏后的占位符去判会让下游整棵子树丢失业务区语义。
         masked_obj = {}
         for k, v in obj.items():
             new_key = k
-            if isinstance(k, str) and k not in _MASK_PROTECTED_KEY_NAMES:
+            if isinstance(k, str) and not _mask_key_exempt(k, path):
                 masked_key = mask(k, sid)
                 if masked_key != k:
                     new_key = masked_key
@@ -5007,14 +5027,14 @@ def request(flow: http.HTTPFlow):
         for key in list(body.keys()):
             new_key = key
             if (isinstance(key, str) and key != _ROOT_WRAP_KEY
-                    and key not in _MASK_PROTECTED_KEY_NAMES):
+                    and not _mask_key_exempt(key, ())):
                 masked_key = mask(key, sid)
                 if masked_key != key:
                     new_key = masked_key
                     body_changed[0] = True
-            # 传进去的仍是**原键**：`_leaf_exempt` 的协议位置判定必须看客户端真实的键名
-            # （同 `_mask_tree` dict 分支的注释）。
-            renamed[new_key] = _mask_tree(body[key], sid, key, flag=body_changed)
+            # 原键、完整路径与深度和扩展的整树入口一致；不能丢掉顶层 input 等业务边界。
+            renamed[new_key] = _mask_tree(body[key], sid, key, path=(key,), depth=1,
+                                          flag=body_changed)
         # 就地替换内容而非给 body 重新绑定：body 是调用方持有的对象，
         # 下面 enum 清洗 / splice / `masked_root` 都还在用它，且要保持键的插入顺序。
         body.clear()
