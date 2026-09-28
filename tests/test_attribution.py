@@ -11,9 +11,11 @@ import io
 import json
 import re
 import sys
+import os
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "engine"))
@@ -626,6 +628,39 @@ class AuditColumnReachabilityTests(unittest.TestCase):
         ev = (ROOT / "frontend/src/components/events/EventDetailDialog.tsx").read_text(encoding="utf-8")
         for col in ("audit_scan_truncated", "audit_scan_bytes", "audit_ms"):
             self.assertNotIn(col, ev, "事件弹窗引用了审计列 %s（events 表没有它 → 死分支）" % col)
+
+
+class PortHolderSelfClassificationTests(unittest.TestCase):
+    """面板进程自己 bind 期望端口时，holder 必须判成 "panel"。
+
+    面板会在自己进程内 bind 期望端口做 passthrough / 兜底 503（代理停止时的
+    **默认态**），而 `_classify_pids` 与 `_is_shield_panel_pid` 都刻意排除自身 PID
+    （它们服务于“清理占位进程”，把自己算进去会误杀）。若不在这里单独认一次自身，
+    holder 会落进 "other" → 自检 S03 报「端口被其他进程占用，请关掉占用该端口的
+    程序」—— 在完全正常的默认状态下吓用户，而且给出的动作无效。
+    """
+
+    def test_own_pid_is_classified_as_panel(self):
+        me = os.getpid()
+        cfg = {"capture_mode": "reverse",
+               "upstreams": [{"port": 18841, "base_url": "https://api.openai.com"}]}
+        with mock.patch.object(panel, "_listening_port_pids", return_value={18841: [me]}), \
+             mock.patch.object(panel, "_classify_pids", return_value={}):
+            out = panel._ports_snapshot(cfg, fresh=True)
+        self.assertIsInstance(out, list, "端口快照不该出错：%r" % (out,))
+        ports = {p["port"]: p for p in out}
+        self.assertEqual(ports.get(18841, {}).get("holder"), "panel",
+                         "面板自持端口被判成 other → 自检 S03 误报")
+
+    def test_unknown_pid_still_reports_other(self):
+        """反向守卫：真正的外部占位者仍必须报 other（别把修复做成无条件 panel）。"""
+        cfg = {"capture_mode": "reverse",
+               "upstreams": [{"port": 18842, "base_url": "https://api.openai.com"}]}
+        with mock.patch.object(panel, "_listening_port_pids", return_value={18842: [999999]}), \
+             mock.patch.object(panel, "_classify_pids", return_value={}):
+            out = panel._ports_snapshot(cfg, fresh=True)
+        ports = {p["port"]: p for p in out}
+        self.assertEqual(ports.get(18842, {}).get("holder"), "other")
 
 
 if __name__ == "__main__":

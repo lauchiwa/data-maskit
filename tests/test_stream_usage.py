@@ -152,3 +152,61 @@ class StreamingUsageTests(unittest.TestCase):
         raw = json.dumps({"usage": {"prompt_tokens": 25, "completion_tokens": 15}}).encode()
         self.assertEqual(self.forward_response(raw, "application/json", 17),
                          {"prompt_tokens": 25, "completion_tokens": 15})
+
+
+class WholeBodyRestoreUsageTests(unittest.TestCase):
+    """非流式（整包）响应的 usage 必须仍从 body 里抽出来（0.6.0 回归守卫）。
+
+    判据曾是 `streamed_text is not None`，而整包路径同样会传还原后的正文 →
+    整包永远落进“流式”分支，`_extract_usage(body)` 成为死代码 → 非流式响应的
+    token 用量恒为空，面板的日 token/费用统计整体塔掉。
+    """
+
+    def _flow(self, body: bytes):
+        return SimpleNamespace(
+            response=SimpleNamespace(status_code=200, content=body,
+                                     headers={"content-type": "application/json"}),
+            request=SimpleNamespace(headers={}),
+            metadata={},
+        )
+
+    def _capture(self, body, **kw):
+        sid = "usage-whole-body"
+        tr._new_session(sid)
+        self.addCleanup(lambda: tr.sessions.pop(sid, None))
+        captured = {}
+        with mock.patch.object(tr, "_emit",
+                               side_effect=lambda kind, **fields: captured.update(fields)):
+            tr._emit_restore_summary(self._flow(body), sid, "api.openai.com", "POST",
+                                     "/v1/chat/completions", {}, ok=True, **kw)
+        return captured
+
+    def test_whole_body_usage_is_extracted_from_response_body(self):
+        body = json.dumps({"choices": [{"message": {"content": "hi"}}],
+                           "usage": {"prompt_tokens": 11, "completion_tokens": 7,
+                                     "total_tokens": 18}}).encode()
+        # 忠实复现整包调用点：传 streamed_text=还原后正文，且不传 stream_usage
+        captured = self._capture(body, streamed_text=body.decode("utf-8"))
+        usage = captured.get("usage") or {}
+        self.assertEqual(usage.get("prompt_tokens"), 11,
+                         "整包响应丢了 usage（日 token/费用统计会塔）")
+        self.assertEqual(usage.get("completion_tokens"), 7)
+        self.assertEqual(captured.get("stream_actual"), "whole")
+
+    def test_stream_path_never_reparses_whole_body(self):
+        """互补红线：流式路径不得回退到“整段文本重解析”（性能）。"""
+        body = json.dumps({"usage": {"prompt_tokens": 999}}).encode()
+        with mock.patch.object(tr, "_extract_usage",
+                               side_effect=AssertionError("流式路径不得重解析整段文本")):
+            captured = self._capture(body, streamed_text="x", stream_actual="stream",
+                                     stream_usage=None)
+        self.assertIsNone(captured.get("usage"))
+
+    def test_stream_error_path_keeps_collected_usage(self):
+        """stream_error 也是流式：采集器采到了就用它的，没采到也不读 body。"""
+        body = json.dumps({"usage": {"prompt_tokens": 999}}).encode()
+        with mock.patch.object(tr, "_extract_usage",
+                               side_effect=AssertionError("stream_error 不得重解析整段文本")):
+            captured = self._capture(body, streamed_text="y", stream_actual="stream_error",
+                                     stream_usage={"prompt_tokens": 3})
+        self.assertEqual((captured.get("usage") or {}).get("prompt_tokens"), 3)

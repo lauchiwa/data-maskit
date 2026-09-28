@@ -7917,7 +7917,13 @@ def _ports_snapshot(cfg, fresh=False):
         kinds = _classify_pids([x for pids in occ.values() for x in pids], fresh=fresh)
         return [
             {"port": p, "listening": p in occ,
-             "holder": ("mitmdump" if any(kinds.get(x) == "mitmdump" for x in occ.get(p, []))
+             # 自身优先：面板进程自己会 bind 期望端口做 passthrough / 兜底 503，
+             # 而 `_classify_pids` 与 `_is_shield_panel_pid` 都刻意排除自身 PID
+             # （它们服务于“清理/杀进程”，把自己算进去会误杀），于是这些端口会落进
+             # "other" → 自检 S03 在“代理已停止 + 兜底层在听”这个**默认正常态**
+             # 报「端口被其他进程占用」。这里单独认一次自身。
+             "holder": ("panel" if any(x == os.getpid() for x in occ.get(p, []))
+                        else "mitmdump" if any(kinds.get(x) == "mitmdump" for x in occ.get(p, []))
                         else "panel" if any(kinds.get(x) == "panel" for x in occ.get(p, []))
                         else "other" if occ.get(p) else "")}
             for p in sorted(expected)

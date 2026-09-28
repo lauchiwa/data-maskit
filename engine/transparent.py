@@ -6835,7 +6835,11 @@ async def response(flow: http.HTTPFlow):
         _debug(f"RESPONSE {host}{path.split('?')[0]} -- 还原后(返回客户端)", sid, debug_text)
     if block is not None:
         flow.response = block
-    _drop(sid)
+    # 只丢“自己那条”会话：上面那次 await 期间，同一 sid 可能已经建了新会话
+    # （同一会话的连续两轮请求），无条件 pop 会把新会话连同 rev 表一起抹掉 ——
+    # 表现为“占位符还原不回来”。流式侧已按 expect 加固，整包路径原先漏了。
+    if s_cur is not None:
+        _drop(sid, expect=s_cur)
 
 
 
@@ -7881,15 +7885,21 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
     # token 用量（尽力而为）：非流式顶层 usage；流式最后带 usage 的 chunk
     usage = {}
     try:
-        if streamed_text is not None:
+        if stream_usage:
             # 流式路径：usage 已由 `_keep()` 逐块采集（每块只解析自己那几行），
             # **绝不再回退**到"整段文本重解析"——那是 O(留存文本 × 行数) 的重复劳动
             # （实测 256KB ≈ 10ms、4MB ≈ 158ms），而结论不会更好：采集器逐块看过
             # 每一个 chunk，它没找到就是流里确实没有。此处回退只会在收尾处
             # （事件循环上）白烧，且"文本留存上限"一改就悄悄放大。
-            usage = dict(stream_usage or {})
-        elif stream_usage:
-            usage = stream_usage
+            usage = dict(stream_usage)
+        elif str(stream_actual or "").startswith("stream"):
+            # 流式（含中途失败）但采集器没找到 → 流里确实没有，不回退重解析。
+            # 判据必须是“引擎实际处理方式”（stream_actual），**不能**用
+            # `streamed_text is not None`：整包路径也传 streamed_text（那是还原后的
+            # 正文），用后者会让整包永远走本分支，`_extract_usage(body)` 成了死代码
+            # —— 非流式响应的 token 用量恒为空，日 token/费用统计整体塔掉
+            # （0.6.0 回归，已用真实非流式响应用例钉住）。
+            usage = {}
         elif flow.response and flow.response.content:
             usage = _extract_usage(flow.response.content.decode("utf-8", errors="replace"))
     except Exception:

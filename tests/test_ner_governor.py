@@ -6,6 +6,7 @@
 """
 import os
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -33,8 +34,23 @@ class InitAtomicityTests(unittest.TestCase):
         ner._INIT_FAILED = False
         ner._LAST_ERROR = ""
         ner._INTRA_THREADS = 0
+        # 造一份「模型文件齐备」的临时目录。只 mock onnxruntime/tokenizers 不够：
+        # `_init_ner_locked` 会在模型文件齐备后 open(config.json) 读 id2label，而
+        # CI 与任何不带 engine/models/（gitignore）的环境会在 open() 处抛
+        # FileNotFoundError 落到「初始化失败」分支，于是这两个原子性用例变成
+        # 「本机绿、CI 红」。用真实存在的占位文件走通「文件齐备 → 建会话」这条路，
+        # 用例测的仍是双检原子性与线程数推导，不依赖真实语义模型。
+        self._model_tmp = tempfile.TemporaryDirectory()
+        model_dir = Path(self._model_tmp.name)
+        (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+        (model_dir / "model_quantized.onnx").write_bytes(b"")
+        (model_dir / "config.json").write_text('{"id2label": {"0": "O"}}', encoding="utf-8")
+        self._model_dir_patch = mock.patch.object(ner, "_MODEL_DIR", model_dir)
+        self._model_dir_patch.start()
 
     def tearDown(self):
+        self._model_dir_patch.stop()
+        self._model_tmp.cleanup()
         (ner._SESSION, ner._TOKENIZER, ner._ID2LABEL,
          ner._INITIALIZED, ner._INIT_FAILED, ner._LAST_ERROR, ner._INTRA_THREADS) = self.old
 

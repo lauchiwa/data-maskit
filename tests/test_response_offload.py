@@ -6,6 +6,7 @@
   ② 事件循环在等待期间**真的能干活**（否则只是把阻塞换了个写法：在循环上
      `await run_in_executor` 若忘了下池、或者被 GIL 长段占住，都会假绿）。
 """
+import ast
 import asyncio
 import json
 import sys
@@ -308,6 +309,35 @@ class ResponseOffloadTests(unittest.TestCase):
         st = tr.aux_pool_stats()
         for key in ("submitted", "completed", "failed", "queue_depth"):
             self.assertIn(key, st)
+
+
+class WholeBodyDropGuardTests(unittest.TestCase):
+    """整包 `response()` 里的 `_drop` 必须带 `expect`。
+
+    整包路径现在也要 `await run_in_executor`（重活下池）。那次 await 期间，同一个
+    sid 上可能已经建了新会话（同一会话的连续两轮请求）；无条件 `sessions.pop(sid)`
+    会把新会话连同 rev 表一起抹掉 → 占位符还原不回来。流式侧已按
+    `_drop(sid, expect=session_ref)` 加固，整包路径原先漏了。
+    """
+
+    def test_response_drops_with_expect(self):
+        src = (ROOT / "engine" / "transparent.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef)) and n.name == "response")
+        calls = [n for n in ast.walk(fn)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_drop"]
+        self.assertTrue(calls, "response() 里找不到 _drop（结构变了？）")
+        # 只有 await **之后**的 `_drop` 才有竞态：函数前段那两处是同步提前返回
+        # （非目标流量 / 空响应），那时还没让出过事件循环，无需 expect。
+        awaits = [n for n in ast.walk(fn) if isinstance(n, ast.Await)]
+        self.assertTrue(awaits, "response() 里没有 await（结构变了？）")
+        cutoff = min(n.lineno for n in awaits)
+        late = [c for c in calls if c.lineno > cutoff]
+        self.assertTrue(late, "response() 的 await 之后找不到 _drop（收尾清理丢了？）")
+        for call in late:
+            self.assertIn("expect", {kw.arg for kw in call.keywords},
+                          "response() 的 await 之后 _drop 缺 expect：会话重建会被抹掉")
 
 
 if __name__ == "__main__":

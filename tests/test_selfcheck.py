@@ -29,7 +29,10 @@ HEALTHY = {
                "audit": {"truncated": 0, "parse_skipped": 0, "p95_ms": 20}},
     "ner": {"enabled": False, "available": True, "initialized": False, "failed": False},
     "events": {"window_s": 3600, "by_status": {"200": 40}, "per_minute": 2, "unresolved": 0},
-    "storage": {"writer": {"dropped": 0, "dead_letters": 0}},
+    # writer 的形状必须与 event_store.writer_stats() 一致（S32 读的就是它）。
+    "storage": {"writer": {"event_writer_alive": True, "audit_writer_alive": True,
+                           "event_writer": {"restarts": 0, "dead_letters": 0, "drops": 0, "last_err": ""},
+                           "audit_writer": {"restarts": 0, "dead_letters": 0, "drops": 0, "last_err": ""}}},
     "settings": {"fail_closed": True},
 }
 
@@ -159,7 +162,27 @@ class RuleTests(unittest.TestCase):
         self.assertIn("S31", ids(dict(HEALTHY, events=dict(HEALTHY["events"], unresolved=3))))
 
     def test_s32_writer_drops(self):
-        self.assertIn("S32", ids(dict(HEALTHY, storage={"writer": {"dropped": 5}})))
+        """S32 必须按 `event_store.writer_stats()` 的**真实形状**判定。
+
+        旧用例把形状写成 `{"writer": {"dropped": 5}}` —— 生产端从不产生这个键
+        （真实形状是嵌套一层的 `event_writer.drops`），于是“规则永远绿色”被用例
+        掩盖：这是自检最坏的失败形态（用户以为日志没丢）。下面三条与最后一条
+        构成一对：按真实形状读，才能“该触发时触发、不该触发时不触发”。
+        """
+        def storage(**writer):
+            base = {"event_writer_alive": True, "audit_writer_alive": True,
+                    "event_writer": {}, "audit_writer": {}}
+            base.update(writer)
+            return {"writer": base}
+
+        self.assertIn("S32", ids(dict(HEALTHY, storage=storage(
+            event_writer={"drops": 5, "dead_letters": 0}))), "丢弃数没被读到")
+        self.assertIn("S32", ids(dict(HEALTHY, storage=storage(
+            audit_writer={"drops": 0, "dead_letters": 2}))), "死信数没被读到")
+        self.assertIn("S32", ids(dict(HEALTHY, storage=storage(
+            event_writer_alive=False))), "写线程死亡没被读到")
+        # 旧形状（生产端不存在）不再是任何异常的来源：改回旧读取方式时这条会红
+        self.assertNotIn("S32", ids(dict(HEALTHY, storage={"writer": {"dropped": 5}})))
 
     def test_s33_disk_and_quarantine(self):
         self.assertIn("S33", ids(dict(HEALTHY, env={"disk_free_mb": 12})))

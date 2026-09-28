@@ -385,12 +385,31 @@ def _s31(ctx):
 
 
 def _s32(ctx):
-    drops = int(_num(_dig(ctx, "storage.writer.dropped", 0)))
-    dead = int(_num(_dig(ctx, "storage.writer.dead_letters", 0)))
-    if drops <= 0 and dead <= 0:
+    # 键名/层级必须与 `event_store.writer_stats()` 的真实形状一致：
+    #   {event_writer_alive, event_writer:{restarts,dead_letters,drops,last_err},
+    #    audit_writer:{...}, ...}
+    # 此前读 `storage.writer.dropped`（键名少个 s、层级少一层）→ 永远取到 0，
+    # 写线程丢几千条事件时自检照样显示“事件库写入正常”（该功能最不可容忍的失败形态）。
+    writer = _dig(ctx, "storage.writer", {}) or {}
+    if not isinstance(writer, dict):
+        writer = {}
+    drops = 0
+    dead = 0
+    for key in ("event_writer", "audit_writer"):
+        stats = writer.get(key) or {}
+        if isinstance(stats, dict):
+            drops += int(_num(stats.get("drops", 0)))
+            dead += int(_num(stats.get("dead_letters", 0)))
+    # 写线程死亡也属于“日志会丢”：队列会一直涨到满再丢，最终只体现在 drops 上
+    stopped = [k for k in ("event_writer_alive", "audit_writer_alive")
+               if k in writer and not writer.get(k)]
+    if drops <= 0 and dead <= 0 and not stopped:
         return None
+    evidence = "丢弃 %d 条；死信 %d 条" % (drops, dead)
+    if stopped:
+        evidence += "；写线程未存活：%s" % "、".join(stopped)
     return _finding("S32", "medium", "事件库写入异常（日志会丢）",
-                    "丢弃 %d 条；死信 %d 条" % (drops, dead),
+                    evidence,
                     "确认数据目录可写、磁盘未满；必要时重启引擎")
 
 
