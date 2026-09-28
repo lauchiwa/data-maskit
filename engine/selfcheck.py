@@ -233,11 +233,15 @@ def _s10(ctx):
 def _s11(ctx):
     up_p50 = _dig(ctx, "events.upstream_ms.p50")
     errs = int(_num(_dig(ctx, "events.by_status.5xx", 0)))
-    if errs <= 0 or up_p50 is None or _num(up_p50) > 300:
-        return None
     # 口径必须写出来：p50 取自**最新 N 条**样本（N = events.upstream_ms.n），而 5xx
-    # 是**全窗口**计数。两者不是同一个集合，混着读会把"样本里很快"当成"整体很快"。
+    # 是**全窗口**计数。两者不是同一个集合，混着读会把“样本里很快”当成“整体很快”。
+    #
+    # ⚠️ `n <= 0` 必须先判：`aggregate_recent` 的默认值是 `{"p50": 0.0, "n": 0}`，
+    # 零样本时 p50 恒为 0 → `0 ≤ 300` 成立 → 会凭“没有数据”断言“上游秒拒”，
+    # 并给出“核对限流/配额”这种指向错误的建议。没采到样本就不该下这个结论。
     n = int(_num(_dig(ctx, "events.upstream_ms.n", 0)))
+    if errs <= 0 or n <= 0 or up_p50 is None or _num(up_p50) > 300:
+        return None
     return _finding("S11", "medium", "上游很快返回错误（不像超时，更像被网关直接拒绝）",
                     "5xx %d 次（全窗口计数），样本内 upstream_ms p50=%.0fms（基于最新 %d 条）"
                     % (errs, _num(up_p50), n),
@@ -445,13 +449,18 @@ RULES = (_s01, _s02, _s03, _s04, _s10, _s11, _s12, _s20, _s21, _s22, _s23,
          _s24, _s25, _s26, _s30, _s31, _s32, _s33, _s34)
 
 # 「检查过且正常」的项：结论页要能告诉用户"这些都没问题"，否则一片空白会让人
-# 以为自检没跑。每项 = (id, 正常时的一句话)
+# 以为自检没跑。每项 = (id, 对应的规则集合, 正常时的一句话)。
+#
+# ⚠️ **必须绑定规则集合**：正常项只能来自“那条规则确实没触发”。此前是一个与
+# RULES 完全无关的静态列表（有 findings 时固定显示第 1 条），于是 S01「代理未
+# 运行」会和「代理运行中且端口 / 兜底层正常」同屏出现 —— 自相矛盾的结论比没有
+# 结论更份信任（而本功能的全部价值就是让人信）。
 OK_NOTES = (
-    ("A", "代理运行中且端口 / 兜底层正常"),
-    ("B", "最近窗口内没有 503"),
-    ("C", "脱敏队列无排队、无背压拒服务"),
-    ("D", "语义识别状态正常（或未开启）"),
-    ("E", "事件库写入正常、磁盘充足"),
+    ("A", ("S01", "S02", "S03", "S04"), "代理运行中且端口 / 兜底层正常"),
+    ("B", ("S10", "S11", "S12"), "最近窗口内没有 503"),
+    ("C", ("S23", "S24", "S25"), "脱敏队列无排队、无背压拒服务"),
+    ("D", ("S20", "S21", "S22", "S26"), "语义识别与 CPU 状态正常（或未开启）"),
+    ("E", ("S32", "S33", "S34"), "事件库写入正常、磁盘充足"),
 )
 
 
@@ -460,7 +469,10 @@ def _assemble(findings, errors, ctx):
     rank = {"high": 0, "medium": 1, "low": 2}
     findings.sort(key=lambda f: (rank.get(f.get("severity"), 9), str(f.get("id"))))
     fired = {str(f.get("id")) for f in findings}
-    ok_items = [{"id": oid, "note": note} for oid, note in OK_NOTES]
+    # 只显示“对应规则确实没触发”的正常项：静态列表会让「代理未运行」与
+    # 「代理运行中」同屏出现（见 OK_NOTES 注释）。
+    ok_items = [{"id": oid, "note": note} for oid, related, note in OK_NOTES
+                if not (fired & set(related))]
     highs = [f for f in findings if f.get("severity") == "high"]
     overall = "high" if highs else ("medium" if findings else "ok")
     summary = _summary_line(findings, ctx)
@@ -471,7 +483,7 @@ def _assemble(findings, errors, ctx):
         "summary_line": summary,
         "findings": findings,
         "fired_ids": sorted(fired),
-        "ok_items": ok_items if not findings else ok_items[:1],
+        "ok_items": ok_items,
         "input_errors": errors,
     }
 

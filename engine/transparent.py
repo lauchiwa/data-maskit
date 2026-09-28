@@ -707,8 +707,10 @@ def _audit_scan_signals(flow, status_code, ct, scan_text, scan_req_text, body_te
             stats["parse_skipped"] = True
         else:
             current = set(flow.metadata.get("audit_canaries") or set())
-            # registry 是 dict {nonce: ts}，取 key 集合做 prior
-            prior = set(_AUDIT_CANARY_REGISTRY.keys()) - current
+            # registry 是 dict {nonce: ts}，取 key 集合做 prior。
+            # 必须持锁快照：注册/清理在别的线程上跑（见 _AUDIT_CANARY_LOCK 注释）。
+            with _AUDIT_CANARY_LOCK:
+                prior = set(_AUDIT_CANARY_REGISTRY.keys()) - current
             if AUDIT_SIGNALS.get("cross_request_pollution") and prior:
                 findings.extend(_audit.scan_cross_request_pollution(body_text, prior))
 
@@ -755,6 +757,13 @@ CMD_HOLD_MAX = 64
 NER_ENABLED = False
 # 主动探针注入的 canary nonce 注册表（跨请求污染检测用）
 # 结构：{nonce: ts}，按 ts 清理过期 nonce，避免无界增长
+#
+# ⚠️ 这个 dict 是**跳线程**的：注册在 request()（事件循环线程），读取在
+# `_audit_response`（可能跑在 aux 线程），清理在 `_sweep`（另一个时机）。
+# 无锁时 `set(dict.keys())` 与并发插入/删除会撞出
+# `RuntimeError: dictionary changed size during iteration` —— 而它被上层的宽
+# except 吞掉，表现为“这条响应没做审计”（静默少一层安全检测）。
+_AUDIT_CANARY_LOCK = threading.Lock()
 _AUDIT_CANARY_REGISTRY = {}
 _AUDIT_REGISTRY_TTL = 3600  # nonce 保留 1 小时
 _AUDIT_REGISTRY_MAX = 500   # 上限 500 nonce，超则清最早
@@ -5459,16 +5468,18 @@ def _sweep():
             dead.append(sid)
     for sid in dead:
         _drop(sid)
-    # 清理过期 canary nonce（按 TTL + 上限）
-    if _AUDIT_CANARY_REGISTRY:
-        expired = [n for n, ts in _AUDIT_CANARY_REGISTRY.items() if now - ts > _AUDIT_REGISTRY_TTL]
-        for n in expired:
-            _AUDIT_CANARY_REGISTRY.pop(n, None)
-        # 超上限清最早（按 ts 升序）
-        if len(_AUDIT_CANARY_REGISTRY) > _AUDIT_REGISTRY_MAX:
-            sorted_items = sorted(_AUDIT_CANARY_REGISTRY.items(), key=lambda kv: kv[1])
-            for n, _ in sorted_items[:len(_AUDIT_CANARY_REGISTRY) - _AUDIT_REGISTRY_MAX]:
+    # 清理过期 canary nonce（按 TTL + 上限）。整段持锁：迭代与 pop 必须原子，
+    # 否则会与 request 线程的注册撞出 dict changed size during iteration。
+    with _AUDIT_CANARY_LOCK:
+        if _AUDIT_CANARY_REGISTRY:
+            expired = [n for n, ts in _AUDIT_CANARY_REGISTRY.items() if now - ts > _AUDIT_REGISTRY_TTL]
+            for n in expired:
                 _AUDIT_CANARY_REGISTRY.pop(n, None)
+            # 超上限清最早（按 ts 升序）
+            if len(_AUDIT_CANARY_REGISTRY) > _AUDIT_REGISTRY_MAX:
+                sorted_items = sorted(_AUDIT_CANARY_REGISTRY.items(), key=lambda kv: kv[1])
+                for n, _ in sorted_items[:len(_AUDIT_CANARY_REGISTRY) - _AUDIT_REGISTRY_MAX]:
+                    _AUDIT_CANARY_REGISTRY.pop(n, None)
 
 
 def error(flow):
@@ -5906,7 +5917,27 @@ _AUDIT_TEXT_PROBE_BYTES = AUDIT_SCAN_MAX * 4 + 4
 _AUX_PENDING_LOCK = threading.Lock()
 _AUX_PENDING = [0]
 _AUX_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="maskit-aux")
+# ⚠️ `_AUX_STATS` 的写入发生在 aux 线程（池里）与事件循环线程两处，而读取
+# （`aux_pool_stats` → /api/engine/metrics 与一键自检）在第三个线程。
+# 此前“峰值 / 等待累计 / stream_finish”这些键是**首次插入**（会改 size），与读取侧的
+# `dict(_AUX_STATS)` 快照并发就撞出 `RuntimeError: dictionary changed size during
+# iteration`；异常被 write_runtime_metrics 的宽 except 吞掉 → engine-runtime.json
+# 静默停更（面板与自检读到的都是旧值）。统一走这两个带锁的写入口。
+_AUX_STATS_LOCK = threading.Lock()
 _AUX_STATS = {"submitted": 0, "completed": 0, "failed": 0}
+
+
+def _aux_stat_add(key, delta=1):
+    """`_AUX_STATS` 的原子累加（含首次插入新键）。"""
+    with _AUX_STATS_LOCK:
+        _AUX_STATS[key] = _AUX_STATS.get(key, 0) + delta
+
+
+def _aux_stat_max(key, value):
+    """`_AUX_STATS` 的原子取大（峰值类指标）。"""
+    with _AUX_STATS_LOCK:
+        if value > _AUX_STATS.get(key, 0):
+            _AUX_STATS[key] = value
 # 响应侧等待 aux 池多久才值得留痕。为什么是"留痕"而不是"超时放弃"：
 # 这条 await 之后就是"把还原结果写回 flow.response"，一旦超时放弃，客户端拿到的就是
 # **带占位符（或未还原明文）的响应** —— 那是本产品的核心承诺（本地还原后再出网/交付），
@@ -5927,7 +5958,8 @@ def aux_pool_stats():
         depth = int(_AUX_POOL._work_queue.qsize())     # 私有 API，取不到就算了
     except Exception:
         depth = None
-    out = dict(_AUX_STATS)
+    with _AUX_STATS_LOCK:
+        out = dict(_AUX_STATS)
     out["queue_depth"] = depth
     # 最长等待（ms）：0 = 从未超过留痕阈值
     out["max_wait_ms"] = round(float(_AUX_WAIT_TRACE_MS[0]), 1)
@@ -6412,7 +6444,8 @@ async def request(flow: http.HTTPFlow):
         return
     # 准入通过才注册 canary（不变式 7：任何签发/登记副作用都排在准入之后）
     for _nonce in (flow.metadata.get("audit_canaries") or ()):
-        _AUDIT_CANARY_REGISTRY[_nonce] = time.time()
+        with _AUDIT_CANARY_LOCK:
+            _AUDIT_CANARY_REGISTRY[_nonce] = time.time()
     try:
         # 重活交给专职线程（见 _MASK_POOL）：本函数是 async 钩子，mitmproxy 会在
         # 事件循环里 await 它——等待期间其他连接的收发照常进行，一条慢会话不再冻住整机。
@@ -6634,16 +6667,14 @@ def _response_offload(flow, sid, host, method, emit_path, source, ct):
                    —— 它们是安全层，不能因为"还原没做"就整段跳过（见下方注释）；
       block        非空 = 要把响应换成这个 503（命令拦截或审计熔断）。
     """
-    _AUX_STATS["submitted"] += 1
+    _aux_stat_add("submitted")
     # 先抢槽位再解码：本函数体内所有 O(body) 的工作（解码、还原、审计、扫描）
     # 都在槽位保护下，"已解码副本"不会随并发请求数线性增长。
     _waited0 = time.perf_counter()
     _AUX_SLOTS.acquire()
     try:
-        _AUX_STATS["peak_inflight"] = max(_AUX_STATS.get("peak_inflight", 0),
-                                          _AUX_MAX_INFLIGHT - _AUX_SLOTS._value)
-        _AUX_STATS["wait_ms_total"] = (_AUX_STATS.get("wait_ms_total", 0.0)
-                                      + (time.perf_counter() - _waited0) * 1000)
+        _aux_stat_max("peak_inflight", _AUX_MAX_INFLIGHT - _AUX_SLOTS._value)
+        _aux_stat_add("wait_ms_total", (time.perf_counter() - _waited0) * 1000)
         return _response_offload_locked(flow, sid, host, method, emit_path, ct, source)
     finally:
         _AUX_SLOTS.release()
@@ -6666,11 +6697,9 @@ def _stream_finish_offload(flow, sid, host, method, emit_path, source, restored_
     _waited0 = time.perf_counter()
     _AUX_SLOTS.acquire()
     try:
-        _AUX_STATS["peak_inflight"] = max(_AUX_STATS.get("peak_inflight", 0),
-                                          _AUX_MAX_INFLIGHT - _AUX_SLOTS._value)
-        _AUX_STATS["wait_ms_total"] = (_AUX_STATS.get("wait_ms_total", 0.0)
-                                      + (time.perf_counter() - _waited0) * 1000)
-        _AUX_STATS["stream_finish"] = _AUX_STATS.get("stream_finish", 0) + 1
+        _aux_stat_max("peak_inflight", _AUX_MAX_INFLIGHT - _AUX_SLOTS._value)
+        _aux_stat_add("wait_ms_total", (time.perf_counter() - _waited0) * 1000)
+        _aux_stat_add("stream_finish")
         # `apply_block=False`：流式响应此刻已逐块下发到客户端，**再写 flow.response
         # 既拦不住也已经晚了**；而且这里是 aux 线程，`flow.response = ...` 是 mitmproxy
         # 状态，按本模块不变式 3 只能在事件循环线程碰（整包路径同样显式传 False）。
@@ -6682,7 +6711,7 @@ def _stream_finish_offload(flow, sid, host, method, emit_path, source, restored_
                        streamed_text=restored_text)
     except Exception as e:
         # 与整包路径同口径：失败必须留痕（审计是安全层，不能因为搬了线程就静默丢）
-        _AUX_STATS["failed"] = _AUX_STATS.get("failed", 0) + 1
+        _aux_stat_add("failed")
         _log("[stream] 收尾审计/扫描失败：%s: %s" % (type(e).__name__, str(e)[:120]))
     finally:
         _AUX_SLOTS.release()
@@ -6731,7 +6760,7 @@ def _response_offload_locked(flow, sid, host, method, emit_path, ct, source):
         # 本函数一度在异常时直接 return，于是"body 形态能诱发还原异常"就等价于
         # "这条响应不做审计、不落响应扫描" —— 输入可控地关掉一层安全检测。
         # 还原失败时下游按**未还原原文**继续扫（审计口径照旧只扫前 128KB）。
-        _AUX_STATS["failed"] += 1
+        _aux_stat_add("failed")
         err = str(e)[:200]
     # 还原后的文本：审计与 S9 都必须扫**还原后**的文本（占位符状态下路径/主机名
     # 都是假的，判不准也没意义）；未还原时退回原文，与旧路径一致。
@@ -6762,7 +6791,7 @@ def _response_offload_locked(flow, sid, host, method, emit_path, ct, source):
         block = audit_block
     # 响应侧扫描：检测模型回复中不在本会话映射里的 PII（幻觉/训练数据泄漏）
     _scan_response(flow, sid, host, method, emit_path, source, streamed_text=text)
-    _AUX_STATS["completed"] += 1
+    _aux_stat_add("completed")
     return (new_content, ok, err, block, debug_text)
 
 
@@ -7677,8 +7706,9 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
                              emit_path, source, restored_text, _session_ref)
         except Exception as e:
             # 池已关（进程收尾）：宁可占一次循环，也不能把这次审计丢掉。
-            with _AUX_PENDING_LOCK:
-                _AUX_PENDING[0] -= 1
+            # ⚠️ 这里**不要**手动归还 `_AUX_PENDING`：下面的内联调用会走它自己的
+            # `finally` 归还（那里还负责 `_drop`），再扣一次会把计数压成负数，
+            # 于是 `aux_drain()` 误判“已排空”（测试与诊断会假绿）。
             _log("[stream] aux 池不可用（%s），收尾改为内联执行" % type(e).__name__)
             _stream_finish_offload(flow, sid, host, method, emit_path, source,
                                    restored_text, _session_ref)

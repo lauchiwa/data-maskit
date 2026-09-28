@@ -193,6 +193,39 @@ class RuleTests(unittest.TestCase):
                    proxy=dict(HEALTHY["proxy"], uptime_s=7200))
         self.assertIn("S34", ids(ctx))
 
+    def test_s11_requires_upstream_samples(self):
+        """零样本不得下“上游秒拒”的判断。
+
+        `aggregate_recent` 的默认值是 {"p50": 0.0, "n": 0} —— p50=0 会让
+        “p50 ≤ 300ms”成立，于是**没有样本**也会被读成“上游返回得很快”，
+        并给出“核对限流/配额”这种指向错误的建议。合法判据必须在 n > 0 之后才谈 p50。
+        """
+        base = dict(HEALTHY["events"])
+        self.assertNotIn("S11", ids(dict(HEALTHY, events=dict(
+            base, by_status={"5xx": 3}, upstream_ms={"p50": 0.0, "p95": 0.0, "n": 0}))),
+            "零样本时凭默认 p50=0 断言了“上游秒拒”")
+        self.assertIn("S11", ids(dict(HEALTHY, events=dict(
+            base, by_status={"5xx": 3}, upstream_ms={"p50": 12.0, "p95": 20.0, "n": 40}))),
+            "有样本且很快时必须判（别把规则废掉）")
+        self.assertNotIn("S11", ids(dict(HEALTHY, events=dict(
+            base, by_status={"5xx": 3}, upstream_ms={"p50": 5000.0, "p95": 9000.0, "n": 40}))),
+            "上游很慢是超时，不是秒拒")
+
+    def test_ok_items_never_contradict_fired_findings(self):
+        """「检查通过」只能来自“那条规则确实没触发”。
+
+        修复前它是一个与规则无关的静态列表（有 findings 时固定显示第 1 条），
+        S01「代理未运行」会与「代理运行中且端口/兜底层正常」同屏出现。
+        """
+        out = sc.run_selfcheck(dict(HEALTHY, proxy=dict(HEALTHY["proxy"], running=False),
+                                    settings={"fail_closed": True}))
+        self.assertIn("S01", out["fired_ids"])
+        notes = " ".join(o["note"] for o in out["ok_items"])
+        self.assertNotIn("代理运行中", notes, "已在报「代理未运行」却仍显示「代理运行中」")
+        # 反向：完全健康时 A–E 应全部在列
+        healthy = sc.run_selfcheck(HEALTHY)
+        self.assertEqual({o["id"] for o in healthy["ok_items"]}, {"A", "B", "C", "D", "E"})
+
     def test_severity_ordering_and_overall(self):
         ctx = dict(HEALTHY, settings={"fail_closed": False},
                    events=dict(HEALTHY["events"], unresolved=2))

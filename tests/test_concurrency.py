@@ -355,5 +355,59 @@ class SameSessionRestoreTests(unittest.TestCase):
                          % (s["restored"], total))
 
 
+class CrossThreadStateGuardTests(unittest.TestCase):
+    """跨线程共享状态的读改写必须走带锁入口（0.6.0 的并发口径要前后一致）。
+
+    这两处原先都是裸 `dict[k] += 1` / `dict[k] = ...`，与另一线程的
+    `dict(_STATS)` 快照并发就撞 `RuntimeError: dictionary changed size during
+    iteration`，而异常被宽 except 吞掉（表现为“审计/指标静默少一条”）。
+    写成源码守卫，免得下次又有人图省事直接写回去。
+    """
+
+    def test_aux_stats_writes_are_locked(self):
+        src = (ROOT / "engine" / "transparent.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        allowed = {"_aux_stat_add", "_aux_stat_max"}
+        bad = []
+        for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+            if fn.name in allowed:
+                continue
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Assign):
+                    targets = node.targets
+                elif isinstance(node, ast.AugAssign):
+                    targets = [node.target]
+                else:
+                    continue
+                for tgt in targets:
+                    if (isinstance(tgt, ast.Subscript) and isinstance(tgt.value, ast.Name)
+                            and tgt.value.id == "_AUX_STATS"):
+                        bad.append("%s:%d" % (fn.name, node.lineno))
+        self.assertEqual(bad, [],
+                         "这些位置绕过带锁入口直接改 _AUX_STATS：%s" % bad)
+
+    def test_canary_registry_access_is_locked(self):
+        """`_AUDIT_CANARY_REGISTRY` 的迭代与写入必须持锁（注册/读取/回收在三个线程上）。"""
+        src = (ROOT / "engine" / "transparent.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        unchecked = []
+        for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+            uses = [n for n in ast.walk(fn)
+                    if isinstance(n, ast.Name) and n.id == "_AUDIT_CANARY_REGISTRY"]
+            if not uses:
+                continue
+            has_lock = any(
+                isinstance(n, ast.With) and any(
+                    getattr(item, "context_expr", None) is not None
+                    and isinstance(item.context_expr, ast.Name)
+                    and item.context_expr.id == "_AUDIT_CANARY_LOCK"
+                    for item in n.items)
+                for n in ast.walk(fn))
+            if not has_lock:
+                unchecked.append(fn.name)
+        self.assertEqual(unchecked, [],
+                         "这些函数访问 _AUDIT_CANARY_REGISTRY 却没有持锁：%s" % unchecked)
+
+
 if __name__ == "__main__":
     unittest.main()

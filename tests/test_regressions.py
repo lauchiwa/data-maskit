@@ -7506,7 +7506,15 @@ class MaskOffloadTests(unittest.TestCase):
             self.assertEqual(ev[0].get("ner_skip_reasons"), {"budget_exhausted": 2})
 
     def test_worker_failure_still_fails_closed(self):
-        """线程里抛异常必须原样带回：仍走 fail-closed 503，绝不因为搬了执行位置就放行原文。"""
+        """线程里抛异常必须原样带回：仍走 fail-closed 503，绝不因为搬了执行位置就放行原文。
+
+        ⚠️ 本用例把 `_mask_pipeline_worker` **整只**换成抛异常的 mock，所以它的
+        `finally: _mask_release(...)` 不会执行 —— 名额必须由本用例自己复位。
+        不复位就会把 `queued_bytes / inflight` 留给后面的用例（实测：先跑本文件
+        再跑 test_concurrency，背压断言会以 `3091 != 3000` 变红，也就是“用例顺序
+        决定成败”，而 discovery 的字母序恰好掩盖了它）。
+        真实生产路径不会漏：worker 的异常发生在它内部 try/finally 里，名额照常归还。
+        """
         old = tr.FAIL_CLOSED
         tr.FAIL_CLOSED = True
         try:
@@ -7518,6 +7526,9 @@ class MaskOffloadTests(unittest.TestCase):
             self.assertEqual(flow.response.status_code, 503)
         finally:
             tr.FAIL_CLOSED = old
+            with tr._MASK_ADMISSION_LOCK:
+                tr._MASK_ADMISSION["inflight"] = 0
+                tr._MASK_ADMISSION["queued_bytes"] = 0
 
     def test_ner_cache_holds_a_long_conversation(self):
         """缓存必须装得下一条长会话的叶子，否则 LRU 每轮整批挤出 → 命中率≈0 → 每轮冷启全量重推。"""
