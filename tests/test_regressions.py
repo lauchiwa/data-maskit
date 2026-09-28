@@ -7456,6 +7456,12 @@ class MaskOffloadTests(unittest.TestCase):
         ⚠️ 不依赖语义模型：分段计数（`cache_stats()["long_split_calls"]`）在
         `_extract_long` 里累加，与推理是否可用无关 —— CI 上 `engine/models/` 是
         gitignore 的，模型缺失时这条用例仍必须有效。
+
+        ⚠️ 但**必须**把 `is_ner_available` 固定为 True（2026-09-28 CI 实测）：
+        `transparent.mask()` 在调 `extract_entities` **之前**就有一道模型可用性前置
+        检查，模型缺失时直接记 `model_missing` 返回 —— 叶子根本到不了
+        `_extract_long`，断言 `long_split_calls` 必然失败（本地有模型所以绿）。
+        而 `_extract_long` 的计数本身不需要推理成功（段内 init 失败也照样计数）。
         """
         import ner_engine
         long_text = "系统提示词" * 4001          # 20005 字，超过单条上限
@@ -7469,7 +7475,8 @@ class MaskOffloadTests(unittest.TestCase):
         old = tr.NER_ENABLED
         tr.NER_ENABLED = True
         try:
-            with mock.patch.object(tr, "_emit", lambda typ, **kw: events.append((typ, kw))), \
+            with mock.patch.object(ner_engine, "is_ner_available", lambda: True), \
+                 mock.patch.object(tr, "_emit", lambda typ, **kw: events.append((typ, kw))), \
                  mock.patch.object(tr, "_maybe_reload", lambda force=False: None):
                 _drive_request(flow)
         finally:
