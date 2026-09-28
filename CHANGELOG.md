@@ -2,6 +2,12 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [Unreleased]
+
+### 修复 / Bug Fixes
+- 修正 Windows 发布校验和清单的换行格式，确保每个文件的摘要独占一行。
+  *Fix newlines in Windows release checksum manifests so each file digest occupies its own line.*
+
 ## [0.103.0] - 2026-09-28
 
 基于上游 v0.6.0（`xiaYuTian11/maskit`）。
