@@ -327,7 +327,7 @@ jobs:
         env:
           CHECKSUM_PLATFORM: ${{ matrix.platform }}
           CHECKSUM_MODE: ${{ steps.mode_windows.outputs.mode }}
-        run: python -c "import hashlib, os; from pathlib import Path; root=Path('src-tauri/target/release/bundle'); files=sorted(p for p in root.rglob('*') if p.is_file() and not p.name.startswith('SHA256SUMS-')); out=root/('SHA256SUMS-'+os.environ['CHECKSUM_PLATFORM']+'-'+os.environ['CHECKSUM_MODE']+'.txt'); out.write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.relative_to(root).as_posix()+'\\n' for p in files), encoding='utf-8'); assert out.stat().st_size > 0"
+        run: python -c "import hashlib, os; from pathlib import Path; root=Path('src-tauri/target/release/bundle'); files=sorted(p for p in root.rglob('*') if p.is_file() and not p.name.startswith('SHA256SUMS-')); out=root/('SHA256SUMS-'+os.environ['CHECKSUM_PLATFORM']+'-'+os.environ['CHECKSUM_MODE']+'.txt'); out.write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.relative_to(root).as_posix()+'\n' for p in files), encoding='utf-8'); assert out.stat().st_size > 0"
 
       - name: Generate SHA-256 checksums (Unix)
         if: runner.os != 'Windows'
