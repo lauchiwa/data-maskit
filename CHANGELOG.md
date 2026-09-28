@@ -2,7 +2,7 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
-## [Unreleased]
+## [0.103.0] - 2026-09-28
 
 基于上游 v0.6.0（`xiaYuTian11/maskit`）。
 *Based on upstream v0.6.0 (`xiaYuTian11/maskit`).*
@@ -14,6 +14,8 @@
 ### 修复 / Bug Fixes
 - 按协议路径保护缓存相关键名与合法保留策略，敏感缓存键沿用稳定脱敏映射，避免同名业务字段漏检及 Schema 定义与引用不一致。
   *Protect cache-related keys and valid retention policies only at protocol paths; reuse stable masking for sensitive cache keys without exempting business data or breaking schema references.*
+- 更新检查与发布日志统一使用本分支仓库，扩展重载提示沿本分支发布历史判定，避免合并上游后误报无需重载。
+  *Use this fork for update checks and release notes, and compare extension changes along its release history to avoid false no-reload notices after upstream merges.*
 
 ## [0.102.0] - 2026-09-22
 

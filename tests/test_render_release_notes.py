@@ -14,6 +14,7 @@ Release body，本地门禁完全覆盖不到它 —— 如果脚本坏了，线
 import contextlib
 import importlib.util
 import io
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -136,6 +137,40 @@ class ExtensionUpdateNoticeTests(unittest.TestCase):
         with mock.patch.object(rrn, "_git", fake_git):
             self.assertEqual(rrn._prev_tag(ROOT), "v0.3.2")
         self.assertEqual(seen[0], "HEAD^", "必须先查 HEAD^，且只查它")
+
+    def test_previous_release_stays_on_first_parent_after_upstream_merge(self):
+        """A nearer upstream tag must not hide extension changes since our own release."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-c", "commit.gpgsign=false", "-c", "tag.gpgSign=false", *args],
+                    cwd=root, check=True, capture_output=True, text=True,
+                ).stdout.strip()
+
+            git("init", "--initial-branch=main")
+            git("config", "user.name", "Maskit test")
+            git("config", "user.email", "fixture" + "@" + "example.invalid")
+            (root / "extension").mkdir()
+            bridge = root / "extension" / "bridge.js"
+            bridge.write_text("old bridge\n", encoding="utf-8")
+            git("add", ".")
+            git("commit", "-m", "base")
+            git("tag", "-a", "v0.100.0", "-m", "fork release")
+            git("switch", "-c", "upstream")
+            bridge.write_text("new bridge\n", encoding="utf-8")
+            git("commit", "-am", "upstream extension change")
+            git("tag", "-a", "v0.6.0", "-m", "upstream release")
+            git("switch", "main")
+            git("commit", "--allow-empty", "-m", "fork work")
+            git("merge", "--no-ff", "upstream", "-m", "merge upstream")
+            git("commit", "--allow-empty", "-m", "next fork release")
+            git("tag", "-a", "v0.101.0", "-m", "next release")
+
+            previous = rrn._prev_tag(root)
+            self.assertEqual(previous, "v0.100.0")
+            self.assertTrue(rrn.extension_changed(previous, root))
 
     def test_missing_version_raises(self):
         """找不到版本号要 SystemExit，不能返回空字符串（否则 Release body 会空白）。"""

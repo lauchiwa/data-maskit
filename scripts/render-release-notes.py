@@ -69,16 +69,17 @@ def _git(args: list[str], cwd: Path) -> tuple[int, str]:
 def _prev_tag(root: Path) -> str | None:
     """发版提交的「上一个版本 tag」；取不到返回 None（不猜）。
 
-    用 `describe --abbrev=0 HEAD^` 而不是 `tag --sort=-v:refname | head`：后者会把
-    **全部** tag 按版本排序取最大的，若历史上有不连续的分支 tag 会挑错对象，
-    从而把「扩展变没变」算成别的区间的结果。
+    用 `describe --first-parent --abbrev=0 HEAD^` 沿本分支发布线找 tag，
+    不进入合并进来的上游历史。否则上游 tag 距离更近时，会把「已合入的扩展改动」
+    误报成「扩展无改动」，即使本分支每次发版都打了 tag 也挡不住。
+    也不能按版本号排序取全仓最大 tag，那会把不相关分支的版本当比较基线。
 
     **故意不回退到 `HEAD`**：浅克隆下 `HEAD^` 取不到（release workflow 若漏了
     `fetch-depth: 0` 就是浅克隆），而 `describe HEAD` 会拿到**当前 tag 自己**，
     紧接着 `git diff <当前tag> HEAD -- extension/` 恒为空 → 把「扩展大改」算成
     「扩展无改动」的假阴性——正是这个机制要防的事。取不到就返回 None（= unknown）。
     """
-    code, out = _git(["describe", "--tags", "--abbrev=0", "HEAD^"], root)
+    code, out = _git(["describe", "--first-parent", "--tags", "--abbrev=0", "HEAD^"], root)
     if code == 0 and out:
         return out
     return None

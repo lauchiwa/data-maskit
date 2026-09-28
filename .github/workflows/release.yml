@@ -105,8 +105,11 @@ jobs:
       - name: Fetch NER model for All-in-One Docker image
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p engine/models/ner_mini_zh
-          curl -sSL https://github.com/xiaYuTian11/maskit/releases/download/v0.3.0/ner_mini_zh.zip -o ner_mini_zh.zip
+          curl --fail --show-error --silent --location --retry 3 --max-time 300 https://github.com/xiaYuTian11/maskit/releases/download/v0.3.0/ner_mini_zh.zip -o ner_mini_zh.zip
+          # Official v0.3.0 asset digest verified on 2026-09-28; never build with a replaced archive.
+          python -c "import hashlib; from pathlib import Path; assert hashlib.sha256(Path('ner_mini_zh.zip').read_bytes()).hexdigest() == 'f125beef98bc9a49bb92237d100818bad18579775e6242744a9a421440e8056d', 'NER archive SHA-256 mismatch'"
           unzip -q -o ner_mini_zh.zip -d engine/models/ner_mini_zh
           rm -f ner_mini_zh.zip
           test -f engine/models/ner_mini_zh/model_quantized.onnx
@@ -190,8 +193,11 @@ jobs:
       - name: Fetch NER model for All-in-One bundle
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p engine/models/ner_mini_zh
-          curl -sSL https://github.com/xiaYuTian11/maskit/releases/download/v0.3.0/ner_mini_zh.zip -o ner_mini_zh.zip
+          curl --fail --show-error --silent --location --retry 3 --max-time 300 https://github.com/xiaYuTian11/maskit/releases/download/v0.3.0/ner_mini_zh.zip -o ner_mini_zh.zip
+          # Official v0.3.0 asset digest verified on 2026-09-28; never build with a replaced archive.
+          python -c "import hashlib; from pathlib import Path; assert hashlib.sha256(Path('ner_mini_zh.zip').read_bytes()).hexdigest() == 'f125beef98bc9a49bb92237d100818bad18579775e6242744a9a421440e8056d', 'NER archive SHA-256 mismatch'"
           unzip -q -o ner_mini_zh.zip -d engine/models/ner_mini_zh
           rm -f ner_mini_zh.zip
           test -f engine/models/ner_mini_zh/model_quantized.onnx
