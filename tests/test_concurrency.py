@@ -386,6 +386,41 @@ class CrossThreadStateGuardTests(unittest.TestCase):
         self.assertEqual(bad, [],
                          "这些位置绕过带锁入口直接改 _AUX_STATS：%s" % bad)
 
+    def test_mask_timeouts_reads_and_writes_are_locked(self):
+        """`_MASK_TIMEOUTS` 的每个读写点都要持 `_MASK_ADMISSION_LOCK`。
+
+        `count` 与 `peak_wait_ms` 分别由事件循环线程与 worker 线程更新，锁外读会
+        拿到半更新快照（面板上表现为“计数已增、峰值还是旧的”这种对不上的数字）。
+        """
+        src = (ROOT / "engine" / "transparent.py").read_text(encoding="utf-8")
+        lines = src.splitlines()
+        bad = []
+        for i, ln in enumerate(lines):
+            if "_MASK_TIMEOUTS[" not in ln:
+                continue
+            indent = len(ln) - len(ln.lstrip())
+            inside = False
+            # 沿缩进链向上找宿主块：逐层回退到缩进更小的那几行，只要其中某一层是
+            # `with _MASK_ADMISSION_LOCK` 就算锁内（`if` 嵌在 `with` 里时最近的一层
+            # 是 `if`，只看最近一行会把锁内的代码误判成锁外）。
+            probe = indent
+            for j in range(i - 1, max(-1, i - 60), -1):
+                prev = lines[j]
+                if not prev.strip():
+                    continue
+                pind = len(prev) - len(prev.lstrip())
+                if pind < probe:
+                    if prev.strip().startswith("with _MASK_ADMISSION_LOCK:"):
+                        inside = True
+                        break
+                    probe = pind
+                    if pind == 0:
+                        break
+            if not inside:
+                bad.append("L%d: %s" % (i + 1, ln.strip()))
+        self.assertEqual(bad, [],
+                         "这些位置直接读/写 _MASK_TIMEOUTS 却不在锁内：%s" % bad)
+
     def test_canary_registry_access_is_locked(self):
         """`_AUDIT_CANARY_REGISTRY` 的迭代与写入必须持锁（注册/读取/回收在三个线程上）。"""
         src = (ROOT / "engine" / "transparent.py").read_text(encoding="utf-8")

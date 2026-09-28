@@ -5800,8 +5800,10 @@ def mask_pool_stats():
         depth = None
     with _MASK_ADMISSION_LOCK:
         adm = dict(_MASK_ADMISSION)
-    adm["engine_timeouts"] = _MASK_TIMEOUTS["count"]
-    adm["peak_wait_ms"] = round(float(_MASK_TIMEOUTS["peak_wait_ms"]), 1)
+        # 快照必须与写入持**同一把锁**：`count` / `peak_wait_ms` 由工作线程与事件循环
+        # 线程更新，锁外读会拿到半更新值（典型是“计数已加、峰值还是旧的”）。
+        adm["engine_timeouts"] = _MASK_TIMEOUTS["count"]
+        adm["peak_wait_ms"] = round(float(_MASK_TIMEOUTS["peak_wait_ms"]), 1)
     adm.update({
         "workers": _MASK_WORKER_COUNT,
         "queue_bytes_limit": _MASK_QUEUE_BYTES,
@@ -6461,7 +6463,10 @@ async def request(flow: http.HTTPFlow):
             # ---- B-5：端到端 deadline ----
             _res = await _await_with_deadline(_fut, _ENGINE_DEADLINE_S)
         except asyncio.TimeoutError:
-            _MASK_TIMEOUTS["count"] += 1
+            # 与 `peak_wait_ms` 同一把锁：`_MASK_TIMEOUTS` 是一个整体快照，
+            # 两个字段分开加锁会让 `/api/engine/metrics` 读到“计数已增、峰值未更新”。
+            with _MASK_ADMISSION_LOCK:
+                _MASK_TIMEOUTS["count"] += 1
             _emit("BLOCK", host=host, method=method, path=path.split("?")[0], sid=sid,
                   reason="engine_timeout", block_source="engine",
                   bytes=len(raw_content),
