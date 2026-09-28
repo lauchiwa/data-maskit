@@ -51,6 +51,7 @@
   ],
   "debug": false,
   "ner_enabled": false,
+  "ner_req_budget_s": 10,
   "diagnostic_unmatched": false,
   "session_ttl": 600,
   "http2": true,

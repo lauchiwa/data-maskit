@@ -1899,6 +1899,46 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                     {tf('settings.sw.nerUnavailable', { reason: status.ner.reason || '—' })}
                   </p>
                 )}
+                {/* P0-a：单请求语义识别预算（秒）。实测客户端解包超时 180s，
+                    而旧默认 60s 会让冷缓存那一轮（实测 58.5s）把请求直接推过超时线。 */}
+                {!!(cfg as Record<string, unknown> | undefined)?.ner_enabled && (
+                  <div className="pt-1">
+                    <Label className="flex items-center gap-1 text-xs">{t('settings.sw.nerBudget')}
+                      <TooltipProvider delayDuration={200}>
+                        <Tooltip>
+                          <TooltipTrigger asChild><HelpCircle className="h-3.5 w-3.5 cursor-help text-muted-foreground/60" /></TooltipTrigger>
+                          <TooltipContent className="max-w-[300px] text-xs">{t('settings.sw.nerBudgetTooltip')}</TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    </Label>
+                    <div className="mt-1 flex items-center gap-2">
+                      <Input type="number" min={1} max={120} step={1} className="h-8 w-24 text-xs"
+                        // key 与日志保留天数同因：defaultValue 只在挂载时生效，
+                        // 首帧 cfg 是 undefined，没有 key 会显示兜底值并被随手写回。
+                        key={`nerbudget-${String((cfg as Record<string, unknown> | undefined)?.ner_req_budget_s ?? 10)}`}
+                        defaultValue={String((cfg as Record<string, unknown> | undefined)?.ner_req_budget_s ?? 10)}
+                        onBlur={(e) => {
+                          const raw = e.target.value.trim()
+                          const parsed = Number(raw)
+                          const current = Number((cfg as Record<string, unknown> | undefined)?.ner_req_budget_s ?? 10)
+                          // 空/非法/非正数：还原并提示（与后端 _normalize_ner_budget 同口径）
+                          if (raw === '' || !Number.isFinite(parsed) || parsed <= 0) {
+                            e.target.value = String(current)
+                            toast(t('settings.toast.nerBudgetInvalid'), 'error')
+                            return
+                          }
+                          const v = Math.min(120, Math.max(1, Math.round(parsed)))
+                          e.target.value = String(v)
+                          if (v !== current) save({ ner_req_budget_s: v }, t('settings.toast.nerBudgetUpdated'))
+                        }} />
+                      <span className="text-[11px] text-muted-foreground">
+                        {status?.ner?.budget_env_override
+                          ? tf('settings.sw.nerBudgetEnvFixed', { s: String(status?.ner?.req_budget_s ?? '') })
+                          : t('settings.sw.nerBudgetHint')}
+                      </span>
+                    </div>
+                  </div>
+                )}
                 {/* 跳过原因计数（审计 M7）：`available` 为 true 只说明引擎能跑，
                     **不说明每一段文本都做了识别**。`MAX_TEXT_CHARS` 会让超长叶子整条
                     跳过，预算耗尽也会中途停手——这些此前只写一条进程级日志，界面上

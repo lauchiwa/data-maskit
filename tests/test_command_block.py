@@ -622,6 +622,10 @@ class ConfigTests(CommandBlockTestBase):
             [(p["id"], p["regex"], p["enabled"]) for p in dflt["command_block"]["patterns"]],
         )
         self.assertEqual(ex["audit"]["fail_closed"], dflt["audit"]["fail_closed"])
+        # P0-a：单请求 NER 预算也是“模板 ↔ 默认”必须同源的一项（两份各写一遍
+        # 必然漂移：改了默认值却忘了改模板，新用户拿到的是旧口径）。
+        self.assertEqual(ex["ner_req_budget_s"], dflt["ner_req_budget_s"])
+        self.assertEqual(ex["ner_enabled"], dflt["ner_enabled"])
 
     def test_user_pattern_without_id_gets_stable_id(self):
         pats = [{"label": "无 id", "regex": "rm -rf /important"}]

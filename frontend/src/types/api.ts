@@ -79,6 +79,15 @@ export interface ProxyStatus {
     initialized: boolean
     reason: string
     skips?: Record<string, number>
+    /**
+     * 单请求语义识别预算上限（秒，P0-a）：这是**配置值**。
+     * 引擎侧实际生效值（环境变量可硬覆盖）见 `/api/engine/metrics` 的 `ner.req_budget_s`。
+     */
+    req_budget_s?: number
+    /** `MASKIT_NER_REQ_BUDGET_S` 是否已设置（设置后配置项改不动，界面必须提示） */
+    budget_env_override?: boolean
+    /** 缓存冷热计数（本进程视角；代理链路真值在 engine-runtime.json） */
+    cache?: { hit?: number; miss?: number; hit_rate?: number | null }
   }
   needs_ca: boolean
   wizard_recommended: boolean
@@ -315,6 +324,11 @@ export interface ShieldConfig {
   debug: boolean
   log_retention_days?: number
   session_ttl?: number
+  /**
+   * 单请求语义识别预算上限（秒，P0-a）。
+   * 环境变量 MASKIT_NER_REQ_BUDGET_S 存在时硬盘覆盖本项（界面会提示）。
+   */
+  ner_req_budget_s?: number
   diagnostic_unmatched?: boolean
   http2?: boolean
   /** 浏览器扩展链路总开关（默认关）。关闭时三个 /api/ext/* 端点 403 `ext_bridge_disabled` */

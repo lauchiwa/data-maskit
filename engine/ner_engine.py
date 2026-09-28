@@ -39,19 +39,27 @@ _LAST_ERROR = ""
 _INTRA_THREADS = 0
 
 # ── 成本护栏 ──────────────────────────────────────────────────────────────────
-# 单条文本长度上限：超过即跳过语义识别并留一次日志。宁可这一条不做识别，
-# 也不能让一条超长文本把整个代理冻住（单线程事件循环被占满 = 打字机卡死 +
-# 其他客户端超时）。实测 10 万字符单次调用要 69 秒。
-# 单条文本长度上限（字）。
+# 单个**识别窗口**的长度上限（字）。超过这个长度的文本不再「整条跳过」，而是
+# 按窗口切分后逐段识别（见 `_extract_long`）——请勿把本常量当成「超长就放弃」的闸。
+#
+# 名字保留 MAX_TEXT_CHARS 是因为它同时是**单次调用**的规模上限（分段粒度），
+# 以及 `tests/measure_ner_coverage.py` 的标定基准。
 #
 # ⚠️ 曾有 2000 字上限，超过就**整条不做 NER**（且只在全局日志里留一行）。实测用户
 # 真实流量里出现过 6208 字的单条正文（会话被拼成一个大字符串），那条里的中文人名
 # 全部明文上行 —— 比总预算更容易咬人，因为它是「整条不认」而不是「后面的不认」。
+# 放到 20000 是一次止血；2026-09-28 起超过 20000 字改为**分段识别**（P1），
+# 「整条跳过」这条路径彻底消失：要么识别完，要么受预算约束只识别前若干段，
+# 且预算用尽会如实记 `budget_exhausted`（不再是无声的 too_long）。
 #
-# 放到 20000 的理由：单次推理成本本身已由 `CALL_BUDGET_S`（每次调用 10s，见下）兜住，
-# `_decode_chunks` 也是分窗口跑的，所以长文本的代价是「拿部分实体」而不是失控。
-# 20000 字 ≈ 4s 冷推理，在请求级总预算（见 transparent._ner_req_budget）之内。
+# 为什么必须分段而不是放大上限：单次推理成本随字数线性（0.28ms/字），
+# 一条 5 万字正文单次调用要 14s，会一直占着推理槽位并撞 `CALL_BUDGET_S`；
+# 而分段后每段 ≤20000 字（≈5.6s 冷推理），且每段都进结果缓存 ——
+# 长会话反复重发同一段时第二轮几乎零成本。
 MAX_TEXT_CHARS = 20000
+# 分段时的相邻重叠字数：实体正好落在切点上时，靠重叠区在**别的段**里被完整识别。
+# 64 字足以覆盖中文人名/机构/地址的最长形态（实测最长实体 <30 字）。
+_LONG_SEG_OVERLAP = 64
 # 单次调用时间预算（秒）：长度在上限内但推理异常变慢时按时收手，只返回已收集实体。
 # 单次调用的推理时间上限（秒）。
 #
@@ -84,6 +92,16 @@ _CACHE_CHARS = 0
 # 内容不符（计数偏高会让缓存被自己挤空，反而废掉这个修复），后者可能撞上并发的
 # `popitem` 抛 KeyError。锁只护这两处缓存操作，推理本身不持锁。
 _CACHE_LOCK = threading.Lock()
+# 缓存命中/未命中计数（与 `_CACHE` 共用 `_CACHE_LOCK`）。
+# 为什么要外发：实测同一条内容「冷缓存 58548.9ms / 热缓存 422.7ms」差 138 倍，
+# 而在此之前没有任何一处能看见冷热比例 —— 只能人肉翻事件库对比两条 mask_ms。
+# 只统计**真的查了缓存**的调用：长度守卫、无汉字早返回、模型不可用都不计入，
+# 否则命中率的分母会被这些早返回灌水，读起来像「缓存没用」。
+_CACHE_STATS = {"hit": 0, "miss": 0}
+# 超长文本被分段识别的次数与总字数（进程级）。
+# 它**不是降级**，所以刻意不进 `_SKIP_STATS`（进那里会被设置页读成「跳过原因」，
+# 而分段识别的覆盖范围比旧的整条跳过更全）。只为可观测性留一个出口。
+_LONG_SPLIT = {"n": 0, "chars": 0}
 # 初始化锁：`_init_ner()` 的双检**不是**原子的，两个线程可以同时通过检查、
 # 各建一个 InferenceSession（模型内存与 ONNX 线程双双翻倍，实测过）。
 _INIT_LOCK = threading.Lock()
@@ -257,6 +275,39 @@ def _cache_put(key, entities):
         while _CACHE and (len(_CACHE) > _CACHE_MAX or _CACHE_CHARS > _CACHE_MAX_CHARS):
             old, _ = _CACHE.popitem(last=False)
             _CACHE_CHARS -= len(old)
+
+
+def cache_stats() -> Dict:
+    """结果缓存的命中/未命中快照（含容量水位与命中率）。
+
+    出口：`status()["cache"]` → 引擎 `engine-runtime.json` → 面板
+    `/api/engine/metrics` → 自检/设置页。
+    冷热差实测 138 倍（同一条内容 58548.9ms vs 422.7ms），没有这组计数就只能
+    靠人肉翻事件库 —— 而「缓存命中率掉到 0」恰恰是长会话每轮都慢几十秒的直接原因。
+    `hit_rate` 在没有任何一次查询时返回 None（而不是 0.0）：0.0 会被读成
+    「查了但一次都没命中」，与「还没查过」是不同结论。
+    """
+    with _CACHE_LOCK:
+        hit = int(_CACHE_STATS.get("hit", 0))
+        miss = int(_CACHE_STATS.get("miss", 0))
+        size = len(_CACHE)
+        chars = _CACHE_CHARS
+        split_n = int(_LONG_SPLIT.get("n", 0))
+        split_chars = int(_LONG_SPLIT.get("chars", 0))
+    total = hit + miss
+    return {
+        "hit": hit,
+        "miss": miss,
+        "hit_rate": round(hit / total, 4) if total else None,
+        "size": size,
+        "max": _CACHE_MAX,
+        "chars": chars,
+        "chars_max": _CACHE_MAX_CHARS,
+        # 超长文本分段识别（非降级，见 _LONG_SPLIT 注释）
+        "long_split_calls": split_n,
+        "long_split_chars": split_chars,
+    }
+
 # 预算窗口的宽限（秒）：调用方漏调 end_budget（异常路径）时超过它就自愈，
 # 免得某个线程被永久停掉语义识别——Flask 会复用线程，永久停用等于静默降级。
 _BUDGET_LEAK_GRACE_S = 60.0
@@ -329,7 +380,9 @@ def _note_skip(key: str, msg: str = "") -> None:
 def request_skips(reset: bool = False) -> Dict:
     """取（或取完清空）本线程自上次 `begin_budget` 以来的跳过计数。
 
-    返回形如 `{"budget_exhausted": 3, "too_long": 1}`；空字典 = 本轮语义识别全程生效。
+    返回形如 `{"budget_exhausted": 3, "deadline": 1}`；空字典 = 本轮语义识别全程生效。
+    （`too_long` 是 2026-09-28 前的旧键：那之前超长文本整条跳过；现在改为分段识别，
+    因此新事件不会再出现它 —— 旧库里的事件仍可能带。）
     """
     s = dict(getattr(_local, "skips", None) or {})
     if reset:
@@ -451,6 +504,8 @@ def status() -> Dict:
         "cache_size": len(_CACHE),
         "cache_max": _CACHE_MAX,
         "cache_chars": _CACHE_CHARS,
+        # C-2：冷热命中比例（旧字段保留是为了不破坏已有前端/诊断包读取方）
+        "cache": cache_stats(),
         "skips": skips,
         # B-2/A-4：并发与限流可见性（面板与自检都读这里）
         "governor": governor_status(),
@@ -669,15 +724,17 @@ def extract_entities(text: str) -> List[Dict]:
     if not any("\u4e00" <= ch <= "\u9fff" for ch in text):
         return []
 
+    # 超长文本 → 分段识别（旧行为是整条跳过并记 too_long，见 MAX_TEXT_CHARS 的注释）。
     if len(text) > MAX_TEXT_CHARS:
-        _note_skip("too_long",
-                   f"文本 {len(text)} 字超过 {MAX_TEXT_CHARS} 字上限，该条未做语义实体识别")
-        return []
+        return _extract_long(text)
 
     with _CACHE_LOCK:
         cached = _CACHE.get(text)
         if cached is not None:
             _CACHE.move_to_end(text)
+            _CACHE_STATS["hit"] = _CACHE_STATS.get("hit", 0) + 1
+        else:
+            _CACHE_STATS["miss"] = _CACHE_STATS.get("miss", 0) + 1
     if cached is not None:
         return [dict(e) for e in cached]
 
@@ -865,3 +922,73 @@ def extract_entities(text: str) -> List[Dict]:
     if complete:
         _cache_put(text, final_merged)
     return [dict(e) for e in final_merged]
+
+
+def _extract_long(text: str) -> List[Dict]:
+    """超长文本的分段识别：按 `MAX_TEXT_CHARS` 切窗口后逐段走正常路径，再平移偏移。
+
+    存在的理由（P1，2026-09-28）：真实长会话里单条 6208~几万字的正文很常见
+    （tool 输出、贴进 prompt 的日志/源码），而旧行为是**整条不做 NER**（too_long）——
+    那一段里的中文人名/机构/地址全部明文上行。分段后要么全识别，要么受预算约束
+    只识别前若干段（并记 `budget_exhausted`），不再有「静默的整条跳过」。
+
+    为什么不是简单放大 MAX_TEXT_CHARS：单次成本线性（0.28ms/字），5 万字单次要 14s，
+    会长期占着推理槽位并撞 `CALL_BUDGET_S`；分段后每段 ≤20000 字（≈5.6s 冷推理），
+    且每段单独进缓存 —— 长会话反复重发同一段时第二轮接近零成本。
+
+    重叠窗口（`_LONG_SEG_OVERLAP`）保证落在切点上的实体能在相邻段里被完整看到；
+    重叠区产生的重要实体由 `_merge_overlaps` 去重裁剪。
+    """
+    out: List[Dict] = []
+    # 重叠量不能超过窗口的一半：否则 step 会退化成 1（逐字滑动），
+    # 在 `MAX_TEXT_CHARS` 被测试/配置改小的场景下变成千次空跑。
+    overlap = min(_LONG_SEG_OVERLAP, max(0, MAX_TEXT_CHARS // 2))
+    step = max(1, MAX_TEXT_CHARS - overlap)
+    total = len(text)
+    pos = 0
+    segs = 0
+    while pos < total:
+        seg = text[pos:pos + MAX_TEXT_CHARS]
+        segs += 1
+        ents = extract_entities(seg)
+        for e in ents:
+            # 平移回整条文本的坐标系；`text` 字段与段内一致，无需重取。
+            out.append({
+                "type": e["type"],
+                "start": e["start"] + pos,
+                "end": e["end"] + pos,
+                "text": e["text"],
+            })
+        if pos + MAX_TEXT_CHARS >= total:
+            break
+        # 本段一个实体都没有且预算已耗尽：后面的段只会空跑（白记 N 次
+        # budget_exhausted），直接收手。必须先调一次 extract_entities 再判——
+        # 它的**缓存命中路径不查预算**，先判会把零成本的命中段也丢掉。
+        if not ents and _current_deadline() is None:
+            break
+        pos += step
+    if segs > 1:
+        with _CACHE_LOCK:
+            _LONG_SPLIT["n"] = int(_LONG_SPLIT.get("n", 0)) + 1
+            _LONG_SPLIT["chars"] = int(_LONG_SPLIT.get("chars", 0)) + total
+    return _merge_overlaps(out, text)
+
+
+def _merge_overlaps(ents: List[Dict], text: str) -> List[Dict]:
+    """分段结果的去重与重叠裁剪（口径与 `extract_entities` 内的一致）。
+
+    重叠窗口让同一个实体可能在相邻两段各被识别一次（起终点一致或小幅漂移）；
+    跨切点的实体会以两段各一半的形态出现 —— 保留更靠前、更长的那条，
+    后面的重叠部分裁剪而不是整条丢弃（丢弃会漏掉尾部那一段）。
+    """
+    if not ents:
+        return []
+    ents.sort(key=lambda x: (x["start"], -x["end"]))
+    out: List[Dict] = []
+    for ent in ents:
+        if out and ent["start"] < out[-1]["end"]:
+            if ent["end"] <= out[-1]["end"]:
+                continue
+            ent = dict(ent, start=out[-1]["end"], text=text[out[-1]["end"]:ent["end"]])
+        out.append(ent)
+    return out

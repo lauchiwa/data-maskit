@@ -285,6 +285,13 @@ Masking pool width adapts to the core count (1–4) and can be overridden with `
 Note that plain-Python rule scanning is GIL-bound: adding workers helps most with NER (ONNX releases the GIL)
 and with avoiding head-of-line blocking, not with raw regex throughput.
 
+The NER **per-request budget** defaults to **10 seconds** (Settings → Proxy behaviour → per-request budget,
+or the `MASKIT_NER_REQ_BUDGET_S` environment variable, which overrides the UI). It caps how slow masking
+may get on a single request: clients typically time out at 180s while the upstream first byte alone can take
+100s, so the budget is what is left for the upstream. When it runs out, semantic recognition degrades,
+regex rules still apply, and the event detail marks `budget_exhausted`. Raising it masks bigger bodies more
+completely, but the failure mode is then a client-side `connection closed` (not a Maskit 503).
+
 ### A 503 is not always "the gateway is overloaded"
 
 Since 0.6.0 every 503 is attributed. Open the event detail, or run **Settings → One-click self-check**:

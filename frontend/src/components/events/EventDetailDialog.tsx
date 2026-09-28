@@ -48,10 +48,11 @@ function formatDuration(ms?: number | null): string {
  * 避免两处各维护一份又互相漂移（当初就是设置页列了 6 个键、其中一个早已不产生、
  * 而真在产生的两个没列，界面上直接看不到）。
  *
- * 键的空间（引擎侧）：ner_engine 的 too_long / budget_exhausted / infer_failed /
- * deadline / model_unavailable，以及 transparent 经 `record_skip` 上报的
- * model_missing / om_compose / runtime。未知原因（后端将来新增）直接回退到原始键名
- * —— 降级信息宁可粗糙也绝不能不显示（不显示就等于静默降级）。
+ * 键的空间（引擎侧当前会产生的）：`budget_exhausted` / `infer_failed` / `deadline` /
+ * `model_unavailable`，以及 transparent 经 `record_skip` 上报的 `model_missing` /
+ * `om_compose` / `runtime`。`too_long` 是 0.6.1 前的**历史键**（当时超长文本整条跳过，
+ * 现在改为分段识别），标签保留是为了渲染旧库里已有的事件。未知原因（后端将来新增）
+ * 直接回退到原始键名 —— 降级信息宁可粗糙也绝不能不显示（不显示就等于静默降级）。
  * 一致性由 tests/test_regressions.py::NerSkipReasonSurfacesTests 守。
  */
 const NER_SKIP_LABELS: Record<string, string> = {

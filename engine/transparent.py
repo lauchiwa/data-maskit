@@ -5543,6 +5543,23 @@ def error(flow):
         _err_name = type(err).__name__ if err is not None else "?"
         _has_resp = 1 if getattr(flow, "response", None) is not None else 0
         msg = f"[err={_err_name} resp={_has_resp} req={_req_len}B ms={_elapsed_ms}] " + msg
+        # P0-b：脱敏耗时与「脱敏完成到出错之间等了多久」必须进事件 —— 否则
+        # 「卡在脱敏」与「卡在上游」在事件行上长得一模一样（2026-09-28 实测就因此
+        # 把 58.5s 的冷缓存脱敏误读成上游问题、又把纯上游慢误判成脱敏问题，来回两次）。
+        # 判据：mask 接近 ms 总量 ⇒ 时间都花在脱敏；两者差得远 ⇒ 卡在上游首包。
+        # upstream_wait=-1 表示拿不到脱敏完成时刻（例如脱敏未跑完就出错）。
+        try:
+            _mask_ms = flow.metadata.get("shield_mask_ms")
+            _mask_done_at = flow.metadata.get("shield_mask_done_at")
+        except Exception:
+            _mask_ms, _mask_done_at = None, None
+        if _mask_ms is not None:
+            try:
+                _upstream_wait = (int((time.time() - float(_mask_done_at)) * 1000)
+                                  if _mask_done_at else -1)
+            except Exception:
+                _upstream_wait = -1
+            msg = f"[mask={_mask_ms}ms upstream_wait={_upstream_wait}ms] " + msg
         # 流式接管中途被切断时 _finish() 不执行，没有 RESTORE 事件可对照，
         # 光看 ERR 无法判断断在哪。带上回调次数/字节数还原现场。
         if flow.metadata.get("shield_streamed"):
@@ -5664,19 +5681,76 @@ def _reasoning_effort_hint(reasoning_value):
 #
 # 取值依据（`tests/measure_ner_coverage.py` 可复现，均为冷缓存实测）：
 # 单位成本 ≈ **93µs/字节**中文（≈0.28ms/字）—— 43KB ≈ 3.4s、60KB ≈ 5.6s、1MB ≈ 90s；
-# 缓存命中后稳态 ≈ 1ms。因此 10s 打底 + 120s/MB、封顶 60s：常见会话（≤100KB）
-# 拿到 2 倍以上余量而能全部跑完；超过封顶的巨型请求（≳0.4MB）会降级，但**看得见**。
+# 缓存命中后稳态 ≈ 1ms。因此 10s 打底 + 120s/MB，**封顶默认 10s（可配置）**：
+# 常见会话（≤100KB）能跑完；超过封顶的请求会降级，但**看得见**。
 # ⚠️ 别再凭印象写小这个系数：早期注释把单位成本写成 11µs/字节（差 8 倍），若按那个
 # 算，每 MB 只给 20s，等于对大 body 静默停手 —— 又一次「以为脱了、其实没脱」。
 # 超预算只停用语义识别，确定性规则（正则/词表）照常生效，**且跳过会被如实写进
 # MASK 事件**（ner_truncated / ner_skip_reasons），不再静默降级。
 _NER_REQ_BUDGET_BASE_S = 10.0
 _NER_REQ_BUDGET_PER_MB_S = 120.0
-_NER_REQ_BUDGET_MAX_S = 60.0
+# 单请求 NER 预算的**封顶值**（秒，可配置）。
+#
+# 为什么把默认值从 60s 压到 10s（P0-a，2026-09-28 实测事故）：
+# 60s 封顶 = 「允许单条请求的脱敏吃满 60 秒」，而客户端（Pi/编程代理）的解包超时
+# 是 180s，还要给上游首包留位。实测同一条 1.76MB 请求：脱敏冷缓存 58.5s +
+# 上游首包 91.7s ≈ 150s；而热缓存的那条（脱敏 0.4s）仍然在 180s 超时 —— 说明
+# 上游首包不可控（同批 328 条成功请求 p50 6.4s、max 99.8s），脱敏必须节约着用，
+# 而不是占掉三分之一的超时窗口。
+# 默认 10s 与 `BASE` 相同 ⇒ **任何单条请求的语义识别至多 10 秒**；
+# 代价是大 body 会更多降级（提前出现 budget_exhausted），这是「用可接受的漏码换
+# 响应时间」的明确产品取舍（已与所有者确认），且降级**写进事件**不会静默。
+# 想换回宽裕口径：面板设置页 `ner_req_budget_s`，或环境变量硬覆盖（容器/CI 用）。
+_NER_REQ_BUDGET_MAX_DEFAULT_S = 10.0
+# 硬上限：上限本身也得有上限，否则一个手改的 config.json 就能把引擎拉回 0.6.0
+# 的形态（32MB 请求体全量 NER 约 6 分钟）。
+_NER_REQ_BUDGET_MAX_HARD_S = 120.0
+# 环境变量硬覆盖（存在时配置改不动）——与 `MASKIT_ENGINE_DEADLINE_S` 同类：
+# 容器/CI 需要把参数固定住，而配置里的值可能被 UI 操作改掉。
+_NER_REQ_BUDGET_MAX_ENV = None
+try:
+    _raw_budget_env = (os.environ.get("MASKIT_NER_REQ_BUDGET_S") or "").strip()
+    _NER_REQ_BUDGET_MAX_ENV = float(_raw_budget_env) if _raw_budget_env else None
+except ValueError:
+    _NER_REQ_BUDGET_MAX_ENV = None
+_NER_REQ_BUDGET_MAX_S = _clamp_float(
+    _NER_REQ_BUDGET_MAX_ENV, _NER_REQ_BUDGET_MAX_DEFAULT_S, 1.0, _NER_REQ_BUDGET_MAX_HARD_S)
+
+
+def _norm_ner_req_budget(raw):
+    """单请求 NER 预算上限的取值口径（配置热重载与 `set_ner_req_budget` 共用）。
+
+    非数字 / NaN / 非正数 → 回落默认；正数超范围 → 钳到硬上限。
+    与面板 `panel._normalize_ner_budget` 同口径（跨进程无法共享函数，靠测试钉住两边一致）。
+    """
+    try:
+        n = float(raw)
+    except (TypeError, ValueError):
+        return _NER_REQ_BUDGET_MAX_DEFAULT_S
+    if n != n or n <= 0:                 # NaN / 0 / 负数
+        return _NER_REQ_BUDGET_MAX_DEFAULT_S
+    return max(1.0, min(_NER_REQ_BUDGET_MAX_HARD_S, n))
+
+
+def set_ner_req_budget(seconds):
+    """更新单请求 NER 预算上限（秒），返回实际生效值。
+
+    优先级：环境变量 `MASKIT_NER_REQ_BUDGET_S` > 配置 `ner_req_budget_s` > 默认 10s。
+    环境变量存在时本函数不改任何东西（硬覆盖），否则容器里会“时而生效时而不生效”。
+    """
+    global _NER_REQ_BUDGET_MAX_S
+    if _NER_REQ_BUDGET_MAX_ENV is not None:
+        return _NER_REQ_BUDGET_MAX_S
+    _NER_REQ_BUDGET_MAX_S = _norm_ner_req_budget(seconds)
+    return _NER_REQ_BUDGET_MAX_S
 
 
 def _ner_req_budget(body_bytes):
-    """按请求体体积给单请求的 NER 总预算（秒）。纯函数，便于直接断言。"""
+    """按请求体体积给单请求的 NER 总预算（秒）。纯函数（只读模块级上限），便于直接断言。
+
+    上限是**运行时可变**的（见 `set_ner_req_budget`），所以这里不能把上限写成默认参数
+    或提前绑定的局部量。
+    """
     mb = max(0.0, float(body_bytes or 0)) / (1024.0 * 1024.0)
     return min(_NER_REQ_BUDGET_MAX_S,
                _NER_REQ_BUDGET_BASE_S + mb * _NER_REQ_BUDGET_PER_MB_S)
@@ -5882,11 +5956,18 @@ def write_runtime_metrics(force=False):
             import ner_engine
             payload["ner"] = {
                 "enabled": bool(NER_ENABLED),
+                # 当前生效的单请求预算上限（秒）：面板与自检不再需要猜它到底是 10s 还是
+                # 环境变量硬覆盖成了别的值。
+                "req_budget_s": float(_NER_REQ_BUDGET_MAX_S),
+                "budget_env_override": _NER_REQ_BUDGET_MAX_ENV is not None,
                 "available": bool(ner_engine.is_ner_available()),
                 "initialized": bool(getattr(ner_engine, "_INITIALIZED", False)),
                 "failed": bool(getattr(ner_engine, "_INIT_FAILED", False)),
                 "last_error": str(getattr(ner_engine, "_LAST_ERROR", "") or "")[:300],
                 "governor": ner_engine.governor_status(),
+                # C-2：缓存命中/未命中（含超长文本分段次数）。冷热差实测 138 倍，
+                # 没有这组计数就只能靠人肉翻事件库对比两条 mask_ms。
+                "cache": ner_engine.cache_stats(),
             }
         except Exception as e:
             payload["ner_error"] = "%s: %s" % (type(e).__name__, e)
@@ -6641,6 +6722,14 @@ async def request(flow: http.HTTPFlow):
                 # （等待时长、全局限流次数）原先只挂 MASK，配对的 RESTORE 行没有，
                 # 于是"降级可见"在弹窗里等于没做。
                 s_sess["ner_metrics"] = ner_metrics
+    except Exception:
+        pass
+    # P0-b：脱敏耗时与完成时刻写进 flow.metadata，供 `error()` 在 resp=0 的 ERR
+    # 事件里归因（「卡在脱敏」vs「卡在上游」）。放在 emit 之前、且不依赖会话是否
+    # 存在 —— 会话被 `_sweep` 回收后 metadata 仍在，而归因靠的正是它。
+    try:
+        flow.metadata["shield_mask_ms"] = round((time.perf_counter() - _mask_t0) * 1000, 1)
+        flow.metadata["shield_mask_done_at"] = time.time()
     except Exception:
         pass
     _emit(
@@ -8467,6 +8556,11 @@ def _read_settings():
             if audit_cfg.get("time_budget_ms") is not None else _ENV_AUDIT_TIME_BUDGET,
             AUDIT_TIME_BUDGET_S, 0.01, 5.0),
         "ner_enabled": bool(cfg.get("ner_enabled", False)),
+        # 单请求语义识别预算上限（秒）。默认 10s（见 `_NER_REQ_BUDGET_MAX_DEFAULT_S`
+        # 的注释）；环境变量 MASKIT_NER_REQ_BUDGET_S 存在时硬覆盖，配置不生效。
+        # 必须在这里读取、在 `_maybe_reload` 里发布：只写成模块常量的话，面板改了
+        # 要等进程重启才生效，而“改完没反应”在用户侧就是一个 bug。
+        "ner_req_budget_s": _norm_ner_req_budget(cfg.get("ner_req_budget_s")),
         # 命令拦截（W2-3）：解析 + 编译在 _read_settings 里做（热重载时一次），
         # 而不是每个 chunk 都编译。非法条目在此丢弃并记日志。
         "command_block": _parse_command_block(cfg.get("command_block")),
@@ -8551,6 +8645,8 @@ def _maybe_reload(force=False):
     COMMAND_BLOCK = s.get("command_block") or _parse_command_block(None)
     global NER_ENABLED
     NER_ENABLED = bool(s.get("ner_enabled", False))
+    # P0-a：预算上限随配置热重载（内部已处理优先级与环境变量硬覆盖）
+    set_ner_req_budget(s.get("ner_req_budget_s"))
     UPSTREAMS = s["upstreams"]
     EGRESS_PROXY = s.get("egress_proxy")
     CAPTURE_MODE = s["capture_mode"]

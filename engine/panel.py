@@ -15,7 +15,7 @@ Data Maskit 控制面板 - 本地 Flask 服务
 # 本程序基于「希望有用」的目的分发，但不附带任何担保；亦无对适销性或特定用途
 # 适用性的默示担保。详见 GNU Affero 通用公共许可证。
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
-__version__ = '0.6.0'
+__version__ = '0.6.1'
 import json
 import codecs
 import copy
@@ -720,6 +720,16 @@ _TAIL_KEEP_FIELDS = {
     #     顺手一起补，二者都不含正文/占位符/原文。
     "ingress", "client_app",
 }
+# tail 通道的双上限（P1，修面板 MemoryError）。
+# 为什么要限：`/api/logs` 是前端**轮询**接口（日志页与首页都调），而 tail 是
+# log_buf 里的**原文行** —— 一条超大 `msg`（异常串、上游回包片段）就能把单行
+# 撑到几十 KB，200 行叠上去就是十几 MB 的瞬时分配，而实测面板进程确实报过
+# werkzeug `MemoryError`（见 engine-stdout.log）。这是列表瘦化之外唯一没设上界的出口。
+# 600 与诊断包 `_scrub_text(x, 600)` 同口径；80 行足以覆盖崩溃现场（连接噪音
+# 已被 `_CONN_NOISE_RE` 挡在 log_buf 之外，缓冲不会几分钟就被刷满）。
+_TAIL_MAX_LINES = 80
+_TAIL_MAX_VALUE_CHARS = 600
+_TAIL_MAX_ITEMS = 12
 
 
 def _tail_line_sanitize(line: str) -> str:
@@ -736,12 +746,20 @@ def _tail_line_sanitize(line: str) -> str:
         return line
     if not isinstance(data, dict):
         return line
-    keep = {k: v for k, v in data.items() if k in _TAIL_KEEP_FIELDS}
+    keep = {}
+    for k, v in data.items():
+        if k not in _TAIL_KEEP_FIELDS:
+            continue
+        # 单值长度上限：这个通道是轮询的，一条超大 msg 就是一次无上限分配。
+        if isinstance(v, str) and len(v) > _TAIL_MAX_VALUE_CHARS:
+            v = v[:_TAIL_MAX_VALUE_CHARS] + "…"
+        keep[k] = v
     its = data.get("items")
     if isinstance(its, list):
         keep["items"] = [
-            {"label": str(i.get("label") or ""), "preview": str(i.get("preview") or "")}
-            for i in its if isinstance(i, dict)
+            {"label": str(i.get("label") or "")[:80],
+             "preview": str(i.get("preview") or "")[:_TAIL_MAX_VALUE_CHARS]}
+            for i in its[:_TAIL_MAX_ITEMS] if isinstance(i, dict)
         ]
     return "SHIELD\t" + parts[1] + "\t" + json.dumps(keep, ensure_ascii=False)
 
@@ -3537,6 +3555,13 @@ def default_config():
         # 且装了 onnxruntime+tokenizers）。默认关：缺模型/缺依赖时是纯负收益，
         # 且概率模型只应作为规则打码的补充。开源包不含模型（见 .gitignore）。
         "ner_enabled": False,
+        # 单请求语义识别（NER）预算上限（秒），默认 10s。
+        # 为什么要可配（P0-a）：实测客户端解包超时 180s，而上游首包实测 p50 6.4s、
+        # max 99.8s —— 旧默认 60s 会把脱敏堆到超时线的三分之一，冷缓存那一轮直接
+        # 把请求推过 180s（实测 58.5s 脱敏 + 180s 超时 resp=0）。
+        # 引擎侧见 `transparent.set_ner_req_budget`；环境变量
+        # MASKIT_NER_REQ_BUDGET_S 存在时硬覆盖本项。
+        "ner_req_budget_s": 10.0,
         "session_ttl": DEFAULT_TTL,
         "http2": False,
         "upstreams": list(DEFAULT_UPSTREAMS),
@@ -3671,6 +3696,27 @@ def _normalize_retention(raw):
     if n <= 0:
         return 0
     return min(3650, n)
+
+
+def _normalize_ner_budget(raw):
+    """单请求 NER 预算上限（秒）归一化：默认 10s，范围 1~120。
+
+    上限 120 与引擎侧 `_NER_REQ_BUDGET_MAX_HARD_S` 同口径：写大了会让引擎退回
+    "一条请求脱敏几分钟"的旧形态（32MB 请求体全量 NER 约 6 分钟）。
+    非法值回落默认而不是钳到边界：`"abc"` / `-1` 一定是手改配置写错了，
+    静默钳成 1s 会让用户以为"我设了"，实际把语义识别几乎关掉。
+    """
+    try:
+        n = float(raw)
+    except (TypeError, ValueError):
+        return 10.0
+    if n != n:          # NaN
+        return 10.0
+    if n <= 0:
+        # 非正数一定是手改错了：静默钳成 1s 会让人以为「我设了」，
+        # 实际把语义识别几乎关掉 —— 回落默认至少行为可预期。
+        return 10.0
+    return max(1.0, min(120.0, n))
 
 
 def normalize_config(raw, warnings=None):
@@ -4003,6 +4049,9 @@ def normalize_config(raw, warnings=None):
         "ext_record_events": bool(raw.get("ext_record_events", True)),
         "ext_convert_legacy_office": bool(raw.get("ext_convert_legacy_office", False)),
         "ner_enabled": bool(raw.get("ner_enabled", False)),
+        # 单请求 NER 预算上限（秒）：非法值静默回落默认（同其他辅助配置，不为
+        # 一个数字让整份配置保存失败），范围 1~120 与引擎侧硬上限同口径。
+        "ner_req_budget_s": _normalize_ner_budget(raw.get("ner_req_budget_s")),
         "stream_response": bool(raw.get("stream_response", True)),
         "stream_exclude_hosts": _normalize_host_list(raw.get("stream_exclude_hosts")),
         "stop_mode": stop_mode,
@@ -5747,6 +5796,24 @@ def api_stop():
     return jsonify({"ok": ok, "error": err})
 
 
+@app.errorhandler(MemoryError)
+def _handle_panel_memory_error(e):
+    """OOM 可归因（P1）：werkzeug 的 "Error on request" 只有 traceback、**没有端点**，
+    实测 stdout 里连报 8 条 MemoryError 却不知道是哪条请求把面板撑爆的。
+    这里把方法/路径/查询串（截断）落一条日志，下次发生能直接定位；
+    仍返回一个可读的 500，而不是让浏览器拿到空连接。
+    """
+    try:
+        _emit_log(f"[panel] MemoryError at {request.method} {request.path} "
+                  f"query={str(request.query_string[:200])!r}")
+    except Exception:
+        pass
+    try:
+        return jsonify({"ok": False, "error": "panel_out_of_memory"}), 500
+    except Exception:
+        return "panel_out_of_memory", 500
+
+
 @app.get("/api/logs")
 def api_logs():
     if time.time() - _last_log_prune[0] > 3600:
@@ -5835,7 +5902,7 @@ def api_logs():
     with buf_lock:
         # 注意：内存 events 的 seq 与 SQLite 自增 id 不是同一命名空间，
         # 不能拿 since 去筛内存事件做兜底（会漏或重复），只回传原始日志尾巴。
-        raw_tail = list(log_buf)[-200:]
+        raw_tail = list(log_buf)[-_TAIL_MAX_LINES:]
     # 锁外做脱敏（避免持锁解析 JSON）：SHIELD 行只回传白名单字段
     tail = [_tail_line_sanitize(x) for x in raw_tail]
     try:
@@ -6159,18 +6226,35 @@ def _ner_status_payload(cfg):
     enabled = bool((cfg or {}).get("ner_enabled", False))
     info = {"enabled": enabled, "available": False, "initialized": False, "reason": "",
             "skips": {}}
+    # P0-a：单请求预算上限（秒）与环境变量硬覆盖标志。
+    # 面板必须看得到**实际生效的是多少**：配置里写着 30 却被环境变量钉在 10，
+    # 不显示的话用户会以为「改了没生效」。
+    try:
+        info["req_budget_s"] = float((cfg or {}).get("ner_req_budget_s") or 10.0)
+    except (TypeError, ValueError):
+        info["req_budget_s"] = 10.0
+    info["budget_env_override"] = bool(
+        (os.environ.get("MASKIT_NER_REQ_BUDGET_S") or "").strip())
     try:
         import ner_engine
         st = ner_engine.status()
         info["available"] = bool(st.get("available"))
         info["initialized"] = bool(st.get("initialized"))
-        # 跳过计数必须透出（审计 M7）：`too_long` / `budget_exhausted` /
-        # `inference_failed` 这些「开了 NER 但这段没做识别」的原因此前只写进程日志，
+        # 跳过计数必须透出（审计 M7）：`budget_exhausted` / `deadline` / `inference_failed`
+        # 这些（以及 0.6.1 前的历史键 `too_long`）「开了 NER 但这段没做识别」的原因此前只写进程日志，
         # 界面上完全看不出——用户看到的是「开了 NER，长文本全跳过」却无从归因。
         # 计数是纯整数，不含任何原文，可以安全下发。
         skips = st.get("skips")
         if isinstance(skips, dict):
             info["skips"] = {str(k): int(v) for k, v in skips.items()}
+        # C-2：缓存冷热计数（本进程视角；**代理链路**的真值在 engine-runtime.json，
+        # 由 /api/engine/metrics 出口）。放在这里是为了让设置页能看出"开了 NER
+        # 却没事干"（miss 恒为 0）与"一直在冷推"（hit_rate 近 0）的区别。
+        try:
+            cs = ner_engine.cache_stats()
+            info["cache"] = {k: cs.get(k) for k in ("hit", "miss", "hit_rate")}
+        except Exception:
+            pass
         if enabled:
             if not info["available"]:
                 info["reason"] = "模型文件缺失（engine/models/ner_mini_zh/model_quantized.onnx）"
@@ -7973,12 +8057,19 @@ def _project_engine_metrics(eng):
     ner = eng.get("ner") if isinstance(eng.get("ner"), dict) else {}
     out["ner"] = {
         "enabled": bool(ner.get("enabled")),
+        # P0-a/C-2：当前生效的预算上限与环境变量覆盖状态；面板据此显示"实际用的
+        # 是多少秒"，而不是显示配置里那个可能被环境变量顶掉的数字。
+        "req_budget_s": ner.get("req_budget_s"),
+        "budget_env_override": bool(ner.get("budget_env_override")),
         "available": bool(ner.get("available")),
         "initialized": bool(ner.get("initialized")),
         "failed": bool(ner.get("failed")),
         # 异常串过清洗后才外发（与其他出口同口径）
         "last_error": _scrub_text(ner.get("last_error") or "", 200),
         "governor": ner.get("governor") or {},
+        # 缓存命中/未命中（含超长文本分段次数）：冷热差实测 138 倍，
+        # 没有它就只能靠人肉翻事件库对比两条 mask_ms。
+        "cache": ner.get("cache") if isinstance(ner.get("cache"), dict) else {},
     }
     if eng.get("ner_error"):
         out["ner_error"] = _scrub_text(eng["ner_error"], 120)
