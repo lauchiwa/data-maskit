@@ -29,8 +29,8 @@
   *Locked the self-check's cross-thread state (aux stats, canary registry, peak_wait_ms) and fixed the double decrement of `_AUX_PENDING`, S11's zero-sample false positive and OK_NOTES contradicting fired findings; tests no longer depend on execution order.*
 - 修复：审计探测窗口不再被模块级常量冻结（改 `audit.scan_max` 立即生效）、等待类指标不再因挂在错误的 gate 下永不显示、`peak_wait_ms` 峰值不再被并发覆盖、事件库队列字节默认值校正为 `max(32MB, workers × 8MB)`。
   *The audit probe window is no longer frozen by a module-level constant (editing audit.scan_max takes effect immediately), wait metrics are no longer hidden behind the wrong gate, peak_wait_ms can no longer lose updates under concurrency, and the event-queue byte default is corrected to max(32MB, workers x 8MB).*
-- 引擎：语义识别预算不足时改为**有界等待**（`MASKIT_NER_WAIT_MS`，默认 2s）：等到即推理，等不到仍降级；新增 `budget_waited` 计数区分「补上了」与「真降级」，随 `/api/engine/metrics` 与诊断包（`ner.governor`）对外可见。
-  *Engine: NER now waits inside a bounded window (MASKIT_NER_WAIT_MS, 2 s default) when the budget is exhausted — it infers if the budget returns, degrades otherwise; the new budget_waited counter separates "recovered" from real degradation and is visible through /api/engine/metrics and the diagnostics bundle (ner.governor).*
+- 引擎：语义识别预算不足时改为**有界等待**（`MASKIT_NER_WAIT_MS`，默认 2s）：等到即推理，等不到仍降级；新增 `budget_waited` 计数区分「补上了」与「真降级」（随 `/api/engine/metrics` 外发；界面与自检结论暂不展示）。
+  *Engine: NER now waits inside a bounded window (MASKIT_NER_WAIT_MS, 2 s default) when the budget is exhausted — it infers if the budget returns, degrades otherwise; the new budget_waited counter separates "recovered" from real degradation and is exported via /api/engine/metrics only (the UI and the self-check conclusion do not show it yet).*
 
 ### 新增 / Added
 - 设置页：一键自检的结论文案跟随界面语言（中/英），英文界面下不再输出中文结论（含诊断包内嵌的同一份结论）。

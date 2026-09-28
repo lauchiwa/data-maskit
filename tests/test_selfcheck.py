@@ -298,6 +298,42 @@ class PanelWiringTests(unittest.TestCase):
     def test_inputs_are_scrubbed(self):
         self.assertIn("_scrub_selfcheck", self.src)
 
+    def _projection_keys(self, fn_name):
+        """取 panel 里某个函数的字符串键集合（dict 字面量 + out[...] 赋值）。"""
+        tree = ast.parse(self.src)
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                   and n.name == fn_name]:
+            keys = {k.value for n in ast.walk(fn) if isinstance(n, ast.Dict)
+                    for k in n.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+            keys |= {s.slice.value for s in ast.walk(fn) if isinstance(s, ast.Subscript)
+                     and isinstance(s.value, ast.Name)
+                     and isinstance(s.slice, ast.Constant) and isinstance(s.slice.value, str)}
+            return keys
+        self.fail("找不到 %s（被改名/删除了？）" % fn_name)
+
+    def test_engine_metrics_projection_carries_governor(self):
+        """`/api/engine/metrics` 必须透出 governor —— 它是 `budget_waited` 的**唯一**出口。
+
+        这条守卫的由来：CHANGELOG 两次把这个指标的出口写错（先写「面板可见」、又写
+        「诊断包可见」，两次都不对），而两次都没有任何测试盯着「出口到底存不存在」。
+        口径写错不是功能缺陷，但它会让人去够一个根本拿不到的数。
+        """
+        self.assertIn("governor", self._projection_keys("_project_engine_metrics"),
+                      "/api/engine/metrics 不再透出 governor（budget_waited 就没有出口了）")
+
+    def test_diagnostics_bundle_does_not_carry_ner(self):
+        """诊断包**不**带 ner / governor / engine —— 别再把两个出口写混。
+
+        实测过的错法：在 panel.py 里看到 `"governor": ner.get("governor")` 就以为诊断包
+        含它。那一行其实属于 `_project_engine_metrics`（喂 `/api/engine/metrics`），而
+        `_diagnostics_payload` 的键里没有 ner / governor / engine。
+        """
+        keys = self._projection_keys("_diagnostics_payload")
+        for leak in ("ner", "governor", "engine"):
+            self.assertNotIn(leak, keys,
+                             "诊断包出现了 %s：出口口径变了就同步改 CHANGELOG" % leak)
+        self.assertIn("selfcheck", keys, "诊断包应内嵌自检结论")
+
     def test_language_param_reaches_both_exports(self):
         """自检与诊断包都要按 `?lang=` 出结论（英文界面不该出现中文结论）。
 
