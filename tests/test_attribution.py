@@ -335,6 +335,8 @@ class PidClassifyConsistencyTests(unittest.TestCase):
         self.assertEqual(batch[12], "panel")
         self.assertEqual(batch[14], "other")
 
+    @unittest.skipUnless(sys.platform == "win32",
+                         "判据基于 Windows 的 tasklist + PowerShell 路径；Linux/macOS 走 ps，不在本用例覆盖范围")
     def test_mitmdump_name_short_circuits_cim(self):
         """进程名就叫 mitmdump 时必须**不走** CIM（0.6.0 修列的 off-by-one）。
 
@@ -363,6 +365,8 @@ class PidClassifyConsistencyTests(unittest.TestCase):
         self.assertTrue([c for c in calls if c == "powershell"],
                         "名字不含 mitmdump 时必须查命令行")
 
+    @unittest.skipUnless(sys.platform == "win32",
+                         "缓存与子进程计数走的是 Windows 的 tasklist/PowerShell 路径；Linux/macOS 走 ps")
     def test_batch_is_memoized(self):
         panel = self.panel
         calls = []
@@ -407,9 +411,12 @@ class PortsSnapshotSubprocessBudgetTests(unittest.TestCase):
             panel._run_console = orig_run
             panel._PID_KIND_CACHE["data"] = orig_cache
         self.assertIsInstance(out, list, "端口快照不该出错：%r" % (out,))
-        # 5 个监听 PID × 3 个端口在旧实现下至少 20+ 次；批量后 ≤ 3
-        self.assertLessEqual(len(calls), 3,
-                             "端口快照起了 %d 次子进程（上限 3）：%s" % (len(calls), calls))
+        # 5 个监听 PID × 3 个端口在旧实现下至少 20+ 次。批量后的上限按平台取值：
+        # Windows 走「netstat + tasklist + CIM」共 3 次；Linux/macOS 走 lsof + ss，
+        # 3 个监听端口各一次 → 上界 6。两边都远小于“每端口每 PID 一次”。
+        limit = 3 if sys.platform == "win32" else 6
+        self.assertLessEqual(len(calls), limit,
+                             "端口快照起了 %d 次子进程（上限 %d）：%s" % (len(calls), limit, calls))
 
 
 class EmittedFieldRegistrationTests(unittest.TestCase):
