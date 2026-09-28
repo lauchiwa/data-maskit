@@ -161,9 +161,14 @@ class GovernorTests(unittest.TestCase):
             ner._BUCKET["ts"] = time.monotonic()
 
     def test_bucket_skips_when_out_of_budget(self):
-        """额度耗尽 → 跳过 + 记 global_throttled（不排队等，语义识别是增强项）。"""
+        """额度耗尽**且不等待**时：跳过 + 记 global_throttled。
+
+        默认行为已改为「有界等待」（见 BudgetWaitTests）；本用例固定
+        `MASKIT_NER_WAIT_MS=0` 回到“立即跳过”，锁住的仍是降级路径本身。
+        """
         self._fill_bucket(0)
-        with mock.patch.object(ner, "_NER_BUDGET_MS_PER_S", 1):
+        with mock.patch.object(ner, "_NER_BUDGET_MS_PER_S", 1), \
+             mock.patch.object(ner, "_NER_BUDGET_WAIT_MS", 0):
             out = ner.extract_entities("客户张大锤在杭州西湖区上班" * 3)
         self.assertEqual(out, [])
         self.assertGreaterEqual(ner._SKIP_STATS.get("global_throttled", 0), 1)
@@ -244,7 +249,8 @@ class GovernorTests(unittest.TestCase):
     def test_metrics_are_cleared_per_request(self):
         """指标按请求记账、取完即清（否则事件里会出现上一轮的等待时长）。"""
         self._fill_bucket(0)
-        with mock.patch.object(ner, "_NER_BUDGET_MS_PER_S", 1):
+        with mock.patch.object(ner, "_NER_BUDGET_MS_PER_S", 1), \
+             mock.patch.object(ner, "_NER_BUDGET_WAIT_MS", 0):
             ner.extract_entities("客户张大锤" * 3)
         first = ner.request_metrics(reset=True)
         self.assertEqual(first["global_throttled"], 1)
@@ -258,6 +264,78 @@ class GovernorTests(unittest.TestCase):
                     "skipped_throttled", "skipped_sem_timeout", "intra_threads"):
             self.assertIn(key, st)
         self.assertIn("governor", ner.status(), "status() 必须带上治理器（面板读它）")
+
+
+class BudgetWaitTests(unittest.TestCase):
+    """额度不足时的**有界等待**（不是无界排队，也不是立刻跳过）。
+
+    桶的语义是长期速率：持续过载时“等到有额度”可能永远不成立，而无界等待会占住
+    脱敏 worker（正是 0.6.0 消掉的队头阻塞）。所以等待必须有上限，超时仍降级。
+    """
+
+    def setUp(self):
+        self._saved = dict(ner._BUCKET)
+        with ner._CACHE_LOCK:
+            ner._CACHE.clear()
+        ner.request_metrics(reset=True)
+        ner._SKIP_STATS.pop("global_throttled", None)
+        self.addCleanup(self._restore)
+        self.addCleanup(ner.request_metrics, True)
+
+    def _restore(self):
+        with ner._BUCKET_LOCK:
+            ner._BUCKET.update(self._saved)
+
+    def _drain_bucket(self):
+        with ner._BUCKET_LOCK:
+            ner._BUCKET["tokens"] = 0.0
+            ner._BUCKET["ts"] = time.monotonic()
+
+    def test_bucket_wait_succeeds_when_budget_recovers(self):
+        self._drain_bucket()
+        self.assertTrue(ner._bucket_wait(1.0, 0.8), "额度会随时间恢复，应当等到")
+
+    def test_bucket_wait_is_bounded(self):
+        """等不到就必须返回 False，且耗时接近给定上限（不是无限等）。"""
+        self._drain_bucket()
+        huge = float(ner._NER_BUDGET_MS_PER_S) * 1000.0    # 远超桶容量 → 永远等不到
+        t0 = time.monotonic()
+        self.assertFalse(ner._bucket_wait(huge, 0.15), "等不到就该返回")
+        self.assertLess(time.monotonic() - t0, 1.5, "等待时间远超上限")
+
+    def test_extract_entities_waits_instead_of_degrading(self):
+        """桶空但额度会恢复：应当等到并照常推理，只记 budget_waited、不记降级。"""
+        self._drain_bucket()
+        with mock.patch.object(ner, "_init_ner", lambda: True), \
+             mock.patch.object(ner, "_current_deadline",
+                               lambda: time.monotonic() + 30.0), \
+             mock.patch.object(ner, "_decode_chunks", lambda text, deadline: ([], True)):
+            out = ner.extract_entities("张三在北京工作，联系李四")
+        self.assertEqual(out, [])
+        m = ner.request_metrics()
+        self.assertGreaterEqual(m.get("budget_waited", 0), 1, "等到额度却没记账")
+        self.assertEqual(m.get("global_throttled", 0), 0, "能等到就不该降级")
+        self.assertNotIn("global_throttled", ner._SKIP_STATS)
+
+    def test_zero_wait_falls_back_to_old_skip_behaviour(self):
+        """`MASKIT_NER_WAIT_MS=0`：退回“立即跳过”的旧行为（可回退开关）。"""
+        self._drain_bucket()
+        with mock.patch.object(ner, "_NER_BUDGET_WAIT_MS", 0), \
+             mock.patch.object(ner, "_init_ner", lambda: True), \
+             mock.patch.object(ner, "_current_deadline",
+                               lambda: time.monotonic() + 30.0), \
+             mock.patch.object(ner, "_decode_chunks", lambda text, deadline: ([], True)):
+            out = ner.extract_entities("张三在北京工作")
+        self.assertEqual(out, [])
+        self.assertGreaterEqual(ner.request_metrics().get("global_throttled", 0), 1,
+                                "不等待时就该如实记降级")
+        self.assertIn("global_throttled", ner._SKIP_STATS)
+
+    def test_extract_entities_still_uses_bounded_wait(self):
+        """源码守卫：额度不足的分支必须走 `_bucket_wait`（别退回“立刻跳过”）。"""
+        src = Path(ner.__file__).read_text(encoding="utf-8")
+        self.assertIn("_bucket_wait(est_ms", src,
+                      "额度不足时不再等待（是不是退回立刻跳过了？）")
 
 
 if __name__ == "__main__":

@@ -139,6 +139,7 @@ Data Maskit 是一个**本地脱敏代理**：拦截本机 LLM API 请求，敏�
 | `MASKIT_ENGINE_DEADLINE_S` | `120` | 单个请求的端到端脱敏等待上限（秒），超时回 503 `engine_timeout` | 超时**不会**中断已在跑的 worker（Python 线程不可中断）：该请求结果被丢弃，但已签发的占位符仍在会话表里 |
 | `MASKIT_NER_CONCURRENCY` | 按核数自适应 | NER 同时推理数上限（信号量） | 过高会把 CPU 吃满，导致规则扫描与事件循环饥饿 |
 | `MASKIT_NER_BUDGET` | 按核数自适应（≥50） | NER 每秒可用推理毫秒预算（令牌桶） | 预算用尽时**降级但不断链**：本次不做实体识别并记 `global_throttled`（自检 S22 可见） |
+| `MASKIT_NER_WAIT_MS` | `2000` | 预算不足时等待的上限（毫秒，`0` = 立即跳过不等待） | 有界等待：等到就照常推理（记 `budget_waited`），等不到仍降级。等待会占住脱敏 worker，别设太大 |
 | `MASKIT_NER_THREADS` | 按核数自适应 | `onnxruntime` 的 intra-op 线程数 | 弱机（1~2 核）应设为 1，否则 NER 会与规则扫描抢核 |
 | `MASKIT_AUDIT_SCAN_MAX` | `131072`（128KB） | 单次审计的扫描窗口字节数 | 调大=线性增加每次审计的 CPU/事件循环占用；调小=更早截断，检出面缩小 |
 | `MASKIT_AUDIT_PARSE_MAX` | `2097152`（2MB） | 审计结构化解析的体积上限 | 超过则跳过解析并在事件里留痕（`parse_skipped`） |

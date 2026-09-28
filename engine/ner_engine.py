@@ -129,6 +129,13 @@ _NER_BUDGET_MS_PER_S = max(50, _env_int("MASKIT_NER_BUDGET",
                                         int(_NER_CONCURRENCY * 1000 * 0.75)))
 _BUCKET_LOCK = threading.Lock()
 _BUCKET = {"tokens": float(_NER_BUDGET_MS_PER_S), "ts": time.monotonic()}
+# 额度不足时的**有界等待**上限（毫秒，0 = 退回“直接跳过”的旧行为）。
+#
+# 为什么从“绝不等待”改成“有界等待”：桶的语义是**长期速率**，持续过载时无界
+# 等待会让请求永不返回；而等待会占住脱敏 worker（正是 0.6.0 要消的队头阻塞）。
+# 所以只在短窗口内等（默认 2s，且不超过本轮剩余 deadline）：等到就照常推理，
+# 等不到仍按原策略降级（记 global_throttled、不阻断、不断链）。
+_NER_BUDGET_WAIT_MS = max(0, min(10000, _env_int("MASKIT_NER_WAIT_MS", 2000)))
 # 单位成本（毫秒/字符）：实测 20000 字 5588ms（见上方 CALL_BUDGET_S 的注释）。
 # 用途只有一个——**动手前估个价**，好决定桶里的余额够不够；估错不影响正确性，
 # 结算时按实际耗时退还（见 _bucket_refund）。
@@ -137,11 +144,11 @@ _SEM_WAIT_MAX_S = 2.0
 
 
 def _bucket_take(est_ms, now=None):
-    """尝试预支 est_ms 的推理额度；余额不足返回 False（调用方应跳过并留痕）。
+    """尝试预支 est_ms 的推理额度；余额不足返回 False（本函数**不等待**）。
 
-    这里**不等待**：等待会把压力转成用户可见的延迟，而语义识别是"尽力而为"的
-    增强项，确定性规则（正则 + 词表）才是脱敏的底线。宁可这一条少几类实体，
-    也不能让请求排队等推理额度。
+    等多久由调用方决定（见 `_bucket_wait`）：等待会把压力转成用户可见的延迟，
+    而语义识别是“尽力而为”的增强项，确定性规则（正则 + 词表）才是脱敏的底线。
+    所以只能按“本轮还剩多少时间”给一个小的等待窗口，不能在这里盲等。
     """
     now = time.monotonic() if now is None else now
     with _BUCKET_LOCK:
@@ -154,6 +161,23 @@ def _bucket_take(est_ms, now=None):
             return False
         _BUCKET["tokens"] -= est_ms
         return True
+
+
+def _bucket_wait(est_ms, timeout_s):
+    """在有界时间内等够 est_ms 额度：等到就取走并返回 True，超时返回 False。
+
+    有界是硬约束：桶的语义是长期速率，持续过载时“等到有额度”可能永远不成立，
+    而无界等待会占住脱敏 worker（正是 0.6.0 要消除的队头阻塞）。所以只在调用方
+    给的小窗口（默认 2s，且不超过本轮剩余 deadline）内小步轮询。
+    """
+    end = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        if _bucket_take(est_ms):
+            return True
+        left = end - time.monotonic()
+        if left <= 0:
+            return False
+        time.sleep(min(0.05, max(0.005, left)))
 
 
 def _bucket_refund(ms):
@@ -671,11 +695,19 @@ def extract_entities(text: str) -> List[Dict]:
     est_ms = max(1.0, len(text) * _EST_MS_PER_CHAR)
     est_ms = min(est_ms, float(_NER_BUDGET_MS_PER_S))
     if not _bucket_take(est_ms):
-        _metric_add("global_throttled", 1)
-        _note_skip("global_throttled",
-                   f"语义识别的全局速率预算已用尽（{_NER_BUDGET_MS_PER_S} 毫秒/秒），"
-                   "本条未做实体识别")
-        return []
+        # 额度不足：先在**有界**窗口内等一等（默认 2s，且不超过本轮剩余 deadline）。
+        # 等到就照常推理（记 budget_waited，“曾经缺额度但补上了”可见）；
+        # 等不到仍按原策略降级 —— 不阻断、不断链，只如实记原因。
+        budget_wait_s = min(_NER_BUDGET_WAIT_MS / 1000.0,
+                            max(0.0, deadline - time.monotonic()))
+        if budget_wait_s > 0 and _bucket_wait(est_ms, budget_wait_s):
+            _metric_add("budget_waited", 1)
+        else:
+            _metric_add("global_throttled", 1)
+            _note_skip("global_throttled",
+                       f"语义识别的全局速率预算已用尽（{_NER_BUDGET_MS_PER_S} 毫秒/秒，"
+                       f"已等 {budget_wait_s:.1f}s），本条未做实体识别")
+            return []
     remaining = max(0.05, min(_SEM_WAIT_MAX_S, deadline - time.monotonic()))
     t_wait0 = time.monotonic()
     got_slot = _SEM.acquire(timeout=remaining)
