@@ -1369,6 +1369,28 @@ def _prefix_secret_regex_locked(key):
 # 新格式保留业务标签（PHONE / EMAIL / TERM…），模型能理解"这里原本是个电话号"。
 _LABEL_SAFE_RX = re.compile(r"[^A-Z0-9]+")
 
+# 凭据标签互通族（大模型在写代码/生成命令时，对 CONNSTR/SECRET/PASSWORD/TOKEN 容易混用）
+_CREDENTIAL_SYNONYMS = frozenset({
+    "CONNSTR", "SECRET", "PASSWORD", "PASSWD", "PWD", "TOKEN",
+    "APIKEY", "ACCESSKEY", "PRIVATEKEY",
+})
+
+# IP 标签互通族（大模型常把 IPPRIVATE / IPINTERNAL 缩写为 IP）
+_IP_SYNONYMS = frozenset({
+    "IPPRIVATE", "IPINTERNAL", "IP",
+})
+
+
+def _labels_compatible(lab_a, lab_b):
+    """判定两个归一化标签是否语义兼容（用于后缀反查容错）。"""
+    if lab_a == lab_b:
+        return True
+    if lab_a in _CREDENTIAL_SYNONYMS and lab_b in _CREDENTIAL_SYNONYMS:
+        return True
+    if lab_a in _IP_SYNONYMS and lab_b in _IP_SYNONYMS:
+        return True
+    return False
+
 
 def _safe_label(label):
     """标签 ASCII 化。内置规则标签本身是 ASCII；自定义中文标签统一归 TERM。"""
@@ -1535,9 +1557,11 @@ _WARMUP_MAX_EVENTS = 5000
 # 2. **只在带花括号的调用点使用**（restore 的严格遍与转义遍）。流式响应里
 #    裸 token 被 chunk 切开后，残片（实测 `ATE_zwndfk`）会被宽松正则命中；
 #    后缀索引一旦介入就会把残片替换成明文，拼出一条错的命令。
-# 3. **标签归一化后必须相等**（见 _suffix_real_token）。后缀只有 47M 分之一的
-#    碰撞概率，但一旦碰撞就是静默替换错值（把 A 的内网 IP 填到 B 的位置）。
-#    所以 `{{HOST_x}}` 这种整段换名**不认**，宁可让它走 unresolved 让用户看见。
+# 3. **标签归一化后必须相等，或属于同一凭据互通族**（见 _suffix_real_token 与 _labels_compatible）。
+#    后缀只有 47M 分之一的碰撞概率，但一旦碰撞就是静默替换错值（把 A 的内网 IP 填到 B 的位置）。
+#    普通标签如 `{{HOST_x}}` 这种整段换名不认，走 unresolved；但凭据族内部（大模型把 CONNSTR
+#    改写为 PASSWORD / SECRET）属于同义互通族，且撞车后缀会被 _SUFFIX_AMBIGUOUS 剔除，
+#    允许语义兼容反查。
 #
 # 维护：_suffix_index_add / _suffix_index_del 是唯一入口，必须与
 # _RECENT_FWD / _RECENT_REV 的写入、淘汰**成对出现**（见 _prune_recent、
@@ -3138,15 +3162,15 @@ def _suffix_real_token(token):
     走这里：流式响应里它可能只是被 chunk 切开的残片（实测 `ATE_zwndfk`），
     按后缀命中后会把残片替换成明文，拼出一条错的命令。
 
-    **标签必须归一化后相等才认**（`_safe_label` 去大小写、去下划线）：
+    **标签必须归一化后相等，或属于同一凭据互通族**（`_safe_label` 去大小写、去下划线）：
     - `{{IP_PRIVATE_x}}` / `{{ipprivate_x}}` → 归一到 `IPPRIVATE`，命中；
-    - `{{HOST_x}}` → `HOST` != `IPPRIVATE`，**拒绝**，原样放回并计入 unresolved。
+    - `{{PASSWORD_x}}` / `{{SECRET_x}}` 与 `CONNSTR` → 同属凭据互通族，命中；
+    - `{{HOST_x}}` → `HOST` != `IPPRIVATE` 且不属同族，**拒绝**，原样放回并计入 unresolved。
 
     为什么不做「只看后缀、标签随便」的完全宽松匹配：后缀虽然只有 47M 分之一
     的碰撞概率，但一旦碰撞就是**把 A 的原文（真实内网 IP、手机号）替换到 B 的
-    位置上**，属于静默替换错值。而拒绝的代价只是「这次没救回来」，用户能看见
-    裸占位符、命令失败得明明白白。宁可失败可见，不可静默替换——与 _lookup
-    「不做模糊匹配、不猜」的既有约定一致。
+    位置上**，属于静默替换错值。凭据族同义互通安全是因为撞车后缀已被剔除且
+    同属凭据范畴；其他标签仍坚持相等校验。
     """
     m = _ANY_BRACED_SUFFIX_RX.match(token)
     if not m:
@@ -3156,7 +3180,9 @@ def _suffix_real_token(token):
         # None = 没登记过；_SUFFIX_AMBIGUOUS = 该后缀撞车、已退出兜底；
         # real == token 说明精确路径刚查过且落空，再查一次没意义
         return None
-    if _safe_label(m.group(1)) != _safe_label(_token_label(real)):
+    lab_in = _safe_label(m.group(1))
+    lab_real = _safe_label(_token_label(real))
+    if not _labels_compatible(lab_in, lab_real):
         return None
     return real
 

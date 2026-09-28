@@ -8049,5 +8049,71 @@ class SingleParsePerRequestTests(unittest.TestCase):
         self.assertTrue(tr._looks_like_llm_request(self._flow(), {"prompt": "x"}))
 
 
+class CredentialSynonymAndRestoreTests(unittest.TestCase):
+    """凭据标签同义互通与无会话流式分块守卫测试。
+
+    1. 大模型在编写代码时，经常把 CONNSTR 改写为 PASSWORD / SECRET；
+    2. 无会话（或已销毁会话）下，流式分块跨 chunk 到达绝不吞字（守住红线 3）。
+    """
+
+    def setUp(self):
+        self.real_pass = "MySecretPass_9988!"
+        self.conn_str = f"postgresql://dbuser:{self.real_pass}@100.92.10.18:54321/jgswj"
+        self.sid = "cred-syn-test"
+        tr._new_session(self.sid)
+
+    def test_connstr_to_password_label_restoration(self):
+        """脱敏为 CONNSTR 后，大模型写成 {{PASSWORD_xxx}} 或 {{SECRET_xxx}} 仍能还原。"""
+        masked = tr.mask(self.conn_str, self.sid)
+        self.assertIn("{{CONNSTR_", masked)
+        suffix = tr._token_suffix(masked.split("@")[0].split(":")[-1])
+        self.assertTrue(suffix)
+
+        # 模拟大模型生成代码时写了 PASSWORD 标签（精确全串断言，确保还原出的就是密码本身）
+        script_code = f'import psycopg2\nconn = psycopg2.connect(password="{{{{PASSWORD_{suffix}}}}}")'
+        expected = f'import psycopg2\nconn = psycopg2.connect(password="{self.real_pass}")'
+        restored = tr.restore_final(script_code, self.sid)
+        self.assertEqual(restored, expected)
+
+        # 模拟大模型生成代码时写了 SECRET 标签
+        script_code2 = f'conn = psycopg2.connect(password="{{{{SECRET_{suffix}}}}}")'
+        expected2 = f'conn = psycopg2.connect(password="{self.real_pass}")'
+        restored2 = tr.restore_final(script_code2, self.sid)
+        self.assertEqual(restored2, expected2)
+
+    def test_single_brace_tolerance_restoration(self):
+        """大模型写成单大括号 {PASSWORD_xxx} 仍能识别并还原。"""
+        masked = tr.mask(self.conn_str, self.sid)
+        suffix = tr._token_suffix(masked.split("@")[0].split(":")[-1])
+
+        script_code = f'conn = psycopg2.connect(password="{{PASSWORD_{suffix}}}")'
+        expected = f'conn = psycopg2.connect(password="{self.real_pass}")'
+        restored = tr.restore_final(script_code, self.sid)
+        self.assertEqual(restored, expected)
+
+    def test_no_session_stream_chunk_never_drops_chars(self):
+        """守卫用例：无会话状态下，占位符被 TCP chunk 切开绝不吞字（前缀绝不丢失）。"""
+        dead_sid = "dead-session-999"
+        # 确保该 sid 绝对不在 sessions 中
+        tr.sessions.pop(dead_sid, None)
+
+        chunk1 = "run {{CONNSTR_"
+        chunk2 = "kppmhp}} done"
+
+        # 模拟流式分块到达：由于无会话，安全门阻断还原并如实透传，绝不能把 chunk1 吞掉
+        out1 = tr.restore(chunk1, dead_sid, channel="c0", final=False)
+        out2 = tr.restore(chunk2, dead_sid, channel="c0", final=True)
+
+        full_output = out1 + out2
+        self.assertEqual(full_output, "run {{CONNSTR_kppmhp}} done",
+                         "无会话状态下半截占位符绝不许吞字（前缀丢失）")
+
+        # 完整孤儿占位符必须如实记录孤儿计数
+        tr.restore("echo {{CONNSTR_kppmhp}}", dead_sid)
+        self.assertGreaterEqual(tr._NO_SESSION_ORPHANS.get(dead_sid, [0])[0], 1,
+                                "无会话请求遇到占位符必须如实记录孤儿计数")
+
+
 if __name__ == "__main__":
     unittest.main()
+
