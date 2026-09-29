@@ -85,23 +85,44 @@ def main():
     repo = args.repo or os.environ.get("GITHUB_REPOSITORY", "xiaYuTian11/maskit")
 
     # 1. 查找签名文件
-    win_sigs = list(root.glob("**/*.exe.sig"))
-    mac_sigs = (
-        list(root.glob("**/*.app.tar.gz.sig"))
-        or list(root.glob("**/*aarch64*.sig"))
-        or list(root.glob("**/*darwin*.sig"))
-        or list(root.glob("**/*.dmg.sig"))
-        or [s for s in root.glob("**/*.sig") if not s.name.endswith(".exe.sig")]
-    )
+    all_sigs = list(root.glob("**/*.sig"))
+    win_sigs = [s for s in all_sigs if s.name.endswith(".exe.sig") or "windows" in s.as_posix().lower()]
+    mac_sigs = [
+        s for s in all_sigs
+        if s not in win_sigs and (
+            s.name.endswith(".app.tar.gz.sig")
+            or "darwin" in s.as_posix().lower()
+            or "macos" in s.as_posix().lower()
+            or s.name.endswith(".dmg.sig")
+        )
+    ]
+    linux_sigs = [
+        s for s in all_sigs
+        if s not in win_sigs and s not in mac_sigs and (
+            ".appimage" in s.name.lower()
+            or "linux" in s.as_posix().lower()
+            or any(k in s.name.lower() for k in ("amd64", "x86_64", "aarch64", "arm64"))
+        )
+    ]
 
-    if not win_sigs and not mac_sigs:
+    linux_x64_sigs = [
+        s for s in linux_sigs
+        if any(k in s.as_posix().lower() for k in ("amd64", "x86_64", "x64", "linux-x64"))
+        or not any(k in s.as_posix().lower() for k in ("arm64", "aarch64", "linux-arm64"))
+    ]
+    linux_arm64_sigs = [
+        s for s in linux_sigs
+        if any(k in s.as_posix().lower() for k in ("arm64", "aarch64", "linux-arm64"))
+    ]
+
+    if not win_sigs and not mac_sigs and not linux_sigs:
         print(f"No *.sig signature files found in {root}; skipping latest.json", file=sys.stderr)
         return 0
 
     # 2. 确定 tag 版本
     tag = args.tag or os.environ.get("GITHUB_REF_NAME", "")
     if not tag:
-        sample = (win_sigs or mac_sigs)[0].name
+        sample = (win_sigs or mac_sigs or linux_sigs)[0].name
         import re
         m = re.search(r"(\d+\.\d+\.\d+)", sample)
         if m:
@@ -128,6 +149,26 @@ def main():
         sig_content = sig_path.read_text(encoding="utf-8").strip()
         bundle_name = sig_path.with_suffix("").name
         platforms["darwin-aarch64"] = {
+            "signature": sig_content,
+            "url": f"https://github.com/{repo}/releases/download/{tag}/{bundle_name}",
+        }
+
+    # 3) Linux x86_64
+    if linux_x64_sigs:
+        sig_path = linux_x64_sigs[0]
+        sig_content = sig_path.read_text(encoding="utf-8").strip()
+        bundle_name = sig_path.with_suffix("").name
+        platforms["linux-x86_64"] = {
+            "signature": sig_content,
+            "url": f"https://github.com/{repo}/releases/download/{tag}/{bundle_name}",
+        }
+
+    # 4) Linux aarch64 (ARM64)
+    if linux_arm64_sigs:
+        sig_path = linux_arm64_sigs[0]
+        sig_content = sig_path.read_text(encoding="utf-8").strip()
+        bundle_name = sig_path.with_suffix("").name
+        platforms["linux-aarch64"] = {
             "signature": sig_content,
             "url": f"https://github.com/{repo}/releases/download/{tag}/{bundle_name}",
         }

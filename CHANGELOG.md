@@ -2,6 +2,28 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.6.2] - 2026-09-29
+
+### 新增
+- 桌面端：支持 Linux amd64 与 arm64 架构桌面安装包（`.deb` 与 `.AppImage` 格式）。
+- 脚本：新增 Linux 本地一键打包（`build.sh`）与热更新部署（`scripts/local-dev-deploy.sh`）脚本。
+
+### 优化
+- 发布：更新器元数据生成脚本支持识别 Linux 双架构独立签名与更新直链。
+- 测试：修复门禁脚本与冒烟测试在虚拟环境为符号链接时的工具定位。
+
+---
+
+### Added
+- Desktop: added Linux desktop package support for amd64 and arm64 architectures (`.deb` and `.AppImage` formats).
+- Scripts: added Linux one-click build (`build.sh`) and local hot-update deployment (`scripts/local-dev-deploy.sh`) scripts.
+
+### Changed
+- Release: updater metadata generation script now distinguishes independent signatures and update URLs for both Linux architectures.
+- Tests: fixed tool and binary discovery in verification and smoke tests under symlinked virtual environments.
+
+---
+
 ## [0.6.1] - 2026-09-28
 
 ### 修复

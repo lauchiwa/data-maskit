@@ -14,6 +14,7 @@
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -170,8 +171,9 @@ def main():
 
     env = {**os.environ, "LLM_SHIELD_DATA_DIR": str(work), "PYTHONUTF8": "1",
            "PYTHONPATH": str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    mitm_cmd = shutil.which("mitmdump") or str(pathlib.Path(sys.executable).parent / "mitmdump")
     proc = subprocess.Popen(
-        ["mitmdump", "-s", str(TRANSPARENT_PY),
+        [mitm_cmd, "-s", str(TRANSPARENT_PY),
          "--mode", f"regular@127.0.0.1:{PORT_DIRECT}",
          "--mode", f"regular@127.0.0.1:{PORT_VIA}",
          "--set", "flow_detail=0", "--set", "connection_strategy=lazy"],

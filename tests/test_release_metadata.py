@@ -91,6 +91,24 @@ class GenerateLatestJsonTests(unittest.TestCase):
         # pub_date 必须是 tauri updater 认的 RFC3339 UTC 形态
         self.assertRegex(data["pub_date"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
+    def test_all_platforms_including_linux(self):
+        self._sig("Maskit_0.2.7_x64-setup.exe.sig", "WIN-SIG")
+        self._sig("Maskit_0.2.7_aarch64.app.tar.gz.sig", "MAC-SIG")
+        self._sig("Maskit_0.2.7_amd64.AppImage.tar.gz.sig", "LINUX-SIG")
+        self._sig("Maskit_0.2.7_aarch64.AppImage.tar.gz.sig", "LINUX-ARM-SIG")
+        self.assertEqual(self._run([str(self.dir), "--tag", "v0.2.7", "--repo", "o/r"]), 0)
+
+        data = self._latest()
+        self.assertEqual(set(data["platforms"]), {"windows-x86_64", "darwin-aarch64", "linux-x86_64", "linux-aarch64"})
+        self.assertEqual(data["platforms"]["linux-x86_64"], {
+            "signature": "LINUX-SIG",
+            "url": "https://github.com/o/r/releases/download/v0.2.7/Maskit_0.2.7_amd64.AppImage.tar.gz",
+        })
+        self.assertEqual(data["platforms"]["linux-aarch64"], {
+            "signature": "LINUX-ARM-SIG",
+            "url": "https://github.com/o/r/releases/download/v0.2.7/Maskit_0.2.7_aarch64.AppImage.tar.gz",
+        })
+
     def test_macos_prefers_app_tar_gz_over_dmg(self):
         """updater 要 .app.tar.gz；取成 .dmg 会让自动更新 404。"""
         self._sig("Maskit_0.2.7_aarch64.dmg.sig", "DMG-SIG")

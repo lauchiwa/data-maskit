@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Maskit",
   "mainBinaryName": "Maskit",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "identifier": "com.maskit.app",
   "build": {
     "frontendDist": "../frontend/dist",
@@ -32,8 +32,13 @@
     "active": true,
     "targets": [
       "nsis",
-      "dmg"
+      "dmg",
+      "deb",
+      "appimage"
     ],
+    "category": "Utility",
+    "shortDescription": "100% 本地大模型敏感信息脱敏与还原网关",
+    "longDescription": "Data Maskit 是专为大模型打造的本地隐私脱敏与还原网关，本地自动打码成业务占位符后转发上游，流式无感还原。",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -52,6 +57,20 @@
       },
       "webviewInstallMode": {
         "type": "embedBootstrapper"
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37",
+          "libayatana-appindicator3-1 | libappindicator3-1",
+          "librsvg2-2",
+          "libssl3 | libssl1.1"
+        ],
+        "section": "utils"
+      },
+      "appimage": {
+        "bundleMediaFramework": false
       }
     },
     "resources": [
