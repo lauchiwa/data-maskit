@@ -7,8 +7,6 @@
 ### 修复 / Bug Fixes
 - 修正 Windows 发布校验和清单的换行格式，确保每个文件的摘要独占一行。
   *Fix newlines in Windows release checksum manifests so each file digest occupies its own line.*
-- 端口探测测试全程保留未监听的 TCP 端口，消除释放后复用造成的偶发失败。
-  *Keep a non-listening TCP port reserved throughout probe tests to eliminate failures caused by reuse after release.*
 
 ## [0.103.0] - 2026-09-28
 
