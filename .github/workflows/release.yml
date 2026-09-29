@@ -450,16 +450,26 @@ jobs:
               gh release create "$GITHUB_REF_NAME" --draft --generate-notes --title "Data Maskit $GITHUB_REF_NAME" --notes "$note"
             fi
           fi
-          # 清理线上已存在的 Tauri 构建中间产物（仅 v0.2.7 那次出现的新增项；现有 Release 上的资产
-          # gh release upload 不会自动删除，这里手动清掉，避免发布页混进 bundle_dmg.sh / icon.icns /
-          # eula-resources-template.xml / template.applescript 这类不应分发的文件）。
-          existing_assets=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' 2>/dev/null || true)
-          for stray in bundle_dmg.sh icon.icns eula-resources-template.xml template.applescript; do
-            if printf '%s\n' "$existing_assets" | grep -qxF "$stray"; then
-              gh release delete-asset "$GITHUB_REF_NAME" "$stray" >/dev/null
-              echo "Removed stray asset: $stray"
-            fi
-          done
+          # 自动清理线上已存在的非白名单资产（避免历史失败或中间重试遗留散装库/临时文件）
+          python3 -c '
+          import subprocess, json, sys, os
+          tag = os.environ.get("GITHUB_REF_NAME", "")
+          try:
+              raw = subprocess.check_output(["gh", "release", "view", tag, "--json", "assets"], text=True)
+              assets = json.loads(raw).get("assets", [])
+              keep_exts = (".exe", ".exe.sig", ".msi", ".dmg", ".dmg.sig", ".deb", ".deb.sig", ".appimage", ".appimage.sig", ".appimage.tar.gz", ".appimage.tar.gz.sig", ".app.tar.gz", ".app.tar.gz.sig", ".zip")
+              for a in assets:
+                  name = a["name"]
+                  low = name.lower()
+                  if name == "latest.json" or name.startswith("SHA256SUMS-") or name == "UNSIGNED.txt":
+                      continue
+                  if any(low.endswith(ext) for ext in keep_exts):
+                      continue
+                  subprocess.run(["gh", "release", "delete-asset", tag, name, "--yes"], check=False)
+                  print(f"Removed stray release asset: {name}")
+          except Exception as exc:
+              print(f"Cleanup stray assets skipped: {exc}", file=sys.stderr)
+          '
           # 仅上传合法且非空的 Release 资产文件（安装包、压缩包、签名、校验和），杜绝任何中间临时文件被误传
           while IFS= read -r -d '' file; do
             gh release upload "$GITHUB_REF_NAME" "$file" --clobber
