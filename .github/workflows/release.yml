@@ -323,6 +323,14 @@ jobs:
           # template.applescript）。这里只删中间产物，保留真正的 .dmg 产物本身。
           rm -rf src-tauri/target/release/bundle/share
           find src-tauri/target/release/bundle/dmg -type f ! -name '*.dmg' -delete || true
+          # Linux 侧清理：Tauri 生成 deb 与 appimage 时会把中间展开构建树（含 engine/_internal 下成百上千散装库文件）
+          # 留在 bundle/deb/ 与 bundle/appimage/ 下。必须清理掉，仅保留真正的 .deb、.AppImage、.tar.gz* 及 .sig 文件。
+          if [ -d src-tauri/target/release/bundle/deb ]; then
+            find src-tauri/target/release/bundle/deb -mindepth 1 ! -name '*.deb' -exec rm -rf {} + || true
+          fi
+          if [ -d src-tauri/target/release/bundle/appimage ]; then
+            find src-tauri/target/release/bundle/appimage -mindepth 1 ! -name '*.AppImage*' -exec rm -rf {} + || true
+          fi
 
       - name: Generate SHA-256 checksums (Windows)
         if: runner.os == 'Windows'
@@ -452,9 +460,10 @@ jobs:
               echo "Removed stray asset: $stray"
             fi
           done
+          # 仅上传合法且非空的 Release 资产文件（安装包、压缩包、签名、校验和），杜绝任何中间临时文件被误传
           while IFS= read -r -d '' file; do
             gh release upload "$GITHUB_REF_NAME" "$file" --clobber
-          done < <(find release-assets -type f ! -name 'latest.json' -print0)
+          done < <(find release-assets -type f -size +0c \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage*' -o -name '*.zip' -o -name '*.sig' -o -name '*.tar.gz' -o -name 'SHA256SUMS-*.txt' -o -name 'UNSIGNED.txt' \) ! -name 'latest.json' -print0)
 
           # 若存在已签名安装包（.sig），且非 Beta 预发布版本，自动组装并上传 latest.json 更新元数据
           # Beta 预发布版本绝对不上传 latest.json，防止现网普通客户端误检测到更新
