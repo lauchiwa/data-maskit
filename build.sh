@@ -136,7 +136,7 @@ if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
   warn "检测到部分系统依赖库可能缺失: ${MISSING_PKGS[*]}"
   echo "若打包过程报错，请在 Ubuntu/Debian 上执行:"
   echo "  sudo apt update && sudo apt install -y \\"
-  echo "    pkg-config libdbus-1-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libayatana-appindicator3-dev"
+  echo "    pkg-config libdbus-1-dev libwebkit2gtk-4.1-dev librsvg2-dev patchelf libssl-dev libayatana-appindicator3-dev"
 fi
 
 # 5. 版本设置（若指定）
