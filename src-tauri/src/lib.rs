@@ -2079,7 +2079,9 @@ mod panel_alive_tests {
     #[test]
     fn bound_but_not_listening_port_is_not_alive() {
         // bind 后不 listen：保留 TCP 端口，但连接必须失败。不能先 bind/drop 再探测，
-        // 释放的端口可能被重新分配；进程内互斥锁无法保护这段窗口（macOS CI 曾复现）。
+        // 释放的端口可能被重新分配；向空闲临时端口 connect 时内核还可能把源端口选成
+        // 同一端口，形成 TCP 自连接而误判「连得上」。进程内互斥锁对两者都无效（macOS CI 曾复现）；
+        // 全程持有端口后，它既不会被别人拿走，也不会被选作源端口。
         // 两个网络用例都持有各自的端口，因此无需用全局锁把它们串行化。
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
             .expect("create TCP socket");
