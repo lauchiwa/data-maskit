@@ -1847,7 +1847,7 @@ def _remember(fwd, labels, orig, label):
 
 
 # 按长度降序的敏感词表（长词优先匹配，保证同一位置长词先命中）。
-# 唯一消费者是 _custom_combined_regex，而它只在合并正则缓存未命中时才会走到这里，
+# 唯一消费者是 _custom_words_plan，而它只在执行计划缓存未命中时才会走到这里，
 # 所以下面的排序不进 mask 热路径。
 _CUSTOM_WORDS_SORTED = ()
 
@@ -2661,9 +2661,63 @@ _SINGLE_WORD_BOUND = r"A-Za-z0-9_\u4e00-\u9fff"
 # 退化回子串匹配（宁可多打码，不可漏打码）；ASCII 词边界照旧，Acme 不会命中 AcmeCorp。
 _WHOLE_WORD_BOUND = r"A-Za-z0-9_"
 _CUSTOM_WORD_RX_CACHE = {}
-# 合并正则缓存：500 词 × 10 万字符从 O(词数×长度) 降到 O(长度)（审计性能项）。
+# 词表执行计划缓存：把全部启用词编译成一份**有序**执行计划。
+# 500 词 × 10 万字符从 O(词数×长度) 降到 O(长度)（审计性能项）。
 # 词表/禁用状态变化时 key 失效重建；key 计算是 O(词数) 的元组比较，微秒级。
-_CUSTOM_COMBINED_CACHE = {"key": None, "rx": None}
+#
+# 计划元素（顺序即执行顺序，按词长降序 = 长词优先，与逐词替换语义一致）：
+#   ("literal", rx, index)           连续普通词合并成的一条 alternation
+#   ("regex",   rx, (word, label))   单个 re: 词，**独立编译**
+#
+# ⚠️ 为什么 re: 词必须独立编译、绝不能拼进同一条 alternation（2026-09-30 实测事故）：
+# 用户写的 `re:(?i)(Beijing)` 单看合法（面板保存也是逐词编译 -> 放行），但只要词表里
+# 存在比它更长的词，它就会落到 alternation 的非首位，整条编译抛
+# `global flags not at the start of the expression`；旧实现把该异常兜成「词表降级为
+# 空」-> **自定义词 + 内置敏感词组一起静默失效**，代理照常 200，只留一行进程日志。
+# 用户看到的现象是「关掉 NER 后什么都不脱敏了」，而根因与 NER 毫无关系。
+# 被隔离掉的同类问题还有：跨词同名命名组（redefinition of group name）、反向引用 \1
+# 因别的词插进来导致组号漂移而指错组。隔离后这些写法各自独立成立，坏词只毁它自己。
+#
+# `key` 槽位与旧实现同名同义（None = 失效重建）：测试夹具直接改它来清缓存。
+# （旧实现还有个 `rx` 槽位，执行计划上线后没有消费者了，已直接删除。）
+_CUSTOM_COMBINED_CACHE = {"key": None, "plan": None}
+
+
+# 词表问题登记表（词 -> 原因）。容量有限、同词只记首次，配置换代时清空。
+# 存在的理由：这些问题以前**只在进程日志里留一行**，面板、事件、一键自检全看不见，
+# 用户唯一能得出的结论是「脱敏坏了」。现在由 /api/status、一键自检与 MASK/RESTORE
+# 事件详情共用它，把「哪个词、什么原因、怎么改」直接摆到用户面前。
+_WORD_TABLE_ISSUES = {}
+_WORD_TABLE_ISSUES_LOCK = threading.Lock()
+_WORD_TABLE_ISSUES_MAX = 20
+
+
+def _note_word_table_issue(word, reason):
+    """登记一条词表问题（线程安全；同词只记首次，最多留 `_WORD_TABLE_ISSUES_MAX` 条）。"""
+    try:
+        key = str(word or "")[:200]
+        with _WORD_TABLE_ISSUES_LOCK:
+            if key in _WORD_TABLE_ISSUES or len(_WORD_TABLE_ISSUES) >= _WORD_TABLE_ISSUES_MAX:
+                return
+            _WORD_TABLE_ISSUES[key] = str(reason or "")[:200]
+        _log(f"[mask] 词表问题：{key} —— {reason}")
+    except Exception:
+        pass
+
+
+def word_table_issues():
+    """当前词表问题快照（词 -> 原因）。空 dict = 全部词都能用。
+
+    出口三处：`/api/status`（面板设置页）、一键自检、MASK/RESTORE 事件详情。
+    """
+    with _WORD_TABLE_ISSUES_LOCK:
+        return dict(_WORD_TABLE_ISSUES)
+
+
+def _clear_word_table_issues():
+    """配置换代后清空：上一代词表的问题不该挂在新一代上（新词表会在下次构建计划时重评）。"""
+    with _WORD_TABLE_ISSUES_LOCK:
+        _WORD_TABLE_ISSUES.clear()
 
 
 def _custom_word_regex(word):
@@ -2688,67 +2742,103 @@ def _custom_word_regex(word):
     return rx
 
 
-def _custom_combined_regex():
-    """全部启用词合并为一条正则（词按长度降序，同一位置长词优先，与逐词替换语义一致）。
+def _literal_word_pattern(word):
+    """普通词 -> 一条**纯字面量**片段（escaped，永不编译失败）。
 
-    支持 re: 前缀的正则型自定义词（审计规则专项 P3）：如 re:EMP-\\d{6}。
-    正则词不 re.escape，直接拼入合并正则。
-
-    P0 修复（审计意见）：正则词编译保护——用户填的非法正则（缺括号等）
-    会 re.compile 抛 PatternError，导致整个合并正则失败 → mask() 异常 →
-    fail-closed 503，全部客户端被拒。这里逐词 try 编译，坏词跳过并留痕，
-    其余词照常生效；绝不让词表配置错误升级成全局阻断。
-
-    缓存命中判断必须放在构建 parts 之前：合并正则的 key 已完整覆盖词表与禁用状态
-    （_custom_word_enabled 只读 SENSITIVE_DISABLED / SENSITIVE_WORD_DISABLED），
-    命中时直接返回，既省掉热路径上的排序与拼接，也避免「跳过非法正则词」的日志
-    每次请求都重打一遍（原实现把日志与 parts 构建放在检查之前，命中缓存也会刷日志）。
+    边界规则与旧的合并实现完全一致（勿改）：
+      · 单字词用 `_SINGLE_WORD_BOUND`（含汉字，避免「密」打中「密码」）；
+      · 显式「整词匹配」的词用 `_WHOLE_WORD_BOUND`（不含汉字，否则中文词永不命中）；
+      · 其余（>=2 字）无边界，子串匹配 —— 宁可多打码，不可漏打码。
     """
-    key = (
+    esc = re.escape(word)
+    if len(word) == 1 or word in SENSITIVE_WORD_WHOLE:
+        bound = _SINGLE_WORD_BOUND if len(word) == 1 else _WHOLE_WORD_BOUND
+        return rf"(?<![{bound}]){esc}(?![{bound}])"
+    return esc
+
+
+def _custom_words_plan_key():
+    """计划缓存键：完整覆盖词表内容与禁用状态（`_custom_word_enabled` 只读这两个集合）。"""
+    return (
         tuple(CUSTOM_WORDS.items()),
         tuple(sorted(SENSITIVE_DISABLED)),
         tuple(sorted((l, w) for l, ws in SENSITIVE_WORD_DISABLED.items() for w in ws)),
         tuple(sorted(SENSITIVE_WORD_WHOLE)),
     )
-    if _CUSTOM_COMBINED_CACHE["key"] == key and _CUSTOM_COMBINED_CACHE["rx"] is not None:
-        return _CUSTOM_COMBINED_CACHE["rx"]
-    parts = []
-    skipped = []
+
+
+def _custom_words_plan():
+    """构建（或取缓存）词表执行计划，语义见 `_CUSTOM_COMBINED_CACHE` 的注释。
+
+    两遍：① 按长词优先顺序把启用词摊成 `word` / `regex` 两种条目（`re:` 词在此单独
+    编译，坏词只跳过它自己并登记原因）；② 把**连续**的 `word` 条目合并成一条
+    alternation（`re:` 词天然成为分界线），逐字面量段编译。
+
+    任何编译失败都**只影响它自己**：段编译失败退化为逐词 pattern，单词失败只跳过该词。
+    旧实现在这一步失败时把**整张词表**置空（自定义词 + 内置敏感词组一起失效），
+    是本轮修复的核心缺陷。
+    """
+    key = _custom_words_plan_key()
+    cache = _CUSTOM_COMBINED_CACHE
+    if cache["key"] == key and cache["plan"] is not None:
+        return cache["plan"]
+
+    items = []          # ("word", word, label) | ("regex", compiled_rx, word, label)
     for word, label in _custom_words_sorted():
         if not word or not _custom_word_enabled(word, label):
             continue
         if word.startswith("re:"):
-            # 正则型自定义词：单独编译校验，失败跳过（不阻断其他词）
             try:
-                re.compile(word[3:], re.IGNORECASE)
+                rx = re.compile(word[3:], re.IGNORECASE)
             except re.error as e:
-                skipped.append((word, str(e)))
+                # 非法正则只跳过它自己（旧行为），但必须留痕给面板/自检/事件
+                _note_word_table_issue(word, f"正则无效，已跳过该词：{e}")
                 continue
-            parts.append(word[3:])
-            continue
-        esc = re.escape(word)
-        if len(word) == 1 or word in SENSITIVE_WORD_WHOLE:
-            # 单字词或显式整词开关：两侧加边界，避免子串误伤。
-            # 边界字符类分档：单字词用 _SINGLE_WORD_BOUND（含汉字，避免「密」打中
-            # 「密码」）；整词开关用 _WHOLE_WORD_BOUND（不含汉字）——否则中文词永不命中，
-            # 见该常量处的说明。单字判在前，故单字词的行为未变。
-            bound = _SINGLE_WORD_BOUND if len(word) == 1 else _WHOLE_WORD_BOUND
-            parts.append(rf"(?<![{bound}]){esc}(?![{bound}])")
+            items.append(("regex", rx, word, label))
         else:
-            parts.append(esc)
-    if skipped:
-        for w, err in skipped[:5]:
-            _log(f"[mask] 跳过非法正则词 {w[:60]}...：{err}")
-    # 整体再包一层 try：parts 拼合本身也可能因用户正则里的 | 破坏结构，
-    # 兜底降级为空正则（全部词不生效但代理不 503）
-    try:
-        rx = re.compile("|".join(parts), re.IGNORECASE) if parts else None
-    except re.error as e:
-        _log(f"[mask] 合并正则编译失败，词表降级为空（坏词已跳过）：{e}")
-        rx = None
-    _CUSTOM_COMBINED_CACHE["key"] = key
-    _CUSTOM_COMBINED_CACHE["rx"] = rx
-    return rx
+            items.append(("word", word, label))
+
+    # 大小写索引：命中文本 -> (词表里的原始 key, 标签)，让 ACME/acme 复用同一个原词与
+    # 占位符。旧实现是**每次命中**都对 CUSTOM_WORDS 做一次 O(词数) 的 `next()` 线性
+    # 扫描（5000 词表 + 上千命中 = 百万级比较），这里只建一次。冲突时取词表中**首个**
+    # 匹配（与旧实现 `next(...)` 同义）。
+    index = {}
+    for it in items:
+        if it[0] == "word":
+            index.setdefault(it[1].lower(), (it[1], it[2]))
+
+    plan = []
+    batch = []
+
+    def _flush():
+        if not batch:
+            return
+        try:
+            rx = re.compile("|".join(_literal_word_pattern(w) for w, _l in batch),
+                            re.IGNORECASE)
+        except re.error as e:                       # 纯 escaped 字面量，理论上不可达
+            rx = None
+            _note_word_table_issue(batch[0][0],
+                                   f"普通词合并编译失败，已改为逐词匹配：{e}")
+        if rx is not None:
+            plan.append(("literal", rx, index))
+        else:
+            # 兜底：逐词独立 pattern。**绝不整表置空** —— 那等于把用户整张词表废掉
+            plan.extend(("literal", re.compile(_literal_word_pattern(w), re.IGNORECASE), index)
+                        for w, _l in batch)
+        del batch[:]
+
+    for it in items:
+        if it[0] == "word":
+            batch.append((it[1], it[2]))
+        else:
+            _flush()
+            plan.append(("regex", it[1], it[3]))
+    _flush()
+
+    cache["key"] = key
+    cache["plan"] = plan
+    return plan
 
 
 def _sync_custom_word_mappings():
@@ -3585,23 +3675,26 @@ def mask(text, sid):
             text, edits = _mask_excluding_placeholders_ed(text, prefix_rx, _prefix_sub)
             _update_om(edits, curr_len)
 
-    cw_rx = _custom_combined_regex()
-    if cw_rx:
-        # 单次扫描替换全部自定义词（长词优先，与旧逐词循环语义一致但 O(长度)）
-        # 跳过已有占位符片段（防污染：自定义词含 hex 子串会劈开占位符）
-        # 大小写不敏感（IGNORECASE）：ACME/acme/Acme 都匹配，但 CUSTOM_WORDS 的 key
-        # 可能是 Acme —— 用小写反查 label，避免大小写变体拿不到 label 回退到 TERM。
-        _cw_label_lower = {w.lower(): lbl for w, lbl in CUSTOM_WORDS.items()}
-        def _cw_sub(m):
+    # 自定义词扫描。计划由 `_custom_words_plan()` 产出：普通词合并成一条 alternation
+    # （O(长度)，长词优先），`re:` 词各自独立成项 —— 隔离用户正则的全局 flag、命名组
+    # 与反向引用，坏词只毁它自己而不是整张词表（见该函数的注释）。
+    # 跳过已有占位符片段（防污染：自定义词含 hex 子串会劈开占位符）。
+    for _cw_kind, _cw_rx, _cw_meta in _custom_words_plan():
+        def _cw_sub(m, _kind=_cw_kind, _meta=_cw_meta):
             word = m.group(0)
-            label = _cw_label_lower.get(word.lower(), "")
-            # _hit 需要原始 key 来建 fwd 映射；大小写变体统一用查到的原始 key
-            orig_key = next((k for k in CUSTOM_WORDS if k.lower() == word.lower()), word)
+            if _kind == "literal":
+                # 大小写变体统一用词表里的原始 key（ACME/acme 复用同一占位符）
+                orig_key, label = _meta.get(word.lower()) or (word, "")
+            else:
+                # 正则型词：原文是**命中到的文本**（每个命中各自建映射，绝不把正则
+                # 本身当原文 —— 那会让还原吐出 `re:...` 字面量），标签取词表里那个词的
+                orig_key, label = word, _meta
             _hit(orig_key, label)
             return fwd.get(orig_key, word)
         curr_len = len(text)
-        text, edits = _mask_excluding_placeholders_ed(text, cw_rx, _cw_sub)
+        text, edits = _mask_excluding_placeholders_ed(text, _cw_rx, _cw_sub)
         _update_om(edits, curr_len)
+
 
     # 被豁免的连接串**区间** [start, end)（end 即 userinfo 结尾的 `@` 之后）：
     # RULES 里 CONNSTR 排在 EMAIL 之前，本列表用于让 EMAIL 避开与这些区间重叠的
@@ -5952,6 +6045,15 @@ def write_runtime_metrics(force=False):
             "audit": audit_runtime_stats(),
             "engine_deadline_s": _ENGINE_DEADLINE_S,
         }
+
+        # 敏感词表：**引擎里真正生效的词数**与**问题清单**（词 -> 原因）。
+        # 必须由引擎进程产生：panel 是另一个进程，它只能看到配置里"写了多少词"，
+        # 看不到引擎里"真正生效了几个词"。2026-09-30 那次「整表静默失效」正是因为
+        # 这个差异没有任何出口 —— 面板显示一切正常，用户却什么都脱敏不了。
+        payload["word_table"] = {
+            "count": len(CUSTOM_WORDS),
+            "issues": word_table_issues(),
+        }
         try:
             import ner_engine
             payload["ner"] = {
@@ -8141,6 +8243,12 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
         restored=restored_count,
         restored_unique=restored_unique,
         unresolved=unresolved,
+        # 未还原占位符样本（最多 5 条；样本本身是占位符，不含任何原文）。
+        # 此前**只有扩展链路**（panel 的 /api/ext/restore）外发它，代理链路只在
+        # 会话里收集 —— 面板只显示一个数字，用户无从区分「模型改写/自造占位符」
+        # 与「映射过期或引擎重启导致查不到原文」，而这两种情况的处置完全不同。
+        **({"unresolved_samples": [str(x)[:120] for x in (s.get("unresolved_samples") or [])][:5]}
+           if s.get("unresolved_samples") else {}),
         # 靠宽松兜底（模型剥了花括号）修回来的个数。
         # 这个计数一直存在于会话里，但**从没被发进事件**——注释写着「计数进
         # RESTORE 事件，让用户看得见」，实际 _emit 参数里没有它，于是
@@ -8616,7 +8724,12 @@ def _maybe_reload(force=False):
     # SENSITIVE_DISABLED / SENSITIVE_WORD_DISABLED 判断哪些词仍启用，放在前面会
     # 永远按上一代配置计算（禁用词要等第二次改配置才被清掉）。
     _refresh_custom_words_sorted()
-    _CUSTOM_WORD_RX_CACHE = {}  # 词表变更后丢掉编译缓存（换对象，不就地 clear）
+    _CUSTOM_WORD_RX_CACHE = {}
+    # 词表换代：上一代的问题登记作废（新词表会在下次构建计划时重新评估）；
+    # 计划缓存的键已含词表内容，本来就会自行失效，显式置空只为可读性。
+    _CUSTOM_COMBINED_CACHE["plan"] = None
+    _clear_word_table_issues()
+
     br = dict(DEFAULT_BUILTIN_RULES)
     raw_br = s.get("builtin_rules") or {}
     # 旧配置 IP 键迁移（与 panel.normalize_config 一致）：IP 拆 IP_PRIVATE/IP_INTERNAL

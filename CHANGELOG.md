@@ -2,6 +2,38 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [Unreleased]
+
+### 修复
+- 引擎：自定义词表里的 `re:` 词不再能拖垮整张词表（一个词编译失败曾让自定义词与内置词组一起静默失效）。
+- 引擎：无汉字的识别窗口不再送入语义模型，稀疏中文正文的识别耗时降约 74%（实测）。
+- 面板：日志列表标注 5xx 来源（上游返回 / 网关拦截 / 代理未运行），上游 503 不再被误读成网关故障。
+
+### 优化
+- 引擎：语义识别分段粒度由 20000 字收紧到 4000 字，长会话第二轮重推开销降约 3 倍（实测 2308ms → 778ms）。
+- 引擎：事件库在保留策略执行后按需回收死空间（实测 237.5MB → 159MB）。
+
+### 新增
+- 自检：新增 S35（敏感词表未生效）与 S36（事件库死空间未回收）。
+- 面板：`/api/status` 外发词表生效口径（配置词数 / 引擎生效词数 / 问题清单）。
+
+---
+
+### Fixed
+- Engine: one broken `re:` word can no longer take down the whole word table (a single bad pattern silently disabled custom and built-in groups together).
+- Engine: recognition windows without CJK characters are no longer sent to the semantic model — ~74% less inference time on sparsely-Chinese content (measured).
+- Panel: the log list now labels the origin of 5xx (upstream / gateway block / proxy stopped); an upstream 503 is no longer misread as a gateway failure.
+
+### Changed
+- Engine: semantic-recognition segment size tightened from 20000 to 4000 chars — ~3x cheaper re-push on the second turn of a long session (measured 2308ms -> 778ms).
+- Engine: the event DB reclaims dead space after the retention pass (measured 237.5MB -> 159MB).
+
+### Added
+- Self-check: new S35 (sensitive words not taking effect) and S36 (event DB dead space).
+- Panel: `/api/status` now exposes word-table effect counts (configured / engine-active / issues).
+
+---
+
 ## [0.6.2] - 2026-09-29
 
 ### 新增

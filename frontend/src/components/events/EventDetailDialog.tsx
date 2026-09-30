@@ -415,7 +415,7 @@ export function EventDetailDialog({
                       </span>
                     )}
                     {(event.unresolved ?? 0) > 0 && (
-                      <span className="text-amber-600 dark:text-amber-400">
+                      <span className="text-amber-600 dark:text-amber-400" title={t('logs.unresolvedHint')}>
                         {t('logs.colUnresolved')} <strong>{event.unresolved}</strong>
                       </span>
                     )}
@@ -429,6 +429,14 @@ export function EventDetailDialog({
                 <p className="mt-1.5 text-[11px] text-muted-foreground leading-relaxed">
                   {stageInfo.desc}
                 </p>
+                {/* 未还原占位符样本：让「模型把占位符写错/自造」与「映射过期」一眼可分。
+                    旧事件没有这个字段时不渲染（不给正常请求加噪声）。 */}
+                {Array.isArray(event.unresolved_samples) && event.unresolved_samples.length > 0 && (
+                  <div className="mt-1.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] leading-snug text-amber-700 dark:text-amber-300">
+                    <span>{t('logs.unresolvedSamples')}</span>
+                    <span className="ml-1 font-mono">{event.unresolved_samples.join(' / ')}</span>
+                  </div>
+                )}
               </div>
             )}
 

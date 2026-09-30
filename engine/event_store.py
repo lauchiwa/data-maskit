@@ -1621,6 +1621,75 @@ def prune_events(now=None, retention_days=RETENTION_DAYS):
         return {"ok": True, "removed": removed}
 
 
+# ── 死空间回收 ───────────────────────────────────────────────────────────────
+# 保留策略每天 DELETE 明细，但 SQLite 只是把这些页放进 freelist，**文件永不缩小**：
+# 实测线上库 249MB 里有 84MB 是这种"已删除但仍占盘"的死空间（33%），而此前全仓
+# 没有任何一处执行 VACUUM。
+#
+# 阈值刻意不低：VACUUM 会重写整个文件（临时占用约等于库大小），不能每次
+# prune 都做。只在这两件事同时成立时压一次。
+_RECLAIM_MIN_FREE_BYTES = 32 * 1024 * 1024
+_RECLAIM_MIN_FREE_RATIO = 0.25
+
+
+def db_stats(conn=None):
+    """事件库体积快照：文件大小 / 死空间 / 明细行数（面板与自检用，不含任何原文）。"""
+    try:
+        _ensure_db()
+        own = conn is None
+        conn = conn if conn is not None else _connect()
+        try:
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0] or 0)
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0] or 0)
+            free_pages = int(conn.execute("PRAGMA freelist_count").fetchone()[0] or 0)
+            rows = int(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] or 0)
+        finally:
+            if own:
+                conn.close()
+        size = page_count * page_size
+        free = free_pages * page_size
+        return {"ok": True, "bytes": size, "free_bytes": free, "rows": rows,
+                "free_ratio": (float(free) / size) if size else 0.0}
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+
+def reclaim_space(min_free_bytes=_RECLAIM_MIN_FREE_BYTES,
+                  min_free_ratio=_RECLAIM_MIN_FREE_RATIO):
+    """prune 之后按需回收死空间（VACUUM）。返回是否真的压缩以及前后体积。
+
+    ⚠️ 引擎（mitmdump）与面板是两个连接，VACUUM 要独占写锁：`_connect` 已设
+    `busy_timeout=5000`，引擎正在写事件时会等一会儿；仍拿不到锁就**放弃本次**
+    （返回 ok=False），留给下一轮保留策略 —— 为了清理空间让写入长时间阻塞不划算。
+    """
+    before = db_stats()
+    if not before.get("ok"):
+        return {"ok": False, "vacuumed": False,
+                "error": before.get("error") or "db_stats failed"}
+    if (int(before.get("free_bytes") or 0) < int(min_free_bytes)
+            or float(before.get("free_ratio") or 0.0) < float(min_free_ratio)):
+        return {"ok": True, "vacuumed": False, "bytes": before.get("bytes"),
+                "free_bytes": before.get("free_bytes"), "rows": before.get("rows")}
+    try:
+        _ensure_db()
+        with closing(_connect()) as conn:
+            conn.execute("VACUUM")
+            try:
+                # WAL 文件同样只会涨：重写完成后把日志截断回 0，否则 -wal 会一直留着。
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+    except Exception as e:
+        return {"ok": False, "vacuumed": False, "bytes": before.get("bytes"),
+                "free_bytes": before.get("free_bytes"),
+                "error": "%s: %s" % (type(e).__name__, e)}
+    after = db_stats()
+    saved = max(0, int(before.get("bytes") or 0) - int(after.get("bytes") or 0))
+    return {"ok": True, "vacuumed": True, "bytes": after.get("bytes"),
+            "free_bytes": after.get("free_bytes"), "rows": after.get("rows"),
+            "reclaimed_bytes": saved}
+
+
 def clear_events():
     """清空事件库（含清空竞态防护，审计 P1-5 / SHIELD-CLEAR-001）。
 

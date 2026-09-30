@@ -104,8 +104,12 @@ class PosixProcessTests(unittest.TestCase):
     def test_posix_port_fallback_does_not_fabricate_pid(self):
         # 若只能通过 TCP connect 判断端口存在，返回空 PID 集合，不能伪造 PID 1。
         old_cache = panel._netstat_cache.copy()
+        # 必须连子进程探测一起打桩：本机（开发者机器）往往**真的**有进程监听
+        # 18701，此时 lsof/ss 会返回真实 PID，断言就变成了「本机没装 Maskit 才成立」
+        # —— 实测在开发机上恒红（与改动无关，基线同样失败），而 CI 上恒绿。
         with mock.patch.object(panel.sys, "platform", "linux"), \
              mock.patch.object(panel.Path, "is_dir", return_value=False), \
+             mock.patch.object(panel, "_run_console", return_value=(1, "")), \
              mock.patch.object(panel.socket, "socket") as sock_cls:
             sock = sock_cls.return_value.__enter__.return_value
             sock.connect_ex.return_value = 0

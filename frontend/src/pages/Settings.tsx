@@ -1382,6 +1382,29 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
             </div>
           </div>
 
+          {/* 词表未生效告警（引擎侧外发）：整表失效时面板原本完全看不出来 ——
+              词库显示得好好的、代理照常 200，只是所有词都不命中。见 S35 自检项。 */}
+          {(() => {
+            const w = status?.words
+            const bad = Object.entries(w?.issues ?? {})
+            const emptyTable = !w?.engine_stale && (w?.configured ?? 0) > 0 && w?.engine_count === 0
+            if (!bad.length && !emptyTable) return null
+            return (
+              <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] leading-snug text-amber-700 dark:text-amber-300">
+                <div className="font-medium">
+                  {tf('settings.words.tableIssues', { n: bad.length || (w?.configured ?? 0) })}
+                </div>
+                {bad.length > 0 && (
+                  <ul className="mt-1 list-disc space-y-0.5 pl-4 font-mono">
+                    {bad.slice(0, 5).map(([word, why]) => (
+                      <li key={word}>{word} — {why}</li>
+                    ))}
+                  </ul>
+                )}
+                <div className="mt-1 text-muted-foreground">{t('settings.words.tableIssuesHint')}</div>
+              </div>
+            )
+          })()}
           {/* 分类词表：卡片式（每分类一张卡，网格布局） */}
           <div className="rounded-lg border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
             {t('settings.words.regexHint').split('{n}')[0]}<code className="font-mono">re:</code>{t('settings.words.regexHint').split('{n}').slice(1).join('{n}')}

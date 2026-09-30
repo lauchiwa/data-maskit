@@ -89,6 +89,21 @@ export interface ProxyStatus {
     /** 缓存冷热计数（本进程视角；代理链路真值在 engine-runtime.json） */
     cache?: { hit?: number; miss?: number; hit_rate?: number | null }
   }
+  /**
+   * 敏感词表生效口径：`configured`/`regex_words` 来自配置，`engine_count`/`issues`
+   * 来自**引擎进程**经 engine-runtime.json 外发的真值。
+   *
+   * 为什么要分开：2026-09-30 事故里整张词表因一个 `re:` 词编译失败而静默失效，
+   * 面板只看配置的话显示一切正常，用户却什么都脱敏不了。
+   * `issues` 是「词 -> 原因」，词本身是用户自己的配置内容，不含请求原文。
+   */
+  words?: {
+    configured: number
+    regex_words: number
+    engine_count: number | null
+    issues: Record<string, string>
+    engine_stale: boolean
+  }
   needs_ca: boolean
   wizard_recommended: boolean
   last_error: string
@@ -143,6 +158,8 @@ export interface ShieldEvent {
    * 无法还原（对应的原文从不存在），只能如实告诉用户。
    */
   unresolved?: number
+  /** 未还原占位符样本（引擎侧外发；仅未还原时存在，用于区分模型改写与映射丢失） */
+  unresolved_samples?: string[]
   /**
    * 靠宽松兜底修回来的占位符数（仅 RESTORE 事件）。模型把 {{}} 剥掉或写残时，
    * _LOOSE_PLACEHOLDER_RX 捞回来的那些。是成功路径，但值得看见——

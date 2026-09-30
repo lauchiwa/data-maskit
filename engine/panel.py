@@ -779,6 +779,15 @@ def prune_event_log(now=None, retention_days=None):
             prune_audit_events(now=now, retention_days=retention_days)
         except Exception:
             pass
+        # 删了行不等于文件变小（SQLite 只把页放进 freelist）：达到阈值时压一次，
+        # 阈值与失败退避都在 event_store.reclaim_space 里（拿不到写锁就放弃，下轮再来）。
+        try:
+            from event_store import reclaim_space
+            _reclaim = reclaim_space()
+            if _reclaim.get("vacuumed") or not _reclaim.get("ok"):
+                result = dict(result or {}, reclaim=_reclaim)
+        except Exception:
+            pass
         return result
     except Exception as e:
         return {"ok": False, "error": _safe_public_text(e, 240), "removed": 0}
@@ -3719,6 +3728,25 @@ def _normalize_ner_budget(raw):
     return max(1.0, min(120.0, n))
 
 
+# 灾难性回溯（ReDoS）形态：分组内含量词、且组后紧跟量词（`(\w+)*` / `(a+)+` / `(a+){2,}`）。
+# 为什么要在**保存时**提醒：这类正则在长 body 上是指数级回溯，实测 `re:(\w+)*@`
+# 在 44KB 文本上 6 秒都跑不完；而 Python 的 `re` 执行期间持有 GIL，会把**整个引擎
+# 进程**（含事件循环与所有在途连接）一起拖住。只警告、不拒绝保存 —— 正当写法存在，
+# 但用户必须知道代价。
+_RE_BACKTRACK_RISK = re.compile(
+    r"\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)\s*[+*{]"
+)
+
+
+def _regex_backtrack_risk(body):
+    """返回可疑的回溯片段（截断 40 字符）；空串 = 未发现。只看形态，不做完整静态分析。"""
+    try:
+        m = _RE_BACKTRACK_RISK.search(str(body or ""))
+    except Exception:
+        return ""
+    return m.group(0)[:40] if m else ""
+
+
 def normalize_config(raw, warnings=None):
     """校验并规整配置。
 
@@ -3786,6 +3814,11 @@ def normalize_config(raw, warnings=None):
                         except re.error as e:
                             warn.append(f"正则词「{word[:40]}」无效：{e}，已拒绝保存")
                             continue
+                        _risk = _regex_backtrack_risk(word[3:])
+                        if _risk:
+                            warn.append(
+                                f"正则词「{word[:40]}」含嵌套量词（{_risk}）：极端输入下会"
+                                f"灾难性回溯并拖住整个引擎，建议改成等价的线性写法")
                     if total_words >= MAX_TOTAL_WORDS:
                         warn.append(f"敏感词总数超过 {MAX_TOTAL_WORDS}，后续词已忽略（可精简词表提升脱敏性能）")
                         break
@@ -5075,6 +5108,7 @@ def api_status():
         "audit": cfg.get("audit", {}),
         # NER 开关 + 可用性：开启但模型/依赖缺失时必须让前端能提示，否则表现为"开了没效果"
         "ner": _ner_status_payload(cfg),
+        "words": _word_table_payload(cfg),
         "needs_ca": capture_mode != "reverse",
         # 首次运行向导：upstreams 恒被回填默认值，用不上它判断，改用显式标记
         "wizard_recommended": not bool(cfg.get("wizard_done")),
@@ -6215,6 +6249,47 @@ _EXT_MAX_BODY = 32 * 1024 * 1024
 # 几千 run 的文档会线性堆到分钟级，而扩展侧 HTTP 超时更短——超预算后只停用语义
 # 识别，确定性规则照常生效（见 transparent._ner_doc_budget）。
 _EXT_FILE_NER_BUDGET_S = 8.0
+
+
+def _word_table_payload(cfg):
+    """敏感词表的生效口径（面板 / 一键自检用）。
+
+    两个来源必须分开，混在一起就看不见故障：
+      · `configured` / `regex_words`：**配置里写了多少**（本进程就能算）；
+      · `engine_count` / `issues`：**引擎里真正生效几个、哪些词被跳过**
+        （只有 mitmdump 进程知道，经 engine-runtime.json 传出来）。
+    只报配置词数的话，「整张词表编译失败 -> 全部词失效」看起来和正常一模一样，
+    而用户侧表现是「脱敏突然什么都不打码了」。
+    """
+    out = {"configured": 0, "regex_words": 0, "engine_count": None,
+           "issues": {}, "engine_stale": True}
+    try:
+        raw_words = []
+        for _label, v in (cfg.get("sensitive") or {}).items():
+            if isinstance(v, dict):
+                raw_words.extend(str(w) for w in (v.get("words") or []))
+            elif isinstance(v, (list, tuple)):
+                raw_words.extend(str(w) for w in v)
+        raw_words.extend(str(w) for w in (cfg.get("custom_words") or {}))
+        uniq = {w for w in raw_words if w}
+        out["configured"] = len(uniq)
+        out["regex_words"] = len([w for w in uniq if w.startswith("re:")])
+    except Exception:
+        pass
+    try:
+        eng = _read_engine_metrics()
+        wt = eng.get("word_table") if isinstance(eng, dict) else None
+        if isinstance(wt, dict):
+            out["engine_count"] = wt.get("count")
+            issues = wt.get("issues")
+            if isinstance(issues, dict):
+                # 词本身是用户自己写的配置内容（正则/关键词），不含任何请求原文
+                out["issues"] = {str(k)[:120]: str(v)[:200]
+                                 for k, v in list(issues.items())[:20]}
+            out["engine_stale"] = bool(eng.get("stale"))
+    except Exception:
+        pass
+    return out
 
 
 def _ner_status_payload(cfg):
@@ -8109,6 +8184,7 @@ def _selfcheck_inputs():
             "metrics_age_s": eng.get("age_s"),
         },
         "ner": {},
+        "words": _word_table_payload(cfg),
         "events": {
             "window_s": agg.get("window_s", 3600),
             "total": agg.get("total", 0),
@@ -8161,7 +8237,7 @@ def _selfcheck_inputs():
     # 事件库写入健康 + 是否发生过损坏隔离（storage.*）
     try:
         import event_store
-        ctx["storage"] = {"writer": event_store.writer_stats()}
+        ctx["storage"] = {"writer": event_store.writer_stats(), "db": event_store.db_stats()}
         ctx["storage"]["db_quarantined"] = bool(getattr(event_store, "_LAST_QUARANTINE", False))
     except Exception as e:                                  # pragma: no cover
         ctx["storage"] = {"error": "%s: %s" % (type(e).__name__, e)}

@@ -244,7 +244,39 @@ class RuleTests(unittest.TestCase):
         self.assertNotIn("代理运行中", notes, "已在报「代理未运行」却仍显示「代理运行中」")
         # 反向：完全健康时 A–E 应全部在列
         healthy = sc.run_selfcheck(HEALTHY)
-        self.assertEqual({o["id"] for o in healthy["ok_items"]}, {"A", "B", "C", "D", "E"})
+        self.assertEqual({o["id"] for o in healthy["ok_items"]}, {"A", "B", "C", "D", "E", "F"})
+
+    def test_s35_reports_words_that_did_not_take_effect(self):
+        """词表问题必须出现在结论里（2026-09-30 事故：一个 re: 词让整表静默失效）。"""
+        ctx = dict(HEALTHY, words={"configured": 5, "engine_count": 2, "engine_stale": False,
+                                   "issues": {"re:(?i)(Beijing)": "正则无效，已跳过该词：..."}})
+        out = sc.run_selfcheck(ctx)
+        self.assertIn("S35", out["fired_ids"])
+        self.assertNotIn("F", {o["id"] for o in out["ok_items"]},
+                         "已经报了词表问题，就不能同时显示「词表全部生效」")
+        clean = sc.run_selfcheck(dict(HEALTHY, words={"configured": 5, "engine_count": 5,
+                                                     "engine_stale": False, "issues": {}}))
+        self.assertNotIn("S35", clean["fired_ids"])
+        self.assertIn("F", {o["id"] for o in clean["ok_items"]})
+        stale = sc.run_selfcheck(dict(HEALTHY, words={"configured": 5, "engine_count": None,
+                                                     "engine_stale": True, "issues": {}}))
+        self.assertNotIn("S35", stale["fired_ids"], "引擎指标过期时不许下结论")
+
+    def test_s36_reports_event_db_dead_space(self):
+        """删行不等于文件变小：死空间占比高时要能看见（实测线上 249MB 里 84MB 是空页）。"""
+        big = dict(HEALTHY, storage={"db": {"ok": True, "bytes": 261_000_000,
+                                            "free_bytes": 88_000_000, "rows": 19000,
+                                            "free_ratio": 0.337}})
+        out = sc.run_selfcheck(big)
+        self.assertIn("S36", out["fired_ids"])
+        self.assertNotIn("E", {o["id"] for o in out["ok_items"]},
+                         "已经报了库体积问题，就不能同时显示「事件库写入正常」")
+        small = dict(HEALTHY, storage={"db": {"ok": True, "bytes": 5_000_000, "free_bytes": 100,
+                                              "rows": 30, "free_ratio": 0.00002}})
+        self.assertNotIn("S36", sc.run_selfcheck(small)["fired_ids"])
+        self.assertIn("E", {o["id"] for o in sc.run_selfcheck(small)["ok_items"]})
+        broken = dict(HEALTHY, storage={"db": {"ok": False, "error": "OperationalError: locked"}})
+        self.assertNotIn("S36", sc.run_selfcheck(broken)["fired_ids"], "取不到体积时不许下结论")
 
     def test_severity_ordering_and_overall(self):
         ctx = dict(HEALTHY, settings={"fail_closed": False},

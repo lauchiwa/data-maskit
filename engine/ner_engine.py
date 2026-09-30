@@ -39,24 +39,24 @@ _LAST_ERROR = ""
 _INTRA_THREADS = 0
 
 # ── 成本护栏 ──────────────────────────────────────────────────────────────────
-# 单个**识别窗口**的长度上限（字）。超过这个长度的文本不再「整条跳过」，而是
-# 按窗口切分后逐段识别（见 `_extract_long`）——请勿把本常量当成「超长就放弃」的闸。
-#
 # 名字保留 MAX_TEXT_CHARS 是因为它同时是**单次调用**的规模上限（分段粒度），
 # 以及 `tests/measure_ner_coverage.py` 的标定基准。
 #
 # ⚠️ 曾有 2000 字上限，超过就**整条不做 NER**（且只在全局日志里留一行）。实测用户
 # 真实流量里出现过 6208 字的单条正文（会话被拼成一个大字符串），那条里的中文人名
 # 全部明文上行 —— 比总预算更容易咬人，因为它是「整条不认」而不是「后面的不认」。
-# 放到 20000 是一次止血；2026-09-28 起超过 20000 字改为**分段识别**（P1），
-# 「整条跳过」这条路径彻底消失：要么识别完，要么受预算约束只识别前若干段，
-# 且预算用尽会如实记 `budget_exhausted`（不再是无声的 too_long）。
+# 20000 字是一次止血、2026-09-28 起超长改为**分段识别**（「整条跳过」这条路径彻底
+# 消失）；2026-09-30 把段长从 20000 收到 4000，实测（tests/measure_segment_granularity.py）：
 #
-# 为什么必须分段而不是放大上限：单次推理成本随字数线性（0.28ms/字），
-# 一条 5 万字正文单次调用要 14s，会一直占着推理槽位并撞 `CALL_BUDGET_S`；
-# 而分段后每段 ≤20000 字（≈5.6s 冷推理），且每段都进结果缓存 ——
-# 长会话反复重发同一段时第二轮几乎零成本。
-MAX_TEXT_CHARS = 20000
+#   1. **总耗时不变**：窗口总数 = 文本长度 / STRIDE，分段前后一样。20000 字整段冷推，
+#      两种段长都是 3.7~4.3s（顺序敏感，差异在噪声内）。段长只改「粒度」，不改「总量」，
+#      别指望靠调它提速。
+#   2. 收益在**粒度**上：段级缓存变细 —— 客户端每轮重发历史时正文只要有一行变化，
+#      旧粒度整叶重推、新粒度只重推变化的那一段。实测 12000 字正文改 1 个字后的
+#      第二轮：段长 4000 = 778ms，段长 20000 = 2308ms（3.0 倍）。
+#   3. 单段成本从 ≈5.6s 降到 ≈0.5~1.1s（4000 字实测 484ms @4 线程 / 1696ms @1 线程），
+#      deadline 收手也不再整段白扔。
+MAX_TEXT_CHARS = 4000
 # 分段时的相邻重叠字数：实体正好落在切点上时，靠重叠区在**别的段**里被完整识别。
 # 64 字足以覆盖中文人名/机构/地址的最长形态（实测最长实体 <30 字）。
 _LONG_SEG_OVERLAP = 64
@@ -121,6 +121,10 @@ def _env_int(name, default):
         return int(default)
 
 
+# 含汉字判定（编译一次）：整叶早返回与窗口级跳过共用，别在热路径上重复写字符比较。
+_CJK_RX = re.compile("[\u4e00-\u9fff]")
+
+
 # ── B-2：进程级治理器 ────────────────────────────────────────────────────────
 # 为什么需要：每个 InferenceSession 自带 `intra_op_num_threads` 个 ONNX 线程，
 # 多请求并发推理 = 线程数乘性叠加。请求级预算（transparent._ner_req_budget）
@@ -140,7 +144,7 @@ _SEM_STATS = {"inflight": 0, "peak_inflight": 0, "waits": 0,
 _SEM_STATS_LOCK = threading.Lock()
 
 # 令牌桶：限的是"每秒允许花多少毫秒做推理"（时间口径，不是次数口径——
-# 一条 20000 字的文本和一条 20 字的文本成本差 1000 倍，按次数限毫无意义）。
+# 一条 4000 字的文本和一条 4 字的文本成本差 1000 倍，按次数限毫无意义）。
 # 容量 = 每秒补充量，默认取并发数 × 1s 的 75%：把最多 3/4 个核留给推理，
 # 剩下的留给规则扫描、事件循环与其他请求。可用 MASKIT_NER_BUDGET 覆盖。
 _NER_BUDGET_MS_PER_S = max(50, _env_int("MASKIT_NER_BUDGET",
@@ -611,6 +615,17 @@ def _decode_chunks(text: str, deadline: float) -> Tuple[List[Dict], bool]:
         if not chunk:
             break
 
+        # 纯英文/代码窗口直接跳过推理（P0 性能，2026-09-30）：本模型只识中文实体，
+        # 不含汉字的窗口不可能产出中文实体；而 CHUNK_SIZE(400)/STRIDE(350) 有 50 字
+        # 重叠，跨窗口的实体一定会在相邻窗口里被完整看到 —— 跳过不会漏码。
+        # 收益取决于内容形态（实测见 tests/measure_segment_granularity.py）：中文段落越稀疏
+        # 省得越多 —— 每 ~1500 字一段中文时省 74%；中文密到每个窗口都有汉字时基本不省。
+        if _CJK_RX.search(chunk) is None:
+            if pos + CHUNK_SIZE >= text_len:
+                break
+            pos += STRIDE
+            continue
+
         encoded = _TOKENIZER.encode(chunk)
         input_ids = np.array([encoded.ids], dtype=np.int64)
         attention_mask = np.array([encoded.attention_mask], dtype=np.int64)
@@ -721,7 +736,7 @@ def extract_entities(text: str) -> List[Dict]:
     # 纯英文/代码/无汉字文本直接跳过：本引擎基于中文 BERT（OntoNotes 5.0），
     # 仅负责人名 (NAME)、机构 (ORG)、详细地址 (ADDR) 三类中文实体。
     # 纯英文或代码中无中文实体，反而会被 BERT subword 切碎产生误报（如将英文参数误报为人名）。
-    if not any("\u4e00" <= ch <= "\u9fff" for ch in text):
+    if _CJK_RX.search(text) is None:
         return []
 
     # 超长文本 → 分段识别（旧行为是整条跳过并记 too_long，见 MAX_TEXT_CHARS 的注释）。
@@ -755,7 +770,7 @@ def extract_entities(text: str) -> List[Dict]:
     # 顺序不能反：先占槽位再发现没额度，会把槽位白占一会儿，放大排队。
     # ⚠️ 估价必须**夹到桶容量**（0.6.0 修）：桶的容量是"每秒额度"
     # （`_NER_BUDGET_MS_PER_S` = 并发 × 750），而单条长文本的线性估价可以远大于它
-    # （20000 字 ≈ 5600ms）。不夹的话 `_bucket_take` 永远失败 —— 于是超过
+    # （4000 字 ≈ 1100ms @1 线程 / 480ms @4 线程）。不夹的话 `_bucket_take` 永远失败 —— 于是超过
     # 约 2680 字（并发 1）/ 5360 字（并发 2）的文本**永久**进不了语义识别，
     # 而且是"确定性漏码"而不是"负载降级"：用户只看到 global_throttled 计数上涨。
     # 桶的职责是限**速率**，不是限**单条大小**（单条大小由 CALL_BUDGET_S 与
@@ -933,7 +948,7 @@ def _extract_long(text: str) -> List[Dict]:
     只识别前若干段（并记 `budget_exhausted`），不再有「静默的整条跳过」。
 
     为什么不是简单放大 MAX_TEXT_CHARS：单次成本线性（0.28ms/字），5 万字单次要 14s，
-    会长期占着推理槽位并撞 `CALL_BUDGET_S`；分段后每段 ≤20000 字（≈5.6s 冷推理），
+    会长期占着推理槽位并撞 `CALL_BUDGET_S`；分段后每段 ≤MAX_TEXT_CHARS（≈0.5~1.1s），
     且每段单独进缓存 —— 长会话反复重发同一段时第二轮接近零成本。
 
     重叠窗口（`_LONG_SEG_OVERLAP`）保证落在切点上的实体能在相邻段里被完整看到；
