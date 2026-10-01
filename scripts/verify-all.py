@@ -38,6 +38,7 @@ GATES = [
     {"group": "python", "name": "Unit tests", "cwd": ".", "argv": ["{python}", "-m", "unittest", "discover", "-s", "tests"]},
     {"group": "python", "name": "Smoke tests (stream)", "cwd": ".", "argv": ["{python}", "tests/smoke_stream.py"]},
     {"group": "python", "name": "Smoke tests (egress)", "cwd": ".", "argv": ["{python}", "tests/smoke_egress.py"]},
+    {"group": "python", "name": "Smoke tests (transport)", "cwd": ".", "argv": ["{python}", "tests/smoke_transport.py"]},
     # ---- frontend（ci.yml: frontend job，工作目录 frontend/）----
     {"group": "frontend", "name": "Typecheck & build", "cwd": "frontend", "argv": ["{npm}", "run", "build"]},
     {"group": "frontend", "name": "Lint", "cwd": "frontend", "argv": ["{npm}", "run", "lint"]},

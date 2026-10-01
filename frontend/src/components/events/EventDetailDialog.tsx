@@ -58,6 +58,7 @@ function formatDuration(ms?: number | null): string {
 const NER_SKIP_LABELS: Record<string, string> = {
   too_long: 'settings.sw.nerSkipTooLong',
   budget_exhausted: 'settings.sw.nerSkipBudget',
+  cancelled: 'settings.sw.nerSkipCancelled',
   infer_failed: 'settings.sw.nerSkipInfer',
   deadline: 'settings.sw.nerSkipDeadline',
   model_unavailable: 'settings.sw.nerSkipModelUnavailable',
@@ -258,6 +259,30 @@ export function EventDetailDialog({
               />
               <MetaItem k={t('detail.duration')} v={formatDuration(event.total_ms ?? event.upstream_ms ?? event.first_byte_ms)} />
             </div>
+
+            <section className="space-y-2 rounded-lg border bg-muted/20 p-3 text-xs" aria-label={t('transport.title')}>
+              <h3 className="font-medium">{t('transport.title')}</h3>
+              <dl className="grid grid-cols-2 gap-2">
+                {[
+                  [t('transport.phase'), t(`transport.phase.${event.transport?.phase || 'unknown'}`)],
+                  [t('transport.reason'), event.transport?.reason || t('transport.unknown')],
+                  [t('transport.connection'), event.transport?.server_conn_id || t('transport.unknown')],
+                  [t('transport.protocol'), event.transport?.protocol || t('transport.unknown')],
+                  [t('transport.reused'), event.transport?.reused == null ? t('transport.unknown') : t(event.transport.reused ? 'transport.yes' : 'transport.no')],
+                  [t('transport.proxy'), event.transport?.via_proxy == null ? t('transport.unknown') : t(event.transport.via_proxy ? 'transport.yes' : 'transport.no')],
+                  [t('transport.idle'), event.transport?.idle_s == null ? t('transport.unknown') : String(event.transport.idle_s)],
+                  [t('transport.connect'), event.transport?.connect_ms == null ? t('transport.unknown') : formatDuration(event.transport.connect_ms)],
+                  [t('transport.tls'), event.transport?.tls_ms == null ? t('transport.unknown') : formatDuration(event.transport.tls_ms)],
+                  [t('transport.evidence'), event.transport?.evidence_complete == null ? t('transport.unknown') : t(event.transport.evidence_complete ? 'transport.complete' : 'transport.partial')],
+                ].map(([label, value]) => <div key={label} className="min-w-0"><dt className="text-muted-foreground">{label}</dt><dd className="break-all">{value}</dd></div>)}
+              </dl>
+              <p className="text-muted-foreground">{t('transport.caution')}</p>
+              {event.failure_phase && <p>{t('transport.localPhase')}: {event.failure_phase}</p>}
+              {event.upstream_may_have_executed && <p>{t('transport.executed')}</p>}
+            </section>
+            {(event.ner_init_ms != null || event.ner_infer_ms != null || event.ner_budget_wait_ms != null) && (
+              <p className="text-xs text-muted-foreground">{t('detail.nerTiming')}: {[event.ner_init_ms, event.ner_infer_ms, event.ner_budget_wait_ms].map((v) => v == null ? t('transport.unknown') : formatDuration(v)).join(' / ')}</p>
+            )}
 
             {/* 流式信息（stream_actual 与 stream_mode 背离提示） */}
             {event.stream_mode && (

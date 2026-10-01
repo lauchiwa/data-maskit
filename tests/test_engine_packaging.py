@@ -74,6 +74,12 @@ class EngineSpecCoverageTests(unittest.TestCase):
                          "这些引擎模块既没在 hiddenimports 里、也不在任何已列模块的导入链上："
                          "%s（打包态可能缺模块，源码态完全看不出来）" % missing)
 
+    def test_transport_modules_are_shipped_as_source(self):
+        src = self._spec_source()
+        for name in ("connection_policy", "mitm_transport_adapter"):
+            self.assertIn("'" + name + "'", src)
+            self.assertIn("ENGINE_DIR / '" + name + ".py'", src)
+
     def test_selfcheck_is_explicitly_listed(self):
         """`selfcheck` 必须**显式**在 hiddenimports 里（0.6.0 漏过一次）。
 

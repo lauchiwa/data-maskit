@@ -1,0 +1,278 @@
+"""Bounded, local connection evidence and shared policy validation.
+
+An absent policy retains legacy transport behavior. Normalization describes the
+requested defaults; it does NOT claim enforcement. Until P1 passes its transport
+compatibility gate, any explicit policy is rejected by validation. Call validation
+on the original value, before persisting configuration or stopping a live proxy.
+"""
+from __future__ import annotations
+
+from collections import OrderedDict
+import math
+import time
+import uuid
+import weakref
+
+try:
+    from . import mitm_transport_adapter as adapter
+except ImportError:  # Source-side mitmdump loads engine modules as top-level files.
+    import mitm_transport_adapter as adapter
+
+DEFAULT_CONNECTION_POLICY = {
+    "reuse": "default", "idle_ttl_s": None,
+    "connect_timeout_s": 15, "tls_handshake_timeout_s": 20,
+}
+transport_capabilities = adapter.transport_capabilities
+
+
+def normalize_connection_policy(raw) -> dict:
+    if raw is None:
+        return dict(DEFAULT_CONNECTION_POLICY)
+    if not isinstance(raw, dict):
+        raise ValueError("connection_policy must be an object")
+    if set(raw) - set(DEFAULT_CONNECTION_POLICY):
+        raise ValueError("Unknown connection_policy fields")
+    policy = dict(DEFAULT_CONNECTION_POLICY, **raw)
+    if policy["reuse"] not in ("default", "never"):
+        raise ValueError("connection_policy.reuse must be default or never")
+    for key in ("idle_ttl_s", "connect_timeout_s", "tls_handshake_timeout_s"):
+        value = policy[key]
+        if key == "idle_ttl_s" and value is None:
+            continue
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not 1 <= value <= 120 or not math.isfinite(value)):
+            raise ValueError(f"connection_policy.{key} must be a finite number from 1 to 120")
+    return policy
+
+
+def validate_connection_policy(raw, http2: bool = True) -> dict:
+    policy = normalize_connection_policy(raw)
+    if http2 and (policy["reuse"] == "never" or policy["idle_ttl_s"] is not None):
+        raise ValueError("Strict reuse/idle TTL policies require HTTP/2 disabled")
+    if raw is not None:
+        raise ValueError(transport_capabilities()["reason"])
+    return policy
+
+
+class ConnectionGovernance:
+    """Event-loop-owned evidence; no timers, socket closure, retries or body access.
+
+    Connection entries and weak flow records are capped. Evicted/missed evidence
+    becomes unknown, never an inferred fresh/reused connection. Completed flow
+    snapshots live on that flow, not in a global history. Public hooks alone cannot
+    prove selection; the compatible adapter supplies pending and selected events.
+    """
+    def __init__(self, *, max_connections=2048, max_flows=4096, clock=time.monotonic):
+        self._clock = clock
+        self._max_connections = max(1, int(max_connections))
+        self._max_flows = max(1, int(max_flows))
+        self._connections = OrderedDict()
+        self._flows = weakref.WeakKeyDictionary()
+        self._generation = uuid.uuid4().hex[:12]
+        self.observation_errors = 0
+        self._evictions = 0
+        self._finished = 0
+        self._installed = False
+
+    def running(self):
+        self._installed = adapter.install(self)
+        return self._installed
+
+    def done(self):
+        adapter.uninstall(self)
+        self._installed = False
+        self._connections.clear()
+        self._flows.clear()
+
+    def _state(self, conn):
+        key = str(conn.id)
+        if key not in self._connections:
+            if len(self._connections) >= self._max_connections:
+                self._connections.popitem(last=False)
+                self._evictions += 1
+            self._connections[key] = {
+                "phase": "unknown", "reason": None, "start": None,
+                "connect_ms": None, "tls_start": None, "tls_ms": None,
+                "selected": 0, "active": set(), "idle_since": None,
+                "observed_connect": False, "activity_incomplete": False,
+            }
+        self._connections.move_to_end(key)
+        return self._connections[key]
+
+    def request_started(self, flow, upstream=None):
+        if flow in self._flows:
+            return
+        raw = upstream.get("connection_policy") if isinstance(upstream, dict) else None
+        validate_connection_policy(raw)
+        if len(self._flows) >= self._max_flows:
+            # No retained flow object; dropped records degrade evidence only.
+            old = next(iter(self._flows))
+            self._release(self._flows.pop(old), idle=False)
+            self._evictions += 1
+        self._flows[flow] = {
+            "token": uuid.uuid4().hex, "conn": None, "phase": "unknown",
+            "reason": None, "reused": None, "idle_s": None,
+            "selected": False, "started": self._clock(), "protocol": "unknown",
+            "via_proxy": None,
+        }
+        flow.metadata.pop("_maskit_transport", None)
+
+    def connection_pending(self, flow, conn):
+        record = self._flows.get(flow)
+        if record is not None and not record["selected"]:
+            record["conn"] = str(conn.id)
+            record["phase"] = "connecting"
+            record["via_proxy"] = bool(conn.via)
+            self._state(conn)
+
+    def connection_selected(self, flow, conn):
+        record = self._flows.get(flow)
+        state = self._state(conn)
+        if record is None:
+            # Other requests may share this pool even if the parent does not
+            # govern them. Count their actual selection; their activity is unknown.
+            state["selected"] += 1
+            state["activity_incomplete"] = True
+            return
+        if record["selected"]:
+            return
+        record.update(conn=str(conn.id), phase="awaiting_response", selected=True,
+                      reused=True if state["selected"] else (False if state["observed_connect"] else None),
+                      via_proxy=bool(conn.via))
+        if state["selected"] and not state["active"] and not state["activity_incomplete"] and state["idle_since"] is not None:
+            record["idle_s"] = max(0, self._clock() - state["idle_since"])
+        state["selected"] += 1
+        state["active"].add(record["token"])
+        owner = weakref.ref(self)
+        conn_id, token = record["conn"], record["token"]
+
+        def abandoned(_):
+            governance = owner()
+            if governance is not None:
+                current = governance._connections.get(conn_id)
+                if current is not None and token in current["active"]:
+                    current["active"].discard(token)
+                    current["activity_incomplete"] = True
+                    current["idle_since"] = None
+
+        record["flow_ref"] = weakref.ref(flow, abandoned)
+        state["idle_since"] = None
+        # Bound active identifiers even when a caller drops a flow without error().
+        if len(state["active"]) > self._max_flows:
+            state["active"].clear()
+            state["idle_since"] = None
+            state["observed_connect"] = False
+            state["activity_incomplete"] = True
+        record["protocol"] = {b"h2": "HTTP/2", b"http/1.1": "HTTP/1.1"}.get(conn.alpn, "unknown")
+
+    def connection_selection_failed(self, flow):
+        record = self._flows.get(flow)
+        if record is not None:
+            record["reason"] = "connection_selection_failed"
+
+    def _hook(self, conn, phase, reason=None):
+        state = self._state(conn)
+        state.update(phase=phase, reason=reason)
+        return state
+
+    def server_connect(self, data):
+        state = self._hook(data.server, "connecting")
+        state.update(start=self._clock(), observed_connect=True)
+
+    def server_connected(self, data):
+        state = self._hook(data.server, "tcp_connected")
+        if state["start"] is not None:
+            state["connect_ms"] = max(0, self._clock() - state["start"]) * 1000
+
+    def server_connect_error(self, data):
+        self._hook(data.server, "connecting", "connect_failed")
+
+    def server_disconnected(self, data):
+        state = self._state(data.server)
+        # Preserve the last failure stage rather than replacing TLS with closed.
+        if state["reason"] is None:
+            state["reason"] = "server_disconnected"
+        state["idle_since"] = None
+
+    def tls_start_server(self, data):
+        self._hook(data.conn, "tls_handshake")["tls_start"] = self._clock()
+
+    def tls_established_server(self, data):
+        state = self._hook(data.conn, "tls_established")
+        if state["tls_start"] is not None:
+            state["tls_ms"] = max(0, self._clock() - state["tls_start"]) * 1000
+
+    def tls_failed_server(self, data):
+        self._hook(data.conn, "tls_handshake", "tls_failed")
+
+    def responseheaders(self, flow):
+        record = self._flows.get(flow)
+        if record is not None:
+            record["phase"] = "response_stream"
+            protocol = getattr(flow.response, "http_version", "unknown")
+            if protocol in ("HTTP/1.0", "HTTP/1.1", "HTTP/2", "HTTP/3"):
+                record["protocol"] = protocol
+
+    def _release(self, record, *, idle=True):
+        state = self._connections.get(record["conn"])
+        if state is not None:
+            state["active"].discard(record["token"])
+            if not idle:
+                state["activity_incomplete"] = True
+            if idle and record["selected"] and not state["active"] and not state["activity_incomplete"]:
+                state["idle_since"] = self._clock()
+
+    def _finish(self, flow, failed):
+        record = self._flows.get(flow)
+        if record is None:
+            return
+        evidence = self.snapshot(flow)
+        if failed:
+            evidence["reason"] = evidence["reason"] or "request_failed"
+        else:
+            evidence["phase"] = "complete"
+        flow.metadata["_maskit_transport"] = evidence
+        self._release(record)
+        del self._flows[flow]
+        self._finished += 1
+
+    def response_complete(self, flow):
+        self._finish(flow, False)
+
+    def error(self, flow):
+        self._finish(flow, True)
+
+    def snapshot(self, flow) -> dict:
+        record = self._flows.get(flow)
+        if record is None:
+            return dict(flow.metadata.get("_maskit_transport", self._empty()))
+        state = self._connections.get(record["conn"])
+        result = self._empty()
+        result.update(phase=record["phase"], reason=record["reason"], reused=record["reused"],
+                      idle_s=record["idle_s"], protocol=record["protocol"], via_proxy=record["via_proxy"])
+        if record["conn"] is not None:
+            # conn.id is generated locally by mitmproxy, not a remote address.
+            result["server_conn_id"] = self._generation + ":" + record["conn"][:64]
+        if state is not None:
+            result.update(connect_ms=state["connect_ms"], tls_ms=state["tls_ms"])
+            if not record["selected"]:
+                result["phase"] = state["phase"]
+            result["reason"] = state["reason"] or result["reason"]
+        result["evidence_complete"] = bool(record["selected"] and state is not None and record["reused"] is not None)
+        return result
+
+    @staticmethod
+    def _empty():
+        return {"phase": "unknown", "reason": None, "server_conn_id": None,
+                "reused": None, "idle_s": None, "connect_ms": None, "tls_ms": None,
+                "protocol": "unknown", "via_proxy": None, "evidence_complete": False,
+                "request_written": None}
+
+    def stats(self) -> dict:
+        now = self._clock()
+        oldest = max((now - r["started"] for r in self._flows.values()), default=0)
+        return {"connections": len(self._connections), "inflight": len(self._flows),
+                "finished": self._finished, "evictions": self._evictions,
+                "observation_errors": self.observation_errors, "timers": 0,
+                "oldest_request_age_s": max(0, oldest),
+                "observation_installed": self._installed, "capabilities": transport_capabilities()}

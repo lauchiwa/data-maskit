@@ -5,6 +5,9 @@
 ## [Unreleased]
 
 ### 修复
+- 引擎：NER 请求预算过期不再续期，取消与等待不再额外开启推理窗口。
+- 引擎：响应任务采用有界准入与独立快照，修复超时后迟到结果、会话清理和内存保护失效。
+- 面板：统一 HTTP/2 缺省为关闭，保留用户明确选择，避免模板与运行配置口径不一致。
 - 引擎：自定义词表里的 `re:` 词不再能拖垮整张词表（一个词编译失败曾让自定义词与内置词组一起静默失效）。
 - 引擎：无汉字的识别窗口不再送入语义模型，稀疏中文正文的识别耗时降约 74%（实测）。
 - 面板：日志列表标注 5xx 来源（上游返回 / 网关拦截 / 代理未运行），上游 503 不再被误读成网关故障。
@@ -14,12 +17,16 @@
 - 引擎：事件库在保留策略执行后按需回收死空间（实测 237.5MB → 159MB）。
 
 ### 新增
+- 诊断：记录真实连接选择与 TLS 阶段，增加本地心跳及 NER 等待指标，避免将无响应一律归因于上游。
 - 自检：新增 S35（敏感词表未生效）与 S36（事件库死空间未回收）。
 - 面板：`/api/status` 外发词表生效口径（配置词数 / 引擎生效词数 / 问题清单）。
 
 ---
 
 ### Fixed
+- Engine: expired NER request budgets no longer renew, and cancellation or waiting cannot grant extra inference windows.
+- Engine: bounded response admission and isolated snapshots prevent late results, session cleanup errors, and bypassed memory limits.
+- Panel: default HTTP/2 consistently to off while preserving explicit choices, avoiding drift between templates and runtime configuration.
 - Engine: one broken `re:` word can no longer take down the whole word table (a single bad pattern silently disabled custom and built-in groups together).
 - Engine: recognition windows without CJK characters are no longer sent to the semantic model — ~74% less inference time on sparsely-Chinese content (measured).
 - Panel: the log list now labels the origin of 5xx (upstream / gateway block / proxy stopped); an upstream 503 is no longer misread as a gateway failure.
@@ -29,6 +36,7 @@
 - Engine: the event DB reclaims dead space after the retention pass (measured 237.5MB -> 159MB).
 
 ### Added
+- Diagnostics: record actual connection selection and TLS phases, with local heartbeat and NER wait metrics instead of assuming every missing response is an upstream failure.
 - Self-check: new S35 (sensitive words not taking effect) and S36 (event DB dead space).
 - Panel: `/api/status` now exposes word-table effect counts (configured / engine-active / issues).
 

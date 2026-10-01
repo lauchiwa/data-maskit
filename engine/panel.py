@@ -718,7 +718,9 @@ _TAIL_KEEP_FIELDS = {
     #   · client_app：tail 通道的「上游」列取的正是 upstream || client_app，
     #     原本没收它 —— 于是 tail 里那一列**一直是空的**，排查时分不清是谁发的。
     #     顺手一起补，二者都不含正文/占位符/原文。
-    "ingress", "client_app",
+    "ingress", "client_app", "transport",
+    "failure_phase", "upstream_may_have_executed",
+    "ner_init_ms", "ner_infer_ms", "ner_budget_wait_ms", "ner_calls", "ner_windows", "ner_cache_hits", "ner_cache_misses",
 }
 # tail 通道的双上限（P1，修面板 MemoryError）。
 # 为什么要限：`/api/logs` 是前端**轮询**接口（日志页与首页都调），而 tail 是
@@ -730,6 +732,27 @@ _TAIL_KEEP_FIELDS = {
 _TAIL_MAX_LINES = 80
 _TAIL_MAX_VALUE_CHARS = 600
 _TAIL_MAX_ITEMS = 12
+
+
+def _project_transport(raw):
+    """Bounded metadata only: never export raw connection objects or endpoints."""
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key in ("phase", "reason", "server_conn_id", "protocol", "evidence"):
+        value = raw.get(key)
+        if isinstance(value, str):
+            out[key] = _scrub_text(value, 160)
+        elif key in raw and value is None:
+            out[key] = None
+    for key in ("reused", "via_proxy", "evidence_complete", "request_written"):
+        if key in raw and (raw[key] is None or isinstance(raw[key], bool)):
+            out[key] = raw[key]
+    for key in ("idle_s", "connect_ms", "tls_ms"):
+        value = raw.get(key)
+        if key in raw and (value is None or (type(value) in (int, float) and math.isfinite(value) and value >= 0)):
+            out[key] = value
+    return out
 
 
 def _tail_line_sanitize(line: str) -> str:
@@ -753,7 +776,7 @@ def _tail_line_sanitize(line: str) -> str:
         # 单值长度上限：这个通道是轮询的，一条超大 msg 就是一次无上限分配。
         if isinstance(v, str) and len(v) > _TAIL_MAX_VALUE_CHARS:
             v = v[:_TAIL_MAX_VALUE_CHARS] + "…"
-        keep[k] = v
+        keep[k] = _project_transport(v) if k == "transport" else v
     its = data.get("items")
     if isinstance(its, list):
         keep["items"] = [
@@ -2839,7 +2862,7 @@ def _start_proxy_locked():
         domains = enabled_domains(cfg)
         if not domains:
             return False, "未配置启用的目标域名"
-    use_h2 = "true" if cfg.get("http2", True) else "false"
+    use_h2 = "true" if cfg.get("http2", False) else "false"
     up = detect_upstream() if capture_mode == "explicit" else ""
     args = _mitmdump_argv0() + ["-s", str(_BUNDLE_ROOT / "transparent.py")]
     if capture_mode == "local":
@@ -3747,6 +3770,27 @@ def _regex_backtrack_risk(body):
     return m.group(0)[:40] if m else ""
 
 
+def _connection_capabilities():
+    """Read-only capability report; never imply unsupported controls are active."""
+    try:
+        from connection_policy import transport_capabilities
+        caps = transport_capabilities()
+        return {k: caps[k] for k in ("supported", "version", "reason", "deadlines",
+                                    "http1_reuse_policy") if k in caps}
+    except ImportError:
+        return {"supported": False, "deadlines": False, "http1_reuse_policy": False,
+                "version": "unknown", "reason": "connection_policy_unavailable"}
+
+
+def _validate_upstream_connection_policy(raw, http2):
+    # Missing policies stay missing: descriptive defaults must not enable new timers.
+    try:
+        from connection_policy import validate_connection_policy
+    except ImportError as exc:
+        raise ValueError("Connection policy unavailable / 当前版本不支持连接策略") from exc
+    return validate_connection_policy(raw, http2=http2)
+
+
 def normalize_config(raw, warnings=None):
     """校验并规整配置。
 
@@ -3996,9 +4040,13 @@ def normalize_config(raw, warnings=None):
                     if len(vv) > 2048:
                         continue
                     extra_headers[kk] = vv
-            ups.append({"name": name, "base_path": base_path, "port": port, "target": target,
+            upstream = {"name": name, "base_path": base_path, "port": port, "target": target,
                         "paths": paths_u, "use_proxy": bool(u.get("use_proxy")),
-                        "extra_headers": extra_headers})
+                        "extra_headers": extra_headers}
+            if "connection_policy" in u and u["connection_policy"] is not None:
+                upstream["connection_policy"] = _validate_upstream_connection_policy(
+                    u["connection_policy"], http2=bool(raw.get("http2", False)))
+            ups.append(upstream)
     if not ups:
         ups = list(DEFAULT_UPSTREAMS)
 
@@ -4069,7 +4117,7 @@ def normalize_config(raw, warnings=None):
         "debug": bool(raw.get("debug", False)),
         "diagnostic_unmatched": bool(raw.get("diagnostic_unmatched", False)),
         "session_ttl": ttl,
-        "http2": bool(raw.get("http2", True)),
+        "http2": bool(raw.get("http2", False)),
         "upstreams": ups,
         "filter_enabled": bool(raw.get("filter_enabled", True)),
         "fail_closed": bool(raw.get("fail_closed", True)),
@@ -4668,6 +4716,7 @@ def api_get_config():
         "_meta": {
             "builtin_rule_meta": BUILTIN_RULE_META,
             "version": __version__,
+            "transport_capabilities": _connection_capabilities(),
         },
     })
 
@@ -4855,6 +4904,10 @@ def _apply_config_patch(cfg, key, op, path, value, match=None):
             raise ValueError("list_upsert 的条目必须包含非空字符串 name")
         for i, item in enumerate(node):
             if isinstance(item, dict) and item.get("name") == target_name:
+                # Older forms replace the whole upstream. Preserve this new field on
+                # omission, including rename; explicit null intentionally resets it.
+                if key == "upstreams" and not path and "connection_policy" not in value and "connection_policy" in item:
+                    value = dict(value, connection_policy=item["connection_policy"])
                 node[i] = value
                 break
         else:
@@ -6149,7 +6202,9 @@ def api_logs_export():
     # 正文类字段一律剔除，只保留元数据 + 打码 items。
     _EXPORT_KEEP_FIELDS = {
         "ts", "type", "sid", "host", "method", "path",
-        "upstream", "model", "stream_mode", "stream_actual",
+        "upstream", "model", "stream_mode", "stream_actual", "transport",
+        "failure_phase", "upstream_may_have_executed",
+        "ner_init_ms", "ner_infer_ms", "ner_budget_wait_ms", "ner_calls", "ner_windows", "ner_cache_hits", "ner_cache_misses",
         "count", "restored", "status", "http_status",
         "mask_ms", "resp_ts", "first_byte_ms", "upstream_ms", "total_ms", "bytes", "usage", "cost_usd", "seq", "reason", "msg",
         # ---- 0.6.0 新增的归因字段 ----
@@ -6169,6 +6224,8 @@ def api_logs_export():
     clean = []
     for e in ev:
         item = {k: v for k, v in e.items() if k in _EXPORT_KEEP_FIELDS}
+        if "transport" in item:
+            item["transport"] = _project_transport(item["transport"])
         # msg/reason 承载异常文本或引擎提示，异常消息理论上可能回显请求片段：
         # 与诊断包口径一致过 _scrub_text 打码，避免导出文件残留明文形态
         for _k in ("msg", "reason"):
@@ -8129,6 +8186,25 @@ def _project_engine_metrics(eng):
         "aux_pool": eng.get("aux_pool") or {},
         "audit": eng.get("audit") or {},
     }
+    for section, keys in {
+        "heartbeat": ("generated_at", "loop_lag_ms"),
+        "transport": ("connections", "inflight", "finished", "evictions", "observation_errors",
+                      "timers", "oldest_request_age_s", "observation_installed"),
+    }.items():
+        raw = eng.get(section)
+        if isinstance(raw, dict):
+            out[section] = {k: raw[k] for k in keys if k in raw and
+                            (raw[k] is None or isinstance(raw[k], bool) or
+                             (type(raw[k]) in (int, float) and math.isfinite(raw[k])))}
+            if section == "transport" and isinstance(raw.get("capabilities"), dict):
+                caps = raw["capabilities"]
+                out[section]["capabilities"] = {
+                    k: (_scrub_text(v, 160) if isinstance(v, str) else v)
+                    for k, v in caps.items()
+                    if k in ("supported", "version", "reason", "deadlines", "http1_reuse_policy",
+                             "observation", "observation_reason") and
+                    (v is None or isinstance(v, (str, bool)))
+                }
     ner = eng.get("ner") if isinstance(eng.get("ner"), dict) else {}
     out["ner"] = {
         "enabled": bool(ner.get("enabled")),
@@ -8356,7 +8432,9 @@ def _diagnostics_payload(error_limit=60):
         bad = {"ERR", "BLOCK", "DNS_ERROR", "SCAN_WARN"}
         keep = ("ts", "type", "sid", "host", "path", "method", "status", "http_status",
                 "stream_mode", "stream_actual", "reason", "count", "restored",
-                "mask_ms", "total_ms",
+                "mask_ms", "total_ms", "transport",
+                "failure_phase", "upstream_may_have_executed",
+                "ner_init_ms", "ner_infer_ms", "ner_budget_wait_ms", "ner_calls", "ner_windows", "ner_cache_hits", "ner_cache_misses",
                 # 诊断包同样要能看出 503 来源与降级原因（0.6.0）
                 "block_source", "degraded", "stream_degraded_reason", "upstream_ms",
                 "engine_queue_depth", "engine_queue_bytes", "engine_busy", "queue_wait_ms",
@@ -8367,6 +8445,8 @@ def _diagnostics_payload(error_limit=60):
             if e.get("type") not in bad and int(e.get("http_status") or 0) < 400:
                 continue
             row = {k: e[k] for k in keep if k in e}
+            if "transport" in row:
+                row["transport"] = _project_transport(row["transport"])
             row["msg"] = _scrub_text(e.get("msg") or "", 500)
             row["rules"] = sorted({str(i.get("label")) for i in (e.get("items") or [])
                                    if isinstance(i, dict) and i.get("label")})

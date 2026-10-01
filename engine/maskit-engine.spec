@@ -31,6 +31,8 @@ hiddenimports = (
         'shield_defaults',
         'event_store',
         'transparent',
+        'connection_policy',
+        'mitm_transport_adapter',
         'panel',
         'credential_labels',
         'audit_signals',
@@ -68,6 +70,8 @@ datas = (
     # 它在自己的模块空间里 import 下面几个，靠 PYTHONPATH 指向 _BUNDLE_ROOT 才找得到，
     # 打进 PYZ 它够不着。代价是引擎规则对用户可见——这是架构决定的，改不了。
     + [(str(ENGINE_DIR / 'transparent.py'), '.')
+       , (str(ENGINE_DIR / 'connection_policy.py'), '.')
+       , (str(ENGINE_DIR / 'mitm_transport_adapter.py'), '.')
        , (str(ENGINE_DIR / 'shield_defaults.py'), '.')
        , (str(ENGINE_DIR / 'event_store.py'), '.')
        , (str(ENGINE_DIR / 'audit_signals.py'), '.')

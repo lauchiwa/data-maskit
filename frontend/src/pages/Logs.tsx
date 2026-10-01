@@ -803,6 +803,7 @@ export default function LogsPage() {
                       200
                     </Badge>
                   ) : '—'}
+                  {'transport' in row && row.transport && <span className="max-w-[6.5rem] truncate text-[9px] text-muted-foreground" title={t('transport.caution')}>{t(`transport.phase.${row.transport.phase || 'unknown'}`)}</span>}
                 </span>
                 {/* 耗时：合并行取整链路(RESTORE)，MASK 单行(未还原/阻断)取脱敏管线耗时 */}
                 <span className="text-right tabular-nums text-[11px] text-muted-foreground">

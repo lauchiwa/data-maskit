@@ -7349,11 +7349,13 @@ class MaskOffloadTests(unittest.TestCase):
         """
         import ner_engine
         seen = []
+        contexts = []
         real = ner_engine.begin_budget
 
-        def spy(seconds):
+        def spy(seconds, **kwargs):
             seen.append(seconds)
-            return real(seconds)
+            contexts.append(kwargs)
+            return real(seconds, **kwargs)
 
         flow = self._flow({"model": "gpt-4o-mini",
                            "messages": [{"role": "user", "content": "张三"}]})
@@ -7362,6 +7364,9 @@ class MaskOffloadTests(unittest.TestCase):
             self._drive(flow)
         self.assertEqual(seen, [tr._ner_req_budget(raw_len)],
                          "代理链路的 NER 总预算没打开或值与体积不匹配")
+        self.assertIsInstance(contexts[0]["deadline"], float)
+        self.assertIsInstance(contexts[0]["cancel_event"], threading.Event)
+        self.assertIsNone(flow.response, "正常请求不应被预算接线阻断")
 
     def test_ner_budget_is_capped_for_the_client_timeout(self):
         """预算按体积伸缩、有上下界，且**默认上限不得大到撞客户端超时**（P0-a）。

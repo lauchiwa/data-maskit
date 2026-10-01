@@ -12,6 +12,36 @@ export interface UpstreamStatus {
   target: string
 }
 
+export interface ConnectionPolicy {
+  reuse: 'default' | 'never'
+  idle_ttl_s: number | null
+  connect_timeout_s: number
+  tls_handshake_timeout_s: number
+}
+
+export interface TransportCapabilities {
+  supported?: boolean
+  deadlines?: boolean
+  http1_reuse_policy?: boolean
+  version?: string
+  reason?: string
+}
+
+export interface TransportEvidence {
+  phase?: string
+  reason?: string | null
+  server_conn_id?: string | null
+  reused?: boolean | null
+  idle_s?: number | null
+  connect_ms?: number | null
+  tls_ms?: number | null
+  protocol?: string
+  via_proxy?: boolean | null
+  evidence?: string
+  evidence_complete?: boolean | null
+  request_written?: boolean | null
+}
+
 export interface UpstreamConfig {
   name: string
   port: number
@@ -21,6 +51,7 @@ export interface UpstreamConfig {
   api_key_header?: string
   extra_headers?: Record<string, string>
   use_proxy?: boolean
+  connection_policy?: ConnectionPolicy | null
 }
 
 export interface EgressProxy {
@@ -139,6 +170,15 @@ export interface EventItem extends SlimItem {
 }
 
 export interface ShieldEvent {
+  transport?: TransportEvidence
+  failure_phase?: string
+  upstream_may_have_executed?: boolean
+  ner_init_ms?: number
+  ner_infer_ms?: number
+  ner_budget_wait_ms?: number
+  ner_calls?: number
+  ner_cache_hits?: number
+  ner_cache_misses?: number
   id: number
   /** epoch 秒 */
   ts: number
@@ -376,6 +416,7 @@ export interface ShieldConfig {
   audit?: Record<string, unknown>
   _meta?: {
     builtin_rule_meta: Record<string, unknown>
+    transport_capabilities?: TransportCapabilities
     version: string
   }
   [key: string]: unknown
