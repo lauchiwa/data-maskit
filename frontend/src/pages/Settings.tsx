@@ -40,7 +40,7 @@ import { getConfig, saveConfig, saveBuiltinRules, patchConfig, testUpstream, ope
 import { runAudit, cancelAudit, getAuditJob, getAuditReport } from '@/api/audit'
 import { getStatus } from '@/api/proxy'
 import { useMutation } from '@tanstack/react-query'
-import type { ShieldConfig, UpstreamConfig } from '@/types/api'
+import type { ShieldConfig, UpstreamConfig, TransportCapabilities } from '@/types/api'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { runSelfCheck, saveDiagnostics, type SelfCheckResult } from '@/api/diagnostics'
@@ -180,6 +180,7 @@ const isCredentialHeader = (k: string) => CREDENTIAL_HEADER_NAMES.has(k.trim().t
 const NER_SKIP_ITEMS: { key: string; labelKey: string }[] = [
   { key: 'too_long', labelKey: 'settings.sw.nerSkipTooLong' },
   { key: 'budget_exhausted', labelKey: 'settings.sw.nerSkipBudget' },
+  { key: 'cancelled', labelKey: 'settings.sw.nerSkipCancelled' },
   { key: 'infer_failed', labelKey: 'settings.sw.nerSkipInfer' },
   { key: 'deadline', labelKey: 'settings.sw.nerSkipDeadline' },
   { key: 'model_unavailable', labelKey: 'settings.sw.nerSkipModelUnavailable' },
@@ -211,6 +212,8 @@ function UpstreamForm({
   captureMode,
   egressProxy,
   onGoToEgress,
+  http2,
+  transportCapabilities,
 }: {
   initial: UpstreamConfig
   onSave: (u: UpstreamConfig) => void
@@ -218,6 +221,8 @@ function UpstreamForm({
   captureMode: string
   egressProxy?: { enabled?: boolean; url?: string }
   onGoToEgress?: () => void
+  http2: boolean
+  transportCapabilities?: TransportCapabilities
 }) {
   const [form, setForm] = useState<UpstreamConfig>({ ...initial })
   const set = (k: keyof UpstreamConfig, v: unknown) => setForm((f) => ({ ...f, [k]: v }))
@@ -227,6 +232,10 @@ function UpstreamForm({
   const [newHeaderVal, setNewHeaderVal] = useState('')
   const { t, tf } = useI18n()
   const extraHeaders = form.extra_headers ?? {}
+  const policy = form.connection_policy ?? { reuse: 'default', idle_ttl_s: null, connect_timeout_s: 15, tls_handshake_timeout_s: 20 }
+  const deadlinesAvailable = transportCapabilities?.deadlines === true
+  const reuseAvailable = transportCapabilities?.http1_reuse_policy === true && !http2
+  const setPolicy = (patch: Partial<typeof policy>) => set('connection_policy', { ...policy, ...patch })
   // 「注入请求头」是可选的高级覆盖入口，默认收起——请求头本来就原样透传，不需要用户做任何事。
   // 但已有配置（含历史遗留的占位符行）必须默认展开，否则用户看不到问题行、也删不掉。
   // 受控 + onToggle 回写：初始值由 lazy initializer 一次性算出（不依赖 effect 时机，弹窗在
@@ -433,6 +442,32 @@ function UpstreamForm({
                   onChange={(model_rules) => set('model_rules', model_rules)}
                 />
               </div>
+            </div>
+          </details>
+
+          <details className="rounded-lg border border-border/60 bg-muted/20 p-2.5">
+            <summary className="cursor-pointer text-xs">{t('connection.policy')}</summary>
+            <div className="mt-2 space-y-2 text-xs">
+              <p className="text-muted-foreground">{t('connection.policyHint')}</p>
+              {!deadlinesAvailable && <p role="status" className="text-muted-foreground">{t('connection.unavailable')}</p>}
+              {http2 && <p className="text-muted-foreground">{t('connection.h1Only')}</p>}
+              <Label htmlFor="connection-reuse">{t('connection.reuse')}</Label>
+              <Select value={policy.reuse} disabled={!reuseAvailable} onValueChange={(v) => setPolicy({ reuse: v as 'default' | 'never' })}>
+                <SelectTrigger id="connection-reuse" className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="default">{t('connection.defaultReuse')}</SelectItem>
+                  <SelectItem value="never">{t('connection.neverReuse')}</SelectItem>
+                </SelectContent>
+              </Select>
+              <div className="grid grid-cols-3 gap-2">
+                <div><Label htmlFor="connection-idle">{t('connection.idleTtl')}</Label>
+                  <Input id="connection-idle" className="mt-1 h-8 text-xs" type="number" min="0.001" step="any" disabled={!reuseAvailable} value={policy.idle_ttl_s ?? ''} placeholder={t('connection.unchanged')} onChange={(e) => setPolicy({ idle_ttl_s: e.target.value === '' ? null : Number(e.target.value) })} /></div>
+                <div><Label htmlFor="connection-connect">{t('connection.connectBudget')}</Label>
+                  <Input id="connection-connect" className="mt-1 h-8 text-xs" type="number" min="1" max="120" disabled={!deadlinesAvailable} value={form.connection_policy?.connect_timeout_s ?? ''} placeholder={t('connection.unenforced')} onChange={(e) => setPolicy({ connect_timeout_s: Number(e.target.value) })} /></div>
+                <div><Label htmlFor="connection-tls">{t('connection.tlsBudget')}</Label>
+                  <Input id="connection-tls" className="mt-1 h-8 text-xs" type="number" min="1" max="120" disabled={!deadlinesAvailable} value={form.connection_policy?.tls_handshake_timeout_s ?? ''} placeholder={t('connection.unenforced')} onChange={(e) => setPolicy({ tls_handshake_timeout_s: Number(e.target.value) })} /></div>
+              </div>
+              {form.connection_policy && <Button size="sm" variant="outline" onClick={() => set('connection_policy', null)}>{t('connection.reset')}</Button>}
             </div>
           </details>
 
@@ -1131,6 +1166,12 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
         </span>
       </div>
 
+      {!!cfg?._meta?.warnings?.length && (
+        <div role="alert" className="space-y-1 rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
+          {cfg._meta.warnings.map((warning, index) => <p key={index}>{warning}</p>)}
+        </div>
+      )}
+
       {/* embeddedTab（独立页模式）：隐藏 tab 栏，只渲染对应内容；URL 保持 /words /clients */}
       <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
         {!embeddedTab && (
@@ -1419,6 +1460,29 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
             </div>
           </div>
 
+          {/* 词表未生效告警（引擎侧外发）：整表失效时面板原本完全看不出来 ——
+              词库显示得好好的、代理照常 200，只是所有词都不命中。见 S35 自检项。 */}
+          {(() => {
+            const w = status?.words
+            const bad = Object.entries(w?.issues ?? {})
+            const emptyTable = !w?.engine_stale && (w?.configured ?? 0) > 0 && w?.engine_count === 0
+            if (!bad.length && !emptyTable) return null
+            return (
+              <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] leading-snug text-amber-700 dark:text-amber-300">
+                <div className="font-medium">
+                  {tf('settings.words.tableIssues', { n: bad.length || (w?.configured ?? 0) })}
+                </div>
+                {bad.length > 0 && (
+                  <ul className="mt-1 list-disc space-y-0.5 pl-4 font-mono">
+                    {bad.slice(0, 5).map(([word, why]) => (
+                      <li key={word}>{word} — {why}</li>
+                    ))}
+                  </ul>
+                )}
+                <div className="mt-1 text-muted-foreground">{t('settings.words.tableIssuesHint')}</div>
+              </div>
+            )
+          })()}
           {/* 分类词表：卡片式（每分类一张卡，网格布局） */}
           <div className="rounded-lg border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
             {t('settings.words.regexHint').split('{n}')[0]}<code className="font-mono">re:</code>{t('settings.words.regexHint').split('{n}').slice(1).join('{n}')}
@@ -2367,7 +2431,7 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                 <SettingToggle label={t('settings.advanced.unmatched')} desc={t('settings.advanced.unmatchedDesc')} checked={!!cfg?.diagnostic_unmatched} onChange={(v) => save({ diagnostic_unmatched: v })} />
               </div>
               <div className="[&>label]:min-h-[52px]">
-                <SettingToggle label="HTTP/2" desc={t('settings.advanced.http2Desc')} checked={cfg?.http2 !== false} onChange={(v) => save({ http2: v }, t('settings.toast.http2Saved'))} />
+                <SettingToggle label="HTTP/2" desc={t('settings.advanced.http2Desc')} checked={cfg?.http2 === true} onChange={(v) => save({ http2: v }, t('settings.toast.http2Saved'))} />
               </div>
             </CardContent>
           </Card>
@@ -2814,6 +2878,8 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
 
       {(editing || adding) && (
         <UpstreamForm
+          http2={cfg?.http2 === true}
+          transportCapabilities={cfg?._meta?.transport_capabilities}
           initial={editing ?? { name: '', port: nextPort, target: '', use_proxy: false, paths: ['/v1'], base_path: '' }}
           onSave={onSaveUpstream}
           onClose={() => { setEditing(null); setAdding(false) }}

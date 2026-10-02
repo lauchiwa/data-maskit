@@ -20,7 +20,7 @@ __version__ = '0.103.0'
 # 与 __version__ 分开维护：__version__ 是**本分支自己**的发布序号（0.10x.x 段，
 # 与上游 0.x.x 永不相撞，更新检查按段比较恒判定为更新），这里记录血缘基线。
 # 每次合并上游 tag 后同步改这一行；只读元数据，不参与任何版本比较。
-__upstream_base__ = '0.6.2'
+__upstream_base__ = '0.7.0'
 import json
 import codecs
 import copy
@@ -723,7 +723,10 @@ _TAIL_KEEP_FIELDS = {
     #   · client_app：tail 通道的「上游」列取的正是 upstream || client_app，
     #     原本没收它 —— 于是 tail 里那一列**一直是空的**，排查时分不清是谁发的。
     #     顺手一起补，二者都不含正文/占位符/原文。
-    "ingress", "client_app",
+    "ingress", "client_app", "transport",
+    "failure_phase", "upstream_may_have_executed",
+    "ner_init_ms", "ner_infer_ms", "ner_budget_wait_ms", "ner_calls", "ner_windows", "ner_cache_hits", "ner_cache_misses",
+    "ner_global_throttled", "ner_sem_wait_ms",
 }
 # tail 通道的双上限（P1，修面板 MemoryError）。
 # 为什么要限：`/api/logs` 是前端**轮询**接口（日志页与首页都调），而 tail 是
@@ -735,6 +738,27 @@ _TAIL_KEEP_FIELDS = {
 _TAIL_MAX_LINES = 80
 _TAIL_MAX_VALUE_CHARS = 600
 _TAIL_MAX_ITEMS = 12
+
+
+def _project_transport(raw):
+    """Bounded metadata only: never export raw connection objects or endpoints."""
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key in ("phase", "reason", "server_conn_id", "protocol", "evidence"):
+        value = raw.get(key)
+        if isinstance(value, str):
+            out[key] = _scrub_text(value, 160)
+        elif key in raw and value is None:
+            out[key] = None
+    for key in ("reused", "via_proxy", "evidence_complete", "request_written"):
+        if key in raw and (raw[key] is None or isinstance(raw[key], bool)):
+            out[key] = raw[key]
+    for key in ("idle_s", "connect_ms", "tls_ms"):
+        value = raw.get(key)
+        if key in raw and (value is None or (type(value) in (int, float) and math.isfinite(value) and value >= 0)):
+            out[key] = value
+    return out
 
 
 def _tail_line_sanitize(line: str) -> str:
@@ -758,7 +782,7 @@ def _tail_line_sanitize(line: str) -> str:
         # 单值长度上限：这个通道是轮询的，一条超大 msg 就是一次无上限分配。
         if isinstance(v, str) and len(v) > _TAIL_MAX_VALUE_CHARS:
             v = v[:_TAIL_MAX_VALUE_CHARS] + "…"
-        keep[k] = v
+        keep[k] = _project_transport(v) if k == "transport" else v
     its = data.get("items")
     if isinstance(its, list):
         keep["items"] = [
@@ -782,6 +806,15 @@ def prune_event_log(now=None, retention_days=None):
         try:
             from event_store import prune_audit_events
             prune_audit_events(now=now, retention_days=retention_days)
+        except Exception:
+            pass
+        # 删了行不等于文件变小（SQLite 只把页放进 freelist）：达到阈值时压一次，
+        # 阈值与失败退避都在 event_store.reclaim_space 里（拿不到写锁就放弃，下轮再来）。
+        try:
+            from event_store import reclaim_space
+            _reclaim = reclaim_space()
+            if _reclaim.get("vacuumed") or not _reclaim.get("ok"):
+                result = dict(result or {}, reclaim=_reclaim)
         except Exception:
             pass
         return result
@@ -2835,7 +2868,7 @@ def _start_proxy_locked():
         domains = enabled_domains(cfg)
         if not domains:
             return False, "未配置启用的目标域名"
-    use_h2 = "true" if cfg.get("http2", True) else "false"
+    use_h2 = "true" if cfg.get("http2", False) else "false"
     up = detect_upstream() if capture_mode == "explicit" else ""
     args = _mitmdump_argv0() + ["-s", str(_BUNDLE_ROOT / "transparent.py")]
     if capture_mode == "local":
@@ -3724,11 +3757,85 @@ def _normalize_ner_budget(raw):
     return max(1.0, min(120.0, n))
 
 
-def normalize_config(raw, warnings=None):
+# 灾难性回溯（ReDoS）形态：分组内含量词、且组后紧跟量词（`(\w+)*` / `(a+)+` / `(a+){2,}`）。
+# 为什么要在**保存时**提醒：这类正则在长 body 上是指数级回溯，实测 `re:(\w+)*@`
+# 在 44KB 文本上 6 秒都跑不完；而 Python 的 `re` 执行期间持有 GIL，会把**整个引擎
+# 进程**（含事件循环与所有在途连接）一起拖住。只警告、不拒绝保存 —— 正当写法存在，
+# 但用户必须知道代价。
+_RE_BACKTRACK_RISK = re.compile(
+    r"\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)\s*[+*{]"
+)
+
+
+def _regex_backtrack_risk(body):
+    """返回可疑的回溯片段（截断 40 字符）；空串 = 未发现。只看形态，不做完整静态分析。"""
+    try:
+        m = _RE_BACKTRACK_RISK.search(str(body or ""))
+    except Exception:
+        return ""
+    return m.group(0)[:40] if m else ""
+
+
+def _project_connection_capabilities(caps):
+    """Bounded metadata only; never export arbitrary adapter objects or errors."""
+    if not isinstance(caps, dict):
+        return {}
+    bool_keys = ("supported", "deadlines", "http1_reuse_policy", "observation", "stream_cancellation")
+    text_keys = ("version", "reason", "observation_reason", "stream_cancellation_reason")
+    return {
+        k: (_scrub_text(v, 160) if isinstance(v, str) else v)
+        for k, v in caps.items()
+        if (k in bool_keys and isinstance(v, bool)) or
+           (k in text_keys and (v is None or isinstance(v, str)))
+    }
+
+
+def _connection_capabilities():
+    """Read-only capability report; never imply unsupported controls are active."""
+    try:
+        from connection_policy import transport_capabilities
+        return _project_connection_capabilities(transport_capabilities())
+    except Exception:
+        return {"supported": False, "deadlines": False, "http1_reuse_policy": False,
+                "version": "unknown", "reason": "connection_policy_unavailable",
+                "observation": False, "observation_reason": "connection_policy_unavailable",
+                "stream_cancellation": False, "stream_cancellation_reason": "connection_policy_unavailable"}
+
+
+def _validate_upstream_connection_policy(raw, http2):
+    # Missing policies stay missing: descriptive defaults must not enable new timers.
+    try:
+        from connection_policy import validate_connection_policy
+    except ImportError as exc:
+        raise ValueError("Connection policy unavailable / 当前版本不支持连接策略") from exc
+    return validate_connection_policy(raw, http2=http2)
+
+
+def _preflight_connection_controls(upstreams):
+    """Reject explicit unsupported controls before API reads can migrate a file.
+
+    Only the proposal is available here; HTTP/2 compatibility is checked again
+    against the merged configuration by save_config().
+    """
+    if isinstance(upstreams, list):
+        for upstream in upstreams:
+            if isinstance(upstream, dict) and upstream.get("connection_policy") is not None:
+                _validate_upstream_connection_policy(upstream["connection_policy"], http2=False)
+
+
+_CONNECTION_POLICY_LOAD_WARNING = (
+    "connection_policy 无效或当前不可用：已保留原值且未改写文件，请移除显式策略后保存。 / "
+    "Invalid or unavailable connection_policy: original value and file retained; remove the explicit policy before saving."
+)
+
+
+def normalize_config(raw, warnings=None, *, validate_controls=True):
     """校验并规整配置。
 
     warnings: 传入 list 时，把"被丢弃/被改写"的项写进去。以前这些都是静默发生的，
     用户输入的域名或客户端会凭空消失、端口被悄悄改掉，界面上完全没有解释。
+    validate_controls=False 仅供读盘：保留无法启用的原始策略与警告，不能把整份
+    用户配置回退成默认值，更不能把策略删掉使引擎绕过 fail-closed 校验。
     """
     warn = warnings if isinstance(warnings, list) else []
     if not isinstance(raw, dict):
@@ -3791,6 +3898,11 @@ def normalize_config(raw, warnings=None):
                         except re.error as e:
                             warn.append(f"正则词「{word[:40]}」无效：{e}，已拒绝保存")
                             continue
+                        _risk = _regex_backtrack_risk(word[3:])
+                        if _risk:
+                            warn.append(
+                                f"正则词「{word[:40]}」含嵌套量词（{_risk}）：极端输入下会"
+                                f"灾难性回溯并拖住整个引擎，建议改成等价的线性写法")
                     if total_words >= MAX_TOTAL_WORDS:
                         warn.append(f"敏感词总数超过 {MAX_TOTAL_WORDS}，后续词已忽略（可精简词表提升脱敏性能）")
                         break
@@ -3968,6 +4080,9 @@ def normalize_config(raw, warnings=None):
                     if len(vv) > 2048:
                         continue
                     extra_headers[kk] = vv
+            # model_rules（本分支）：按模型名改写请求头 / 请求体的规则表。
+            # 与 extra_headers 的区别是它按 model 命中，注入时机在**脱敏之后**
+            # （见 transparent._apply_model_rule_body），避免词表改写客户端指纹。
             model_rules = []
             raw_rules = u.get("model_rules")
             if isinstance(raw_rules, list):
@@ -3992,9 +4107,22 @@ def normalize_config(raw, warnings=None):
                     if body_size > 32768 or not isinstance(rule_body, dict):
                         continue
                     model_rules.append({"match": match, "headers": rule_headers, "body": rule_body})
-            ups.append({"name": name, "base_path": base_path, "port": port, "target": target,
+            upstream = {"name": name, "base_path": base_path, "port": port, "target": target,
                         "paths": paths_u, "use_proxy": bool(u.get("use_proxy")),
-                        "extra_headers": extra_headers, "model_rules": model_rules})
+                        "extra_headers": extra_headers, "model_rules": model_rules}
+            if "connection_policy" in u and u["connection_policy"] is not None:
+                try:
+                    upstream["connection_policy"] = _validate_upstream_connection_policy(
+                        u["connection_policy"], http2=bool(raw.get("http2", False)))
+                except Exception:
+                    if validate_controls:
+                        raise
+                    upstream["connection_policy"] = copy.deepcopy(u["connection_policy"])
+                    # One fixed warning, independent of policy size, upstream count or
+                    # exception text (which may contain user data).
+                    if _CONNECTION_POLICY_LOAD_WARNING not in warn:
+                        warn.append(_CONNECTION_POLICY_LOAD_WARNING)
+            ups.append(upstream)
     if not ups:
         ups = list(DEFAULT_UPSTREAMS)
 
@@ -4065,7 +4193,7 @@ def normalize_config(raw, warnings=None):
         "debug": bool(raw.get("debug", False)),
         "diagnostic_unmatched": bool(raw.get("diagnostic_unmatched", False)),
         "session_ttl": ttl,
-        "http2": bool(raw.get("http2", True)),
+        "http2": bool(raw.get("http2", False)),
         "upstreams": ups,
         "filter_enabled": bool(raw.get("filter_enabled", True)),
         "fail_closed": bool(raw.get("fail_closed", True)),
@@ -4343,21 +4471,30 @@ def _sync_runtime_config(cfg):
             pass
 
 
-def load_config():
+def load_config(warnings=None):
     # 整个「读文件 → normalize → 迁移写回」必须在锁内完成：迁移分支会写盘，
     # 与并发的 /api/config 保存交错会互相覆盖。RLock 允许内部再调 save_config。
     # 内存状态（如 _origin_check_enabled）必须在锁内原子同步，避免读-写交错覆盖刚保存的值。
     with cfg_lock:
-        cfg = _load_config_locked()
+        cfg = _load_config_locked(warnings)
         _sync_runtime_config(cfg)
     return cfg
 
 
-def _load_config_locked():
+def _load_config_locked(warnings=None):
     if CONFIG_PATH.exists():
         try:
             raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            cfg = normalize_config(raw)
+            load_warnings = []
+            cfg = normalize_config(raw, load_warnings, validate_controls=False)
+            if isinstance(warnings, list):
+                warnings.extend(load_warnings)
+            if _CONNECTION_POLICY_LOAD_WARNING in load_warnings:
+                # An invalid/unavailable control is not corrupt JSON. Leave the
+                # original file and migration flags untouched so a targeted reset
+                # can back up and preserve this exact configuration.
+                _emit_log(f"[panel] {_CONNECTION_POLICY_LOAD_WARNING}")
+                return cfg
             # 投毒检测默认开启（强制迁移一次）：老配置（无迁移标记）显式关闭过
             # audit/response_scan，升级后默认改为开启并落标记；之后尊重用户手工选择
             meta = raw.get("meta") or {}
@@ -4549,7 +4686,12 @@ def save_config(cfg, warnings=None, allow_shrink=False):
         old_cfg = _read_config_raw()
         if isinstance(old_cfg, dict):
             if not allow_shrink:
+                normalized_upstreams = cfg.get("upstreams")
                 cfg = _guard_structural_shrink(old_cfg, cfg, warnings)
+                if cfg.get("upstreams") is not normalized_upstreams:
+                    # The shrink guard may restore raw disk policies. Validate
+                    # those too, before a backup or any write can occur.
+                    cfg = normalize_config(cfg, warnings)
             _log_config_delta(old_cfg, cfg)
         # 写前自动备份：任何误写/半写都能从 config.json.bak-* 恢复（保留最近 10 份）。
         # 曾发生单字段 POST /api/config 触发全量替换、用户配置被默认值覆盖的事故，
@@ -4657,13 +4799,16 @@ def _maybe_restart_for_allow_hosts(cfg, allow_before):
 # ========== API ==========
 @app.get("/api/config")
 def api_get_config():
-    cfg = load_config()
+    warnings = []
+    cfg = load_config(warnings)
     # 附带内置规则元数据，供 UI 渲染开关（只读）
     return jsonify({
         **cfg,
         "_meta": {
             "builtin_rule_meta": BUILTIN_RULE_META,
             "version": __version__,
+            "transport_capabilities": _connection_capabilities(),
+            "warnings": [_safe_public_text(w, 240) for w in warnings[:20]],
         },
     })
 
@@ -4671,16 +4816,17 @@ def api_get_config():
 @app.post("/api/config")
 def api_set_config():
     warnings = []
-    # 保存前的监听端口集合：用于判断本次改动是否需要重启（见下）
-    try:
-        ports_before = set(_expected_listen_ports())
-    except Exception as e:
-        _emit_log(f"[panel] 读取当前监听端口失败: {_safe_public_text(e, 240)}")
-        ports_before = set()
     try:
         incoming = request.get_json(force=True)
         if not isinstance(incoming, dict):
             return jsonify({"ok": False, "error": "配置必须是 JSON 对象"}), 400
+        _preflight_connection_controls(incoming.get("upstreams"))
+        # 保存前的监听端口集合：必须在控制能力预检之后，读盘可能触发迁移写回。
+        try:
+            ports_before = set(_expected_listen_ports())
+        except Exception as e:
+            _emit_log(f"[panel] 读取当前监听端口失败: {_safe_public_text(e, 240)}")
+            ports_before = set()
         # 保存前的 explicit 模式 --allow-hosts 参数：与端口一样是启动期派生参数，
         # 域名/禁用域名变化后不重启就永远不生效（transparent 热重载只更新路由变量，
         # mitmproxy 的 MITM 范围仍按旧白名单走，新域名流量静默不脱敏）。
@@ -4851,6 +4997,16 @@ def _apply_config_patch(cfg, key, op, path, value, match=None):
             raise ValueError("list_upsert 的条目必须包含非空字符串 name")
         for i, item in enumerate(node):
             if isinstance(item, dict) and item.get("name") == target_name:
+                if (key == "upstreams" and not path and
+                        "connection_policy" in value and value["connection_policy"] is None and
+                        set(value) <= {"name", "connection_policy"}):
+                    # A policy-only reset must not require a stale upstream snapshot
+                    # or drop its address/headers/port when only null was supplied.
+                    value = dict(item, **value)
+                # Older forms replace the whole upstream. Preserve this new field on
+                # omission, including rename; explicit null intentionally resets it.
+                if key == "upstreams" and not path and "connection_policy" not in value and "connection_policy" in item:
+                    value = dict(value, connection_policy=item["connection_policy"])
                 node[i] = value
                 break
         else:
@@ -4869,11 +5025,6 @@ def api_patch_config():
     请求体：{"key": "audit", "op": "set", "path": ["signals", "INJECTION"], "value": true}
     响应体与 POST /api/config 完全一致，便于前端复用同一套保存/提示逻辑。
     """
-    try:
-        ports_before = set(_expected_listen_ports())
-    except Exception as e:
-        _emit_log(f"[panel] 读取当前监听端口失败: {_safe_public_text(e, 240)}")
-        ports_before = set()
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return jsonify({"ok": False, "error": "请求体必须是 JSON 对象"}), 400
@@ -4889,6 +5040,14 @@ def api_patch_config():
     warnings = []
     allow_before = None
     try:
+        if key == "upstreams" and not path:
+            proposed = [body["value"]] if op == "list_upsert" else body["value"]
+            _preflight_connection_controls(proposed)
+        try:
+            ports_before = set(_expected_listen_ports())
+        except Exception as e:
+            _emit_log(f"[panel] 读取当前监听端口失败: {_safe_public_text(e, 240)}")
+            ports_before = set()
         with cfg_lock:
             cfg = _load_config_locked()
             allow_before = _allow_hosts_of(cfg)
@@ -5105,6 +5264,7 @@ def api_status():
         "audit": cfg.get("audit", {}),
         # NER 开关 + 可用性：开启但模型/依赖缺失时必须让前端能提示，否则表现为"开了没效果"
         "ner": _ner_status_payload(cfg),
+        "words": _word_table_payload(cfg),
         "needs_ca": capture_mode != "reverse",
         # 首次运行向导：upstreams 恒被回填默认值，用不上它判断，改用显式标记
         "wizard_recommended": not bool(cfg.get("wizard_done")),
@@ -6145,7 +6305,9 @@ def api_logs_export():
     # 正文类字段一律剔除，只保留元数据 + 打码 items。
     _EXPORT_KEEP_FIELDS = {
         "ts", "type", "sid", "host", "method", "path",
-        "upstream", "model", "stream_mode", "stream_actual",
+        "upstream", "model", "stream_mode", "stream_actual", "transport",
+        "failure_phase", "upstream_may_have_executed",
+        "ner_init_ms", "ner_infer_ms", "ner_budget_wait_ms", "ner_calls", "ner_windows", "ner_cache_hits", "ner_cache_misses",
         "count", "restored", "status", "http_status",
         "mask_ms", "resp_ts", "first_byte_ms", "upstream_ms", "total_ms", "bytes", "usage", "cost_usd", "seq", "reason", "msg",
         # ---- 0.6.0 新增的归因字段 ----
@@ -6165,6 +6327,8 @@ def api_logs_export():
     clean = []
     for e in ev:
         item = {k: v for k, v in e.items() if k in _EXPORT_KEEP_FIELDS}
+        if "transport" in item:
+            item["transport"] = _project_transport(item["transport"])
         # msg/reason 承载异常文本或引擎提示，异常消息理论上可能回显请求片段：
         # 与诊断包口径一致过 _scrub_text 打码，避免导出文件残留明文形态
         for _k in ("msg", "reason"):
@@ -6245,6 +6409,47 @@ _EXT_MAX_BODY = 32 * 1024 * 1024
 # 几千 run 的文档会线性堆到分钟级，而扩展侧 HTTP 超时更短——超预算后只停用语义
 # 识别，确定性规则照常生效（见 transparent._ner_doc_budget）。
 _EXT_FILE_NER_BUDGET_S = 8.0
+
+
+def _word_table_payload(cfg):
+    """敏感词表的生效口径（面板 / 一键自检用）。
+
+    两个来源必须分开，混在一起就看不见故障：
+      · `configured` / `regex_words`：**配置里写了多少**（本进程就能算）；
+      · `engine_count` / `issues`：**引擎里真正生效几个、哪些词被跳过**
+        （只有 mitmdump 进程知道，经 engine-runtime.json 传出来）。
+    只报配置词数的话，「整张词表编译失败 -> 全部词失效」看起来和正常一模一样，
+    而用户侧表现是「脱敏突然什么都不打码了」。
+    """
+    out = {"configured": 0, "regex_words": 0, "engine_count": None,
+           "issues": {}, "engine_stale": True}
+    try:
+        raw_words = []
+        for _label, v in (cfg.get("sensitive") or {}).items():
+            if isinstance(v, dict):
+                raw_words.extend(str(w) for w in (v.get("words") or []))
+            elif isinstance(v, (list, tuple)):
+                raw_words.extend(str(w) for w in v)
+        raw_words.extend(str(w) for w in (cfg.get("custom_words") or {}))
+        uniq = {w for w in raw_words if w}
+        out["configured"] = len(uniq)
+        out["regex_words"] = len([w for w in uniq if w.startswith("re:")])
+    except Exception:
+        pass
+    try:
+        eng = _read_engine_metrics()
+        wt = eng.get("word_table") if isinstance(eng, dict) else None
+        if isinstance(wt, dict):
+            out["engine_count"] = wt.get("count")
+            issues = wt.get("issues")
+            if isinstance(issues, dict):
+                # 词本身是用户自己写的配置内容（正则/关键词），不含任何请求原文
+                out["issues"] = {str(k)[:120]: str(v)[:200]
+                                 for k, v in list(issues.items())[:20]}
+            out["engine_stale"] = bool(eng.get("stale"))
+    except Exception:
+        pass
+    return out
 
 
 def _ner_status_payload(cfg):
@@ -8083,6 +8288,18 @@ def _project_engine_metrics(eng):
         "aux_pool": eng.get("aux_pool") or {},
         "audit": eng.get("audit") or {},
     }
+    for section, keys in {
+        "heartbeat": ("generated_at", "loop_lag_ms"),
+        "transport": ("connections", "inflight", "finished", "evictions", "observation_errors",
+                      "timers", "oldest_request_age_s", "observation_installed"),
+    }.items():
+        raw = eng.get(section)
+        if isinstance(raw, dict):
+            out[section] = {k: raw[k] for k in keys if k in raw and
+                            (raw[k] is None or isinstance(raw[k], bool) or
+                             (type(raw[k]) in (int, float) and math.isfinite(raw[k])))}
+            if section == "transport" and isinstance(raw.get("capabilities"), dict):
+                out[section]["capabilities"] = _project_connection_capabilities(raw["capabilities"])
     ner = eng.get("ner") if isinstance(eng.get("ner"), dict) else {}
     out["ner"] = {
         "enabled": bool(ner.get("enabled")),
@@ -8138,6 +8355,7 @@ def _selfcheck_inputs():
             "metrics_age_s": eng.get("age_s"),
         },
         "ner": {},
+        "words": _word_table_payload(cfg),
         "events": {
             "window_s": agg.get("window_s", 3600),
             "total": agg.get("total", 0),
@@ -8190,7 +8408,7 @@ def _selfcheck_inputs():
     # 事件库写入健康 + 是否发生过损坏隔离（storage.*）
     try:
         import event_store
-        ctx["storage"] = {"writer": event_store.writer_stats()}
+        ctx["storage"] = {"writer": event_store.writer_stats(), "db": event_store.db_stats()}
         ctx["storage"]["db_quarantined"] = bool(getattr(event_store, "_LAST_QUARANTINE", False))
     except Exception as e:                                  # pragma: no cover
         ctx["storage"] = {"error": "%s: %s" % (type(e).__name__, e)}
@@ -8310,7 +8528,9 @@ def _diagnostics_payload(error_limit=60):
         bad = {"ERR", "BLOCK", "DNS_ERROR", "SCAN_WARN"}
         keep = ("ts", "type", "sid", "host", "path", "method", "status", "http_status",
                 "stream_mode", "stream_actual", "reason", "count", "restored",
-                "mask_ms", "total_ms",
+                "mask_ms", "total_ms", "transport",
+                "failure_phase", "upstream_may_have_executed",
+                "ner_init_ms", "ner_infer_ms", "ner_budget_wait_ms", "ner_calls", "ner_windows", "ner_cache_hits", "ner_cache_misses",
                 # 诊断包同样要能看出 503 来源与降级原因（0.6.0）
                 "block_source", "degraded", "stream_degraded_reason", "upstream_ms",
                 "engine_queue_depth", "engine_queue_bytes", "engine_busy", "queue_wait_ms",
@@ -8321,6 +8541,8 @@ def _diagnostics_payload(error_limit=60):
             if e.get("type") not in bad and int(e.get("http_status") or 0) < 400:
                 continue
             row = {k: e[k] for k in keep if k in e}
+            if "transport" in row:
+                row["transport"] = _project_transport(row["transport"])
             row["msg"] = _scrub_text(e.get("msg") or "", 500)
             row["rules"] = sorted({str(i.get("label")) for i in (e.get("items") or [])
                                    if isinstance(i, dict) and i.get("label")})

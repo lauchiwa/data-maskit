@@ -27,17 +27,38 @@ import transparent as tr
 ALLOWED_SOURCES = {"upstream", "engine", "fallback"}
 
 
+def _restore_summary_fields(tree):
+    """Discover the worker-prepared RESTORE schema, not a hand-maintained list."""
+    for fn in tree.body:
+        if isinstance(fn, ast.FunctionDef) and fn.name == "_emit_restore_summary":
+            for node in ast.walk(fn):
+                if (isinstance(node, ast.Assign)
+                        and any(isinstance(t, ast.Name) and t.id == "summary" for t in node.targets)
+                        and isinstance(node.value, ast.Call)
+                        and isinstance(node.value.func, ast.Name) and node.value.func.id == "dict"):
+                    return {kw.arg for kw in node.value.keywords if kw.arg}
+    return set()
+
+
 def _emit_calls(src, typ):
-    """返回源码里所有 `_emit("<typ>", ...)` 调用的 keyword 名集合。"""
+    """Return emitted keyword names, including the explicit prepared RESTORE builder."""
     tree = ast.parse(src)
+    prepared = _restore_summary_fields(tree)
     out = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
+    for fn in tree.body:
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        if not isinstance(node.func, ast.Name) or node.func.id != "_emit":
-            continue
-        if node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value == typ:
-            out.append({kw.arg for kw in node.keywords})
+        for node in ast.walk(fn):
+            if (not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name)
+                    or node.func.id != "_emit"):
+                continue
+            if node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value == typ:
+                fields = {kw.arg for kw in node.keywords if kw.arg}
+                if typ == "RESTORE" and fn.name in ("_emit_restore_summary", "response"):
+                    if any(kw.arg is None and isinstance(kw.value, ast.Name)
+                           and kw.value.id == "summary" for kw in node.keywords):
+                        fields |= prepared
+                out.append(fields)
     return out
 
 
@@ -52,6 +73,14 @@ class BlockSourceStaticGuardTests(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 6, "BLOCK 发射点变少了？先确认是不是合并了路径")
         missing = [i for i, kws in enumerate(calls) if "block_source" not in kws]
         self.assertEqual(missing, [], "第 %s 个 BLOCK 发射点缺少 block_source" % missing)
+
+    def test_prepared_schema_discovery_does_not_hide_missing_source(self):
+        sample = ('def _emit_restore_summary():\n'
+                  '    summary = dict(block_source="upstream", new_field=1)\n'
+                  '    _emit("RESTORE", **summary)\n')
+        self.assertEqual(_emit_calls(sample, "RESTORE"), [{"block_source", "new_field"}])
+        broken = sample.replace('block_source="upstream", ', '')
+        self.assertNotIn("block_source", _emit_calls(broken, "RESTORE")[0])
 
     def test_restore_emit_declares_upstream_source(self):
         """RESTORE 的 503 来自上游，必须标 upstream（否则与引擎自己拦的混在一起）。"""
@@ -464,7 +493,7 @@ class EmittedFieldRegistrationTests(unittest.TestCase):
 
     def _emitted_fields(self):
         tree = ast.parse((ROOT / "engine" / "transparent.py").read_text(encoding="utf-8"))
-        fields = set()
+        fields = _restore_summary_fields(tree)
         for node in ast.walk(tree):
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                     and node.func.id == "_emit"):
@@ -499,6 +528,19 @@ class EmittedFieldRegistrationTests(unittest.TestCase):
         self.assertEqual(unregistered, [],
                          "这些字段既没进导出/诊断白名单，也没在 NOT_EXPORTED 里说明理由："
                          "%s（漏登记就会像 engine_queue_bytes 一样静默丢出导出）" % unregistered)
+
+    def test_ner_inventory_reaches_every_projection_and_frontend_merge(self):
+        fields = set(tr._NER_EVENT_METRICS)
+        export, diag = self._whitelists()
+        self.assertGreaterEqual(len(fields), 9)
+        self.assertTrue(fields <= panel._TAIL_KEEP_FIELDS)
+        self.assertTrue(fields <= export)
+        self.assertTrue(fields <= diag)
+        types = (ROOT / "frontend/src/types/api.ts").read_text(encoding="utf-8")
+        merge = (ROOT / "frontend/src/lib/log-events.ts").read_text(encoding="utf-8")
+        for field in fields:
+            self.assertRegex(types, rf"\b{field}\?:\s*number")
+            self.assertRegex(merge, rf"\b{field}:\s*r\.{field}\s*\?\?\s*m\.{field}")
 
     def test_not_exported_list_has_no_rot(self):
         """NOT_EXPORTED 不许留腐烂条目：字段改名/删掉后，这里必须同步（否则它会

@@ -88,6 +88,11 @@ interface AuditRow {
   restored?: number
   /** 查不到原文、原样透传出去的占位符数。>0 通常意味着模型自造了占位符 */
   unresolved?: number
+  /** 未还原占位符样本（引擎侧外发；仅未还原时存在，用于区分模型改写与映射丢失） */
+  unresolved_samples?: string[]
+  /** 5xx 归因（引擎外发）：upstream=上游返回原样透传 / engine=本机熔断 / fallback=代理未运行兜底。
+   *  列表里必须看得见 —— 否则「上游返回 503」会被当成网关故障（2026-09-30 实测误判） */
+  block_source?: string
   /** 靠宽松兜底（模型剥了花括号）修回来的占位符数。成功路径，但值得看见 */
   degraded?: number
   stream_actual?: string
@@ -758,22 +763,34 @@ export default function LogsPage() {
                 </span>
                 {/* 处理摘要：脱敏/还原计数，审计行为信号名 + 严重度，无命中的行回退路径 */}
                 {renderSummary(row)}
-                {/* 状态：http_status 数字或 status 中文语义 */}
-                <span className="min-w-0 text-center">
+                {/* 状态：http_status 数字或 status 中文语义。
+                    5xx 必须标出**来源**：上游返回的 503 与网关熔断的 503 在列表里
+                    原本长得一模一样，实测被当成"网关坏了"（2026-09-30）。 */}
+                <span className="flex min-w-0 flex-col items-center gap-0.5">
                   {row.http_status ? (
-                    <Badge
-                      variant="outline"
-                      className={cn(
-                        'px-1 py-0 text-[9px] font-mono',
-                        row.http_status >= 400
-                          ? 'border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400'
-                          : row.http_status >= 200 && row.http_status < 300
-                            ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-                            : 'border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400',
+                    <>
+                      <Badge
+                        variant="outline"
+                        className={cn(
+                          'px-1 py-0 text-[9px] font-mono',
+                          row.http_status >= 400
+                            ? 'border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400'
+                            : row.http_status >= 200 && row.http_status < 300
+                              ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+                              : 'border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400',
+                        )}
+                      >
+                        {row.http_status}
+                      </Badge>
+                      {row.http_status >= 500 && (
+                        <span
+                          className="max-w-[6.5rem] truncate text-[9px] text-muted-foreground"
+                          title={t(`logs.status5xx.${row.block_source || 'unknown'}`)}
+                        >
+                          {t(`logs.status5xx.${row.block_source || 'unknown'}`)}
+                        </span>
                       )}
-                    >
-                      {row.http_status}
-                    </Badge>
+                    </>
                   ) : row.status ? (
                     <span className="min-w-0 truncate text-[9px] text-muted-foreground" title={String(row.status)}>
                       {row.status === 'no_placeholder_in_response' ? t('logs.statusNoRestore') : row.status === 'no_sensitive_data' ? t('logs.statusNoSensitive') : String(row.status).slice(0, 6)}
@@ -786,6 +803,7 @@ export default function LogsPage() {
                       200
                     </Badge>
                   ) : '—'}
+                  {'transport' in row && row.transport && <span className="max-w-[6.5rem] truncate text-[9px] text-muted-foreground" title={t('transport.caution')}>{t(`transport.phase.${row.transport.phase || 'unknown'}`)}</span>}
                 </span>
                 {/* 耗时：合并行取整链路(RESTORE)，MASK 单行(未还原/阻断)取脱敏管线耗时 */}
                 <span className="text-right tabular-nums text-[11px] text-muted-foreground">

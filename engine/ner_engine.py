@@ -39,24 +39,24 @@ _LAST_ERROR = ""
 _INTRA_THREADS = 0
 
 # ── 成本护栏 ──────────────────────────────────────────────────────────────────
-# 单个**识别窗口**的长度上限（字）。超过这个长度的文本不再「整条跳过」，而是
-# 按窗口切分后逐段识别（见 `_extract_long`）——请勿把本常量当成「超长就放弃」的闸。
-#
 # 名字保留 MAX_TEXT_CHARS 是因为它同时是**单次调用**的规模上限（分段粒度），
 # 以及 `tests/measure_ner_coverage.py` 的标定基准。
 #
 # ⚠️ 曾有 2000 字上限，超过就**整条不做 NER**（且只在全局日志里留一行）。实测用户
 # 真实流量里出现过 6208 字的单条正文（会话被拼成一个大字符串），那条里的中文人名
 # 全部明文上行 —— 比总预算更容易咬人，因为它是「整条不认」而不是「后面的不认」。
-# 放到 20000 是一次止血；2026-09-28 起超过 20000 字改为**分段识别**（P1），
-# 「整条跳过」这条路径彻底消失：要么识别完，要么受预算约束只识别前若干段，
-# 且预算用尽会如实记 `budget_exhausted`（不再是无声的 too_long）。
+# 20000 字是一次止血、2026-09-28 起超长改为**分段识别**（「整条跳过」这条路径彻底
+# 消失）；2026-09-30 把段长从 20000 收到 4000，实测（tests/measure_segment_granularity.py）：
 #
-# 为什么必须分段而不是放大上限：单次推理成本随字数线性（0.28ms/字），
-# 一条 5 万字正文单次调用要 14s，会一直占着推理槽位并撞 `CALL_BUDGET_S`；
-# 而分段后每段 ≤20000 字（≈5.6s 冷推理），且每段都进结果缓存 ——
-# 长会话反复重发同一段时第二轮几乎零成本。
-MAX_TEXT_CHARS = 20000
+#   1. **总耗时不变**：窗口总数 = 文本长度 / STRIDE，分段前后一样。20000 字整段冷推，
+#      两种段长都是 3.7~4.3s（顺序敏感，差异在噪声内）。段长只改「粒度」，不改「总量」，
+#      别指望靠调它提速。
+#   2. 收益在**粒度**上：段级缓存变细 —— 客户端每轮重发历史时正文只要有一行变化，
+#      旧粒度整叶重推、新粒度只重推变化的那一段。实测 12000 字正文改 1 个字后的
+#      第二轮：段长 4000 = 778ms，段长 20000 = 2308ms（3.0 倍）。
+#   3. 单段成本从 ≈5.6s 降到 ≈0.5~1.1s（4000 字实测 484ms @4 线程 / 1696ms @1 线程），
+#      deadline 收手也不再整段白扔。
+MAX_TEXT_CHARS = 4000
 # 分段时的相邻重叠字数：实体正好落在切点上时，靠重叠区在**别的段**里被完整识别。
 # 64 字足以覆盖中文人名/机构/地址的最长形态（实测最长实体 <30 字）。
 _LONG_SEG_OVERLAP = 64
@@ -121,6 +121,10 @@ def _env_int(name, default):
         return int(default)
 
 
+# 含汉字判定（编译一次）：整叶早返回与窗口级跳过共用，别在热路径上重复写字符比较。
+_CJK_RX = re.compile("[\u4e00-\u9fff]")
+
+
 # ── B-2：进程级治理器 ────────────────────────────────────────────────────────
 # 为什么需要：每个 InferenceSession 自带 `intra_op_num_threads` 个 ONNX 线程，
 # 多请求并发推理 = 线程数乘性叠加。请求级预算（transparent._ner_req_budget）
@@ -140,7 +144,7 @@ _SEM_STATS = {"inflight": 0, "peak_inflight": 0, "waits": 0,
 _SEM_STATS_LOCK = threading.Lock()
 
 # 令牌桶：限的是"每秒允许花多少毫秒做推理"（时间口径，不是次数口径——
-# 一条 20000 字的文本和一条 20 字的文本成本差 1000 倍，按次数限毫无意义）。
+# 一条 4000 字的文本和一条 4 字的文本成本差 1000 倍，按次数限毫无意义）。
 # 容量 = 每秒补充量，默认取并发数 × 1s 的 75%：把最多 3/4 个核留给推理，
 # 剩下的留给规则扫描、事件循环与其他请求。可用 MASKIT_NER_BUDGET 覆盖。
 _NER_BUDGET_MS_PER_S = max(50, _env_int("MASKIT_NER_BUDGET",
@@ -190,12 +194,12 @@ def _bucket_wait(est_ms, timeout_s):
     """
     end = time.monotonic() + max(0.0, float(timeout_s))
     while True:
+        left = end - time.monotonic()
+        if left <= 0 or _cancelled() or _current_deadline() is None:
+            return False
         if _bucket_take(est_ms):
             return True
-        left = end - time.monotonic()
-        if left <= 0:
-            return False
-        time.sleep(min(0.05, max(0.005, left)))
+        time.sleep(min(0.05, left))
 
 
 def _bucket_refund(ms):
@@ -206,16 +210,24 @@ def _bucket_refund(ms):
         _BUCKET["tokens"] = min(float(_NER_BUDGET_MS_PER_S), _BUCKET["tokens"] + float(ms))
 
 
+def _empty_metrics():
+    return {"init_ms": 0.0, "infer_ms": 0.0, "budget_wait_ms": 0.0,
+            "sem_wait_ms": 0.0, "global_throttled": 0, "sem_timeout": 0,
+            "calls": 0, "windows": 0, "cache_hit": 0, "cache_miss": 0}
+
+
 def request_metrics(reset=False):
     """取（或取完清空）本线程的 NER 运行指标。
 
-    `sem_wait_ms` / `global_throttled` 要进事件（C-1），否则"这次脱敏到底等了多久、
-    有没有被限流"在界面上完全看不见 —— 与降级原因一样，不可见就等于静默降级。
+    `init_ms` includes initialization-lock waiting; `infer_ms` is decode wall time
+    (tokenization + ONNX + label decoding), not CPU time. `calls` counts decode
+    attempts and `windows` counts ONNX run attempts. Cache counters count lookups,
+    including complete negative hits. Wait metrics include unsuccessful waits.
+    All values are numeric; no request text or model paths are included.
     """
     m = dict(getattr(_local, "metrics", None) or {})
     if reset:
-        _local.metrics = {"sem_wait_ms": 0.0, "infer_ms": 0.0, "global_throttled": 0,
-                          "sem_timeout": 0, "calls": 0}
+        _local.metrics = _empty_metrics()
     return m
 
 
@@ -223,8 +235,7 @@ def _metric_add(key, value):
     try:
         m = getattr(_local, "metrics", None)
         if m is None:
-            m = _local.metrics = {"sem_wait_ms": 0.0, "infer_ms": 0.0,
-                                  "global_throttled": 0, "sem_timeout": 0, "calls": 0}
+            m = _local.metrics = _empty_metrics()
         m[key] = m.get(key, 0) + value
     except Exception:
         pass
@@ -308,9 +319,6 @@ def cache_stats() -> Dict:
         "long_split_chars": split_chars,
     }
 
-# 预算窗口的宽限（秒）：调用方漏调 end_budget（异常路径）时超过它就自愈，
-# 免得某个线程被永久停掉语义识别——Flask 会复用线程，永久停用等于静默降级。
-_BUDGET_LEAK_GRACE_S = 60.0
 # 调用方给「一串调用」设的总预算（threading.local：只对本线程生效）。
 _local = threading.local()
 # 跳过原因计数 + 「只记一次」集合：失败必须可见，但每个请求都刷日志同样不可接受。
@@ -390,45 +398,68 @@ def request_skips(reset: bool = False) -> Dict:
     return s
 
 
-def begin_budget(seconds):
-    """开启一段有总预算的调用序列（如整份 Office 文档逐 run 脱敏）。
+def begin_budget(seconds, *, deadline=None, cancel_event=None):
+    """Begin a thread-local request budget; always pair with end_budget in finally.
 
-    期间「截止时间已过」等同于「预算耗尽」，extract_entities 直接跳过推理；
-    必须由调用方配对调用 end_budget（transparent._ner_doc_budget 已封装）。
-    同时把本轮的跳过记账清零，供 `request_skips()` 如实上报。
+    deadline is an optional absolute time.monotonic() processing deadline (including
+    upstream worker queue time). cancel_event is an optional threading.Event owned
+    by the caller. Checks are cooperative: running initialization/ONNX cannot be
+    interrupted. Expiry never implicitly ends or renews a request budget.
     """
+    effective = time.monotonic() + float(seconds)
+    if deadline is not None:
+        effective = min(effective, float(deadline))
     _local.doc_active = True
+    _local.deadline = effective
+    _local.cancel_event = cancel_event
     _local.skips = {}
-    _local.metrics = {"sem_wait_ms": 0.0, "infer_ms": 0.0, "global_throttled": 0,
-                      "sem_timeout": 0, "calls": 0}
-    # 不钳到 >=0：负值/0 用来表达「预算窗口已经过去」，便于测试与自愈判定
-    _local.deadline = time.monotonic() + float(seconds)
+    _local.metrics = _empty_metrics()
 
 
 def end_budget():
     _local.doc_active = False
     _local.deadline = None
+    _local.cancel_event = None
+
+
+def _cancelled():
+    event = getattr(_local, "cancel_event", None)
+    return event is not None and event.is_set()
 
 
 def _current_deadline():
-    """返回本次调用实际可用的绝对截止时间；None 表示预算已耗尽、应跳过本次推理。
-
-    没有显式预算时按单次上限兜底。deadline 过期且**不在**显式预算序列里时按
-    「未设置」处理：调用方漏调 end_budget 也只会退回默认上限，绝不永久停掉识别。
-    """
+    """Absolute cooperative deadline; None means exhausted or cancelled."""
     now = time.monotonic()
+    if _cancelled():
+        return None
     dl = getattr(_local, "deadline", None)
-    if dl is None:
-        return now + CALL_BUDGET_S
-    if dl <= now:
-        # 显式预算窗口内「过期」= 预算耗尽，跳过本次推理；窗口本身会自愈：
-        # 漏调 end_budget 最多影响 _BUDGET_LEAK_GRACE_S，绝不永久停掉识别。
-        if getattr(_local, "doc_active", False) and (now - dl) < _BUDGET_LEAK_GRACE_S:
-            return None
-        _local.doc_active = False
-        _local.deadline = None
-        return now + CALL_BUDGET_S
-    return min(dl, now + CALL_BUDGET_S)
+    if getattr(_local, "doc_active", False) and dl is not None:
+        return min(dl, now + CALL_BUDGET_S) if now < dl else None
+    return now + CALL_BUDGET_S
+
+
+def _stopped(deadline, reason="deadline"):
+    if _cancelled():
+        _note_skip("cancelled")
+        return True
+    if deadline is None or time.monotonic() >= deadline:
+        if reason == "budget_exhausted":
+            _note_skip("budget_exhausted")
+        else:
+            _note_skip("deadline")
+        return True
+    return False
+
+
+def _acquire_until(lock, deadline):
+    """Poll a lock without granting fresh time after expiry or cancellation."""
+    while not _cancelled():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if lock.acquire(timeout=min(0.05, remaining)):
+            return True
+    return False
 
 
 ADDR_TAGS = frozenset({"GPE", "LOC", "FAC"})
@@ -520,13 +551,20 @@ def _init_ner():
     if _INIT_FAILED:
         return False
 
-    with _INIT_LOCK:
+    deadline = _current_deadline()
+    if deadline is None or not _acquire_until(_INIT_LOCK, deadline):
+        return False
+    try:
+        if _cancelled() or time.monotonic() >= deadline:
+            return False
         # 双检：拿到锁之后再确认一次，否则两个线程仍会各建一个 session
         if _INITIALIZED:
             return True
         if _INIT_FAILED:
             return False
         return _init_ner_locked()
+    finally:
+        _INIT_LOCK.release()
 
 
 def _intra_threads():
@@ -609,10 +647,27 @@ def _decode_chunks(text: str, deadline: float) -> Tuple[List[Dict], bool]:
 
     pos = 0
     while pos < text_len:
+        if _stopped(deadline):
+            complete = False
+            break
         chunk = text[pos:pos + CHUNK_SIZE]
         if not chunk:
             break
 
+        # 纯英文/代码窗口直接跳过推理（P0 性能，2026-09-30）：本模型只识中文实体，
+        # 不含汉字的窗口不可能产出中文实体；而 CHUNK_SIZE(400)/STRIDE(350) 有 50 字
+        # 重叠，跨窗口的实体一定会在相邻窗口里被完整看到 —— 跳过不会漏码。
+        # 收益取决于内容形态（实测见 tests/measure_segment_granularity.py）：中文段落越稀疏
+        # 省得越多 —— 每 ~1500 字一段中文时省 74%；中文密到每个窗口都有汉字时基本不省。
+        if _CJK_RX.search(chunk) is None:
+            if pos + CHUNK_SIZE >= text_len:
+                break
+            pos += STRIDE
+            continue
+
+        if _stopped(deadline):
+            complete = False
+            break
         encoded = _TOKENIZER.encode(chunk)
         input_ids = np.array([encoded.ids], dtype=np.int64)
         attention_mask = np.array([encoded.attention_mask], dtype=np.int64)
@@ -624,7 +679,11 @@ def _decode_chunks(text: str, deadline: float) -> Tuple[List[Dict], bool]:
             "token_type_ids": token_type_ids,
         }
 
+        if _stopped(deadline):
+            complete = False
+            break
         try:
+            _metric_add("windows", 1)
             outputs = _SESSION.run(None, inputs)
             logits = outputs[0][0]
             preds = np.argmax(logits, axis=-1)
@@ -698,13 +757,10 @@ def _decode_chunks(text: str, deadline: float) -> Tuple[List[Dict], bool]:
         if curr:
             raw_entities.append(curr)
 
-        if pos + CHUNK_SIZE >= text_len:
-            break
-        # 时间预算：超时就收手。必须是**块间**检查——单块推理无法中断，
-        # 但只要不再开新块，耗时就不会继续线性膨胀。
-        if time.monotonic() > deadline:
-            _note_skip("deadline", "达到单次推理时间预算，本次仅返回已识别结果")
+        if _stopped(deadline):
             complete = False
+            break
+        if pos + CHUNK_SIZE >= text_len:
             break
         pos += STRIDE
 
@@ -723,7 +779,11 @@ def extract_entities(text: str) -> List[Dict]:
     # 纯英文/代码/无汉字文本直接跳过：本引擎基于中文 BERT（OntoNotes 5.0），
     # 仅负责人名 (NAME)、机构 (ORG)、详细地址 (ADDR) 三类中文实体。
     # 纯英文或代码中无中文实体，反而会被 BERT subword 切碎产生误报（如将英文参数误报为人名）。
-    if not any("\u4e00" <= ch <= "\u9fff" for ch in text):
+    if _CJK_RX.search(text) is None:
+        return []
+
+    if _cancelled():
+        _note_skip("cancelled")
         return []
 
     # 超长文本 → 分段识别（旧行为是整条跳过并记 too_long，见 MAX_TEXT_CHARS 的注释）。
@@ -737,17 +797,26 @@ def extract_entities(text: str) -> List[Dict]:
             _CACHE_STATS["hit"] = _CACHE_STATS.get("hit", 0) + 1
         else:
             _CACHE_STATS["miss"] = _CACHE_STATS.get("miss", 0) + 1
+    _metric_add("cache_hit" if cached is not None else "cache_miss", 1)
+    if _cancelled():
+        _note_skip("cancelled")
+        return []
+    # Completed cache entries need no inference budget. Cancellation still wins.
     if cached is not None:
         return [dict(e) for e in cached]
-
-    if not _init_ner():
-        _note_skip("model_unavailable")
+    deadline = _current_deadline()
+    if _stopped(deadline, "budget_exhausted"):
         return []
 
-    deadline = _current_deadline()
-    if deadline is None:
-        _note_skip("budget_exhausted",
-                   "本次脱敏的语义识别总预算已耗尽，剩余文本未做实体识别")
+    t_init = time.monotonic()
+    try:
+        initialized = _init_ner()
+    finally:
+        _metric_add("init_ms", max(0.0, time.monotonic() - t_init) * 1000)
+    if _stopped(deadline):
+        return []
+    if not initialized:
+        _note_skip("model_unavailable")
         return []
 
     # 单次调用超时（`deadline` 键）与推理异常（`infer_failed` 键）由 `_decode_chunks`
@@ -757,7 +826,7 @@ def extract_entities(text: str) -> List[Dict]:
     # 顺序不能反：先占槽位再发现没额度，会把槽位白占一会儿，放大排队。
     # ⚠️ 估价必须**夹到桶容量**（0.6.0 修）：桶的容量是"每秒额度"
     # （`_NER_BUDGET_MS_PER_S` = 并发 × 750），而单条长文本的线性估价可以远大于它
-    # （20000 字 ≈ 5600ms）。不夹的话 `_bucket_take` 永远失败 —— 于是超过
+    # （4000 字 ≈ 1100ms @1 线程 / 480ms @4 线程）。不夹的话 `_bucket_take` 永远失败 —— 于是超过
     # 约 2680 字（并发 1）/ 5360 字（并发 2）的文本**永久**进不了语义识别，
     # 而且是"确定性漏码"而不是"负载降级"：用户只看到 global_throttled 计数上涨。
     # 桶的职责是限**速率**，不是限**单条大小**（单条大小由 CALL_BUDGET_S 与
@@ -768,12 +837,21 @@ def extract_entities(text: str) -> List[Dict]:
         # 额度不足：先在**有界**窗口内等一等（默认 2s，且不超过本轮剩余 deadline）。
         # 等到就照常推理（记 budget_waited，“曾经缺额度但补上了”可见）；
         # 等不到仍按原策略降级 —— 不阻断、不断链，只如实记原因。
-        # 给「取并发槽位」留出完整窗口：预算等待若把 deadline 吃光，紧接着的槽位
-        # 等待就只剩 max(0.05, ...) 的残值 —— 净效果是多等 2 秒、仍然不做识别，
-        # 还白占一个脱敏 worker（比直接降级更差）。所以这里先减掉槽位等待上限。
+        # 保留既有策略：给并发槽位预留等待窗口，避免额度等待吃光剩余预算。
+        # 后续每道检查仍以绝对 deadline 为准，绝不续给最小等待时间。
         budget_wait_s = min(_NER_BUDGET_WAIT_MS / 1000.0,
                             max(0.0, deadline - time.monotonic() - _SEM_WAIT_MAX_S))
-        if budget_wait_s > 0 and _bucket_wait(est_ms, budget_wait_s):
+        t_budget = time.monotonic()
+        try:
+            got_tokens = budget_wait_s > 0 and _bucket_wait(est_ms, budget_wait_s)
+        finally:
+            budget_wait_ms = max(0.0, time.monotonic() - t_budget) * 1000
+            _metric_add("budget_wait_ms", budget_wait_ms)
+        if _stopped(deadline):
+            if got_tokens:
+                _bucket_refund(est_ms)
+            return []
+        if got_tokens:
             _metric_add("budget_waited", 1)
             with _SKIP_LOCK:
                 _BUDGET_WAITED["n"] += 1
@@ -781,12 +859,21 @@ def extract_entities(text: str) -> List[Dict]:
             _metric_add("global_throttled", 1)
             _note_skip("global_throttled",
                        f"语义识别的全局速率预算已用尽（{_NER_BUDGET_MS_PER_S} 毫秒/秒，"
-                       f"已等 {budget_wait_s:.1f}s），本条未做实体识别")
+                       f"已等 {budget_wait_ms / 1000:.1f}s），本条未做实体识别")
             return []
-    remaining = max(0.05, min(_SEM_WAIT_MAX_S, deadline - time.monotonic()))
+    if _stopped(deadline):
+        _bucket_refund(est_ms)
+        return []
+    remaining = min(_SEM_WAIT_MAX_S, deadline - time.monotonic())
     t_wait0 = time.monotonic()
-    got_slot = _SEM.acquire(timeout=remaining)
-    wait_ms = (time.monotonic() - t_wait0) * 1000
+    got_slot = _acquire_until(_SEM, min(deadline, t_wait0 + remaining))
+    wait_ms = max(0.0, time.monotonic() - t_wait0) * 1000
+    _metric_add("sem_wait_ms", wait_ms)
+    if _stopped(deadline):
+        if got_slot:
+            _SEM.release()
+        _bucket_refund(est_ms)
+        return []
     if not got_slot:
         # 槽位等不到 = 已经有人在推理且迟迟不放手：跳过而不是无限排队。
         _bucket_refund(est_ms)
@@ -800,12 +887,9 @@ def extract_entities(text: str) -> List[Dict]:
         _SEM_STATS["waits"] += 1
         _SEM_STATS["wait_ms_total"] += wait_ms
         _SEM_STATS["wait_ms_max"] = max(_SEM_STATS["wait_ms_max"], wait_ms)
-    _metric_add("sem_wait_ms", wait_ms)
     t_infer0 = time.monotonic()
     with _SEM_STATS_LOCK:
         _SEM_STATS["inflight"] += 1
-    # 计数本身靠 GIL 原子；peak 的 read-modify-write 允许输掉竞态（它只用于展示）：
-    # 为它单独加锁得不偿失，而报小的峰值不会放过任何真问题。
     with _SEM_STATS_LOCK:
         if _SEM_STATS["inflight"] > _SEM_STATS["peak_inflight"]:
             _SEM_STATS["peak_inflight"] = _SEM_STATS["inflight"]
@@ -815,12 +899,16 @@ def extract_entities(text: str) -> List[Dict]:
         with _SEM_STATS_LOCK:
             _SEM_STATS["inflight"] -= 1
         _SEM.release()
-        actual_ms = (time.monotonic() - t_infer0) * 1000
+        actual_ms = max(0.0, time.monotonic() - t_infer0) * 1000
         _metric_add("infer_ms", actual_ms)
         _metric_add("calls", 1)
         # 预估比实际高就退还（长文本往往比线性估计快），反之不追缴——
         # 宁可偶尔多用一点额度，也不要为了精确记账把桶做成负值。
         _bucket_refund(max(0.0, est_ms - actual_ms))
+    # Even the last ONNX window can outlive cancellation/deadline. Never publish
+    # that attempt as a complete cache entry; running calls release their own slot.
+    if complete and _stopped(deadline):
+        complete = False
     if not raw_entities:
         # 负缓存（审计 M6 同源问题）：无实体的长文本此前**每次请求都重跑推理**
         # （≤2000 字约 500ms/次，实测成本模型 0.25ms/字）。
@@ -921,7 +1009,7 @@ def extract_entities(text: str) -> List[Dict]:
     # 只有**完整**跑完的结果才入缓存（审计 M6）：预算超时（`deadline` 分支）与
     # 单块推理异常都会带着残缺实体列表走到这里，缓存下来等于让该文本此后每次
     # 命中缓存都返回同一份残缺结果——即使系统空闲也不再补全，持续欠脱敏。
-    if complete:
+    if complete and not _stopped(deadline):
         _cache_put(text, final_merged)
     return [dict(e) for e in final_merged]
 
@@ -935,7 +1023,7 @@ def _extract_long(text: str) -> List[Dict]:
     只识别前若干段（并记 `budget_exhausted`），不再有「静默的整条跳过」。
 
     为什么不是简单放大 MAX_TEXT_CHARS：单次成本线性（0.28ms/字），5 万字单次要 14s，
-    会长期占着推理槽位并撞 `CALL_BUDGET_S`；分段后每段 ≤20000 字（≈5.6s 冷推理），
+    会长期占着推理槽位并撞 `CALL_BUDGET_S`；分段后每段 ≤MAX_TEXT_CHARS（≈0.5~1.1s），
     且每段单独进缓存 —— 长会话反复重发同一段时第二轮接近零成本。
 
     重叠窗口（`_LONG_SEG_OVERLAP`）保证落在切点上的实体能在相邻段里被完整看到；
@@ -963,10 +1051,9 @@ def _extract_long(text: str) -> List[Dict]:
             })
         if pos + MAX_TEXT_CHARS >= total:
             break
-        # 本段一个实体都没有且预算已耗尽：后面的段只会空跑（白记 N 次
-        # budget_exhausted），直接收手。必须先调一次 extract_entities 再判——
-        # 它的**缓存命中路径不查预算**，先判会把零成本的命中段也丢掉。
-        if not ents and _current_deadline() is None:
+        # Continue cheap cache lookups after inference budget expiry; a miss will
+        # not start inference. A cancelled whole request must stop immediately.
+        if _cancelled():
             break
         pos += step
     if segs > 1:

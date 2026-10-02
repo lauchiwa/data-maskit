@@ -4843,7 +4843,6 @@ class NewRulesTests(unittest.TestCase):
         tr.BUILTIN_RULES = {l: True for l in tr.DEFAULT_BUILTIN_RULES}
         tr._CUSTOM_WORD_RX_CACHE.clear()
         tr._CUSTOM_COMBINED_CACHE["key"] = None
-        tr._CUSTOM_COMBINED_CACHE["rx"] = None
 
     def _mask(self, text):
         sid = "nr" + str(hash(text))[-6:]
@@ -5586,18 +5585,20 @@ class NerEngineGuardrailTests(unittest.TestCase):
         self.assertGreater(ner_engine.status()["skips"].get("budget_exhausted", 0), before,
                            "预算耗尽必须计数/留痕，不能静默")
 
-    def test_leaked_budget_window_self_heals(self):
-        """漏调 end_budget 时：预算期内按耗尽处理，但绝不永久停掉后续识别。"""
+    def test_expired_budget_needs_explicit_new_request(self):
+        """同一请求的预算永不续期；只有显式的新请求才能重新取得预算。"""
         import ner_engine
-        ner_engine.begin_budget(0.0)
-        try:
-            self.assertIsNone(ner_engine._current_deadline(), "预算期内必须按耗尽处理")
-            # 模拟预算窗口早已过去（异常路径漏调 end_budget）
-            ner_engine.begin_budget(-120.0)
-            self.assertIsNotNone(ner_engine._current_deadline(),
-                                 "超过宽限期必须自愈，不能永久停掉识别")
-        finally:
-            ner_engine.end_budget()
+        with mock.patch.object(ner_engine.time, "monotonic", return_value=100.0) as clock:
+            ner_engine.begin_budget(1.0)
+            try:
+                for now in (102.0, 162.0, 222.0):
+                    clock.return_value = now
+                    self.assertIsNone(ner_engine._current_deadline())
+                ner_engine.end_budget()
+                ner_engine.begin_budget(1.0)
+                self.assertIsNotNone(ner_engine._current_deadline())
+            finally:
+                ner_engine.end_budget()
 
 
 class NerEngineIntegrationTests(unittest.TestCase):
@@ -5939,6 +5940,45 @@ class MaskExcludingPlaceholdersEdTests(unittest.TestCase):
         text, edits = tr._mask_excluding_placeholders_ed(inp, rx, lambda m: "x")
         self.assertEqual(text, inp)
         self.assertEqual(edits, [])
+
+
+class WordTablePayloadTests(unittest.TestCase):
+    """`/api/status` 的词表口径：**配置里写了多少** 与 **引擎真正生效几个** 必须分开报。
+
+    合并成一个数字就看不见故障：整张词表编译失败时，"配置 49 个词"看起来完全正常，
+    而用户侧表现是"脱敏突然什么都不打码了"（2026-09-30 事故）。
+    """
+
+    def _payload(self, cfg, metrics):
+        with mock.patch.object(panel, "_read_engine_metrics", lambda: metrics):
+            return panel._word_table_payload(cfg)
+
+    def test_counts_words_in_both_config_shapes(self):
+        cfg = {"sensitive": {"甲组": {"words": ["杭州", "北京"]}, "乙组": ["上海"]},
+               "custom_words": {"广州": "TERM"}}
+        out = self._payload(cfg, {})
+        self.assertEqual(out["configured"], 4, "分组两种写法 + custom_words 都要数到")
+        self.assertEqual(out["regex_words"], 0)
+        self.assertIsNone(out["engine_count"], "引擎没报数时不许编一个")
+        self.assertEqual(out["issues"], {})
+
+    def test_engine_issues_are_passed_through_with_stale_flag(self):
+        cfg = {"sensitive": {"甲组": ["杭州", "re:BEIJING"]}}
+        metrics = {"word_table": {"count": 1,
+                                  "issues": {"re:BEIJING": "正则无效，已跳过该词：unbalanced parenthesis"}},
+                   "stale": False}
+        out = self._payload(cfg, metrics)
+        self.assertEqual(out["configured"], 2)
+        self.assertEqual(out["regex_words"], 1)
+        self.assertEqual(out["engine_count"], 1, "生效词数来自引擎，不是配置")
+        self.assertIn("re:BEIJING", out["issues"])
+        self.assertFalse(out["engine_stale"])
+
+    def test_engine_metrics_missing_is_reported_not_guessed(self):
+        out = self._payload({"sensitive": {"甲组": ["杭州"]}}, {})
+        self.assertIsNone(out["engine_count"])
+        self.assertTrue(out["engine_stale"], "指标缺失/过期必须显式标出来")
+
 
 
 if __name__ == "__main__":

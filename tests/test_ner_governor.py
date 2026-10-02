@@ -218,31 +218,31 @@ class GovernorTests(unittest.TestCase):
         """长文本叶子**必须**能进入推理（0.6.0 修的关键回归点）。
 
         背景：单条估价 = 字数 × `_EST_MS_PER_CHAR`（0.28ms/字），而桶容量 = 每秒
-        补充量（并发 1 时只有 750ms）。若拿**未夹的**估价去 `_bucket_take`，那么
-        超过容量/单价 ≈ 2680 字的叶子**永远**拿不到额度 —— 不是"负载降级"，而是
-        "这些文本永久不做语义识别"，用户只看到计数上涨。
-        所以这条用例断言的是：满桶 + 20000 字叶子 ⇒ 真的走到了推理（模型加载被
-        打桩，`_decode_chunks` 被替换），而不是在闸门处返回空。
+        补充量。若拿**未夹的**估价去 `_bucket_take`，那么超过容量/单价的叶子**永远**
+        拿不到额度 —— 不是"负载降级"，而是"这些文本永久不做语义识别"，用户只看到
+        计数上涨。
+
+        用例刻意不绑定 `MAX_TEXT_CHARS` 与桶容量这两个常量的具体取值（2026-09-30
+        分段粒度从 20000 收到 4000 时，旧写法靠"18000 字"同时满足两个前提，一改就红）：
+        改为①文本取满一个段，②把每秒额度压到"估价必然超过容量"的水位。
         """
         self._fill_bucket(ner._NER_BUDGET_MS_PER_S)          # 满桶
-        # 19500 字：既高于“估价超过桶容量”的悬崖（容量/单价，并发 2 时约 5357 字），
-        # 又不撞 MAX_TEXT_CHARS=20000 那条**另一条**闸（否则会在桶之前就
-        # 以 too_long 返回，用例就测不到本意了）。
-        text = "客户张大锤在杭州西湖区上班" * 1500
-        self.assertLessEqual(len(text), ner.MAX_TEXT_CHARS, "用例前提：不撞长度上限")
-        self.assertGreater(len(text) * ner._EST_MS_PER_CHAR,
-                           ner._NER_BUDGET_MS_PER_S, "用例前提：估价必须超过桶容量")
-        reached = []
-        # 注意：`_decode_chunks` 返回二元组 (entities, complete)，桩必须同形状
-        # （第一版只回列表，用例自己报 ValueError，等于白测）。
-        stub = lambda *a, **k: (reached.append(1), ([], True))[1]  # noqa: E731
-        with mock.patch.object(ner, "_decode_chunks", stub), \
-                mock.patch.object(ner, "_init_ner", lambda: True), \
-                mock.patch.object(ner, "_SEM", _AlwaysAcquire()):
-            out = ner.extract_entities(text)
+        text = "项目进度记录与联系人信息说明，含机构名称、详细地址与业务备注等内容。" * 200
+        text = text[: ner.MAX_TEXT_CHARS]
+        with mock.patch.object(ner, "_NER_BUDGET_MS_PER_S", 300):
+            self.assertGreater(len(text) * ner._EST_MS_PER_CHAR,
+                               ner._NER_BUDGET_MS_PER_S, "用例前提：估价必须超过桶容量")
+            reached = []
+            # 注意：`_decode_chunks` 返回二元组 (entities, complete)，桩必须同形状
+            # （第一版只回列表，用例自己报 ValueError，等于白测）。
+            stub = lambda *a, **k: (reached.append(1), ([], True))[1]  # noqa: E731
+            with mock.patch.object(ner, "_decode_chunks", stub), \
+                    mock.patch.object(ner, "_init_ner", lambda: True), \
+                    mock.patch.object(ner, "_SEM", _AlwaysAcquire()):
+                out = ner.extract_entities(text)
         self.assertEqual(out, [])
         self.assertTrue(reached,
-                        "20000 字叶子在满桶时仍未进入推理：估价未被夹到桶容量"
+                        "长文本叶子在满桶时仍未进入推理：估价未被夹到桶容量"
                         "（长文本永久漏码，且只在计数上看得到）")
         self.assertEqual(ner.request_metrics().get("global_throttled", 0), 0,
                          "不该被记为预算耗尽")

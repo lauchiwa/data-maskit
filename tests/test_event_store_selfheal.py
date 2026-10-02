@@ -188,5 +188,86 @@ class DailyWordsCredentialExclusionTests(unittest.TestCase):
                          "普通 PII 在开 RECORD_PLAINTEXT_WORDS 时正常记录原文")
 
 
+class ReclaimSpaceTests(unittest.TestCase):
+    """`prune_events` 删行 ≠ 文件变小：死空间必须能被回收。
+
+    线上实测：249MB 的库里有 84MB 是已删除行的空页（33%），而 7 天保留策略每天都在删 ——
+    此前全仓没有一处 VACUUM，所以体积只涨不落。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: self._cleanup(self.tmp))
+        self.old_db = event_store.DB_PATH
+        self.addCleanup(lambda: setattr(event_store, "DB_PATH", self.old_db))
+        event_store.DB_PATH = self.tmp / "ev.sqlite3"
+        event_store._reset_writer()
+        event_store.init_db()
+
+    @staticmethod
+    def _cleanup(tmp):
+        for p in list(tmp.glob("*")):
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _fill(self, rows, payload="x" * 8000):
+        now = time.time()
+        with sqlite3.connect(event_store.DB_PATH) as conn:
+            conn.executemany(
+                "INSERT INTO events (ts, type, sid, host, method, path, payload) VALUES (?,?,?,?,?,?,?)",
+                [(now, "MASK", "s1", "h", "POST", "/p", payload) for _ in range(rows)])
+            conn.commit()
+
+    def _delete_all_but(self, keep):
+        with sqlite3.connect(event_store.DB_PATH) as conn:
+            conn.execute("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT ?)",
+                         (keep,))
+            conn.commit()
+
+    def test_db_stats_reports_dead_space(self):
+        self._fill(300)
+        before = event_store.db_stats()
+        self.assertTrue(before["ok"])
+        self.assertEqual(before["rows"], 300)
+        self.assertEqual(before["free_bytes"], 0, "刚写入的库不该有空页")
+        self._delete_all_but(10)
+        after = event_store.db_stats()
+        self.assertGreater(after["free_bytes"], 0, "删行之后必须看得到死空间")
+        self.assertEqual(after["rows"], 10)
+        self.assertGreater(after["free_ratio"], 0.5)
+
+    def test_reclaim_space_compacts_file(self):
+        self._fill(300)
+        self._delete_all_but(10)
+        before = event_store.db_stats()
+        result = event_store.reclaim_space(min_free_bytes=0, min_free_ratio=0.1)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["vacuumed"], "死空间超过阈值时必须真的压")
+        after = event_store.db_stats()
+        self.assertEqual(after["free_bytes"], 0, "压缩后 freelist 必须归零")
+        self.assertLess(after["bytes"], before["bytes"], "文件必须变小")
+        self.assertGreaterEqual(result["reclaimed_bytes"], before["bytes"] - after["bytes"])
+
+    def test_reclaim_space_skips_when_not_worth_it(self):
+        """小库/死空间占比低时不许压：VACUUM 会重写整个文件，白耗 IO。"""
+        self._fill(20)
+        self._delete_all_but(19)
+        result = event_store.reclaim_space(min_free_bytes=32 * 1024 * 1024, min_free_ratio=0.25)
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["vacuumed"])
+
+    def test_reclaim_space_reports_lock_failure_without_raising(self):
+        """引擎占着写锁时必须安静放弃（留给下一轮），绝不让清理把写入拖死。"""
+        self._fill(300)
+        self._delete_all_but(10)
+        with mock.patch.object(event_store, "_connect", side_effect=sqlite3.OperationalError("database is locked")):
+            result = event_store.reclaim_space(min_free_bytes=0, min_free_ratio=0.1)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["vacuumed"])
+        self.assertIn("locked", result["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

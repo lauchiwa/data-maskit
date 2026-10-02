@@ -5,6 +5,8 @@
 ## [Unreleased]
 
 ### 新增 / Added
+- 同步上游 v0.7.0：真实流取消与响应配额修复、连接策略诊断、词表 `re:` 单词失效修复、无汉字窗口跳过语义模型（识别耗时 -74%）、分段粒度收紧至 4000 字、事件库死空间回收、`linux-<arch>-deb` 更新载体独立签名。
+  *Synced upstream v0.7.0: native stream cancellation and response-admission fixes, connection-policy diagnostics, a fix for `re:` words silently disabling the word table, skipping the semantic model on CJK-free windows (-74% inference time), segment size tightened to 4000 chars, event-DB dead-space reclamation, and separately signed `linux-<arch>-deb` update targets.*
 - 同步上游 v0.6.1–v0.6.2：语义识别单请求预算可配置、超长文本分段识别、Linux amd64/arm64 桌面安装包与本地打包脚本。
   *Synced upstream v0.6.1–v0.6.2: configurable per-request NER budget, segmented recognition for over-long text, Linux amd64/arm64 desktop packages and local build scripts.*
 
@@ -86,6 +88,51 @@
 ### 新增 / Added
 - 上游血缘基线元数据 `__upstream_base__`，经 `/api/status` 与诊断导出暴露（字段 `upstream_base`），用于确认运行中的实例基于哪个上游版本；只读，不参与版本比较。
   *Upstream lineage baseline `__upstream_base__`, exposed via `/api/status` and diagnostics export (field `upstream_base`), to identify which upstream version a running instance is based on; read-only, never used in version comparison.*
+## [0.7.0] - 2026-10-02
+
+### 修复
+- 引擎：NER 请求预算过期不再续期，取消与等待不再额外开启推理窗口。
+- 引擎：修复真实流取消、垃圾回收重入与压缩响应配额，避免迟到回复、假 503 和响应漏审计。
+- 构建：隔离发布构建并验收真实 frozen 引擎，保留本机运行数据，拒绝不完整模型包。
+- 构建：`--release-only` 暂存根改到磁盘固定路径（拒绝默认落在 tmpfs 吃内存），发布前逐个断言产物内确实含引擎与 NER 模型，并把 `zstandard` 显式写进 requirements。
+- 面板：未知连接策略不再使整份配置回退；桌面控制面请求不再经过环境代理。
+- 面板：统一 HTTP/2 缺省为关闭，保留用户明确选择，避免模板与运行配置口径不一致。
+- 引擎：自定义词表里的 `re:` 词不再能拖垮整张词表（一个词编译失败曾让自定义词与内置词组一起静默失效）。
+- 引擎：无汉字的识别窗口不再送入语义模型，稀疏中文正文的识别耗时降约 74%（实测）。
+- 面板：日志列表标注 5xx 来源（上游返回 / 网关拦截 / 代理未运行），上游 503 不再被误读成网关故障。
+
+### 优化
+- 引擎：语义识别分段粒度由 20000 字收紧到 4000 字，长会话第二轮重推开销降约 3 倍（实测 2308ms → 778ms）。
+- 引擎：事件库在保留策略执行后按需回收死空间（实测 237.5MB → 159MB）。
+
+### 新增
+- 诊断：记录真实连接选择与 TLS 阶段，增加本地心跳及 NER 等待指标，避免将无响应一律归因于上游。
+- 自检：新增 S35（敏感词表未生效）与 S36（事件库死空间未回收）。
+- 面板：`/api/status` 外发词表生效口径（配置词数 / 引擎生效词数 / 问题清单）。
+
+---
+
+### Fixed
+- Engine: expired NER request budgets no longer renew, and cancellation or waiting cannot grant extra inference windows.
+- Engine: fixed native stream cancellation, GC reentrancy and compressed-response admission to prevent late replies, spurious 503s and skipped audits.
+- Build: isolate release builds and verify the actual frozen engine, preserving local runtime data and rejecting incomplete model bundles.
+- Build: `--release-only` now stages on a fixed on-disk path (refusing a tmpfs default that ate RAM), every artifact is asserted to actually contain the engine and NER model before release, and `zstandard` is declared explicitly in requirements.
+- Panel: unknown connection policies no longer reset the entire configuration; desktop control-plane requests bypass environment proxies.
+- Panel: default HTTP/2 consistently to off while preserving explicit choices, avoiding drift between templates and runtime configuration.
+- Engine: one broken `re:` word can no longer take down the whole word table (a single bad pattern silently disabled custom and built-in groups together).
+- Engine: recognition windows without CJK characters are no longer sent to the semantic model — ~74% less inference time on sparsely-Chinese content (measured).
+- Panel: the log list now labels the origin of 5xx (upstream / gateway block / proxy stopped); an upstream 503 is no longer misread as a gateway failure.
+
+### Changed
+- Engine: semantic-recognition segment size tightened from 20000 to 4000 chars — ~3x cheaper re-push on the second turn of a long session (measured 2308ms -> 778ms).
+- Engine: the event DB reclaims dead space after the retention pass (measured 237.5MB -> 159MB).
+
+### Added
+- Diagnostics: record actual connection selection and TLS phases, with local heartbeat and NER wait metrics instead of assuming every missing response is an upstream failure.
+- Self-check: new S35 (sensitive words not taking effect) and S36 (event DB dead space).
+- Panel: `/api/status` now exposes word-table effect counts (configured / engine-active / issues).
+
+---
 
 ## [0.6.2] - 2026-09-29
 

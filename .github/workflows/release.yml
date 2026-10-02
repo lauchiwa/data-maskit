@@ -112,7 +112,9 @@ jobs:
           python -c "import hashlib; from pathlib import Path; assert hashlib.sha256(Path('ner_mini_zh.zip').read_bytes()).hexdigest() == 'f125beef98bc9a49bb92237d100818bad18579775e6242744a9a421440e8056d', 'NER archive SHA-256 mismatch'"
           unzip -q -o ner_mini_zh.zip -d engine/models/ner_mini_zh
           rm -f ner_mini_zh.zip
-          test -f engine/models/ner_mini_zh/model_quantized.onnx
+          for model_file in model_quantized.onnx tokenizer.json config.json; do
+            test -s "engine/models/ner_mini_zh/$model_file"
+          done
       - name: Build and push
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
@@ -209,7 +211,9 @@ jobs:
           python -c "import hashlib; from pathlib import Path; assert hashlib.sha256(Path('ner_mini_zh.zip').read_bytes()).hexdigest() == 'f125beef98bc9a49bb92237d100818bad18579775e6242744a9a421440e8056d', 'NER archive SHA-256 mismatch'"
           unzip -q -o ner_mini_zh.zip -d engine/models/ner_mini_zh
           rm -f ner_mini_zh.zip
-          test -f engine/models/ner_mini_zh/model_quantized.onnx
+          for model_file in model_quantized.onnx tokenizer.json config.json; do
+            test -s "engine/models/ner_mini_zh/$model_file"
+          done
 
       - name: Build PyInstaller sidecar (Windows)
         if: runner.os == 'Windows'
@@ -225,6 +229,8 @@ jobs:
           Copy-Item dist_engine\MaskitEngine\MaskitEngine.exe "$target\MaskitEngine.exe"
           $count = (Get-ChildItem "$target\_internal" -Recurse -File | Measure-Object).Count
           if (-not (Test-Path "$target\MaskitEngine.exe") -or $count -lt 100) { throw "sidecar incomplete ($count files)" }
+          python tests/smoke_transport.py --engine "$target\MaskitEngine.exe" --ner
+          if ($LASTEXITCODE -ne 0) { throw "frozen sidecar smoke failed" }
 
       - name: Build PyInstaller sidecar (Unix)
         if: runner.os != 'Windows'
@@ -239,6 +245,8 @@ jobs:
           chmod +x src-tauri/resources/engine/MaskitEngine
           test -x src-tauri/resources/engine/MaskitEngine
           test "$(find src-tauri/resources/engine/_internal -type f | wc -l)" -ge 100
+          python3 tests/smoke_transport.py --engine src-tauri/resources/engine/MaskitEngine --ner
+          python3 tests/smoke_packaged_panel.py --engine src-tauri/resources/engine/MaskitEngine --expect-ner
 
       - name: Select updater mode (Windows)
         if: runner.os == 'Windows'
@@ -337,6 +345,71 @@ jobs:
           if [ -d src-tauri/target/release/bundle/appimage ]; then
             find src-tauri/target/release/bundle/appimage -mindepth 1 ! -name '*.AppImage*' -exec rm -rf {} + || true
           fi
+
+      - name: Assert packaged engine contents (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 断言的是「产物里面有没有引擎」，不是「构建目录里有没有」。resources 映射失效时
+          # Tauri 照样出一个上百 MB、能正常安装的 deb，用户点开只有「引擎缺失」四个字，
+          # 而这一步之前整条流水线全绿。dpkg-deb -c 是唯一能看见包内真实路径的便宜手段。
+          required=(
+            resources/engine/MaskitEngine
+            resources/engine/_internal/transparent.py
+            resources/engine/_internal/models/ner_mini_zh/model_quantized.onnx
+          )
+          listing="$RUNNER_TEMP/package-listing.txt"
+          found=0
+          for deb in src-tauri/target/release/bundle/deb/*.deb; do
+            [ -e "$deb" ] || continue
+            found=1
+            dpkg-deb -c "$deb" > "$listing"
+            missing=()
+            for entry in "${required[@]}"; do
+              grep -q "/${entry}\$" "$listing" || missing+=("$entry")
+            done
+            if [ ${#missing[@]} -gt 0 ]; then
+              echo "$(basename "$deb") is missing: ${missing[*]}" >&2
+              echo 'installer ships without a complete engine; aborting release' >&2
+              exit 1
+            fi
+            echo "ok: $(basename "$deb") ships the frozen engine and the NER model"
+          done
+          if [ "$found" -eq 0 ]; then
+            echo 'no .deb was produced' >&2
+            exit 1
+          fi
+
+      # Tauri bundler 只为 updater 载体（.exe / .app.tar.gz / .AppImage）产出 .sig；
+      # .deb 走的是 updater 的 install_deb（pkexec dpkg -i），它同样要求 latest.json
+      # 里带上 minisign 签名 —— 缺签名会在 download 阶段就失败，所以必须自己补签。
+      - name: Sign Linux packages for updater (deb)
+        if: runner.os == 'Linux' && steps.mode_unix.outputs.mode == 'signed'
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.MASKIT_UPDATER_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.MASKIT_UPDATER_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(src-tauri/target/release/bundle/deb/*.deb)
+          if [ "${#debs[@]}" -eq 0 ]; then
+            echo 'no .deb was produced to sign' >&2
+            exit 1
+          fi
+          for deb in "${debs[@]}"; do
+            node frontend/node_modules/@tauri-apps/cli/tauri.js signer sign "$deb"
+          done
+          sigs=(src-tauri/target/release/bundle/deb/*.deb.sig)
+          if [ "${#sigs[@]}" -ne "${#debs[@]}" ]; then
+            echo "expected ${#debs[@]} signatures, got ${#sigs[@]}" >&2
+            exit 1
+          fi
+          for sig in "${sigs[@]}"; do
+            test -s "$sig" || { echo "empty signature: $sig" >&2; exit 1; }
+            echo "signed: $(basename "$sig")"
+          done
 
       - name: Generate SHA-256 checksums (Windows)
         if: runner.os == 'Windows'
@@ -456,16 +529,26 @@ jobs:
               gh release create "$GITHUB_REF_NAME" --draft --generate-notes --title "Data Maskit $GITHUB_REF_NAME" --notes "$note"
             fi
           fi
-          # 清理线上已存在的 Tauri 构建中间产物（仅 v0.2.7 那次出现的新增项；现有 Release 上的资产
-          # gh release upload 不会自动删除，这里手动清掉，避免发布页混进 bundle_dmg.sh / icon.icns /
-          # eula-resources-template.xml / template.applescript 这类不应分发的文件）。
-          existing_assets=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' 2>/dev/null || true)
-          for stray in bundle_dmg.sh icon.icns eula-resources-template.xml template.applescript; do
-            if printf '%s\n' "$existing_assets" | grep -qxF "$stray"; then
-              gh release delete-asset "$GITHUB_REF_NAME" "$stray" >/dev/null
-              echo "Removed stray asset: $stray"
-            fi
-          done
+          # 自动清理线上已存在的非白名单资产（避免历史失败或中间重试遗留散装库/临时文件）
+          python3 -c '
+          import subprocess, json, sys, os
+          tag = os.environ.get("GITHUB_REF_NAME", "")
+          try:
+              raw = subprocess.check_output(["gh", "release", "view", tag, "--json", "assets"], text=True)
+              assets = json.loads(raw).get("assets", [])
+              keep_exts = (".exe", ".exe.sig", ".msi", ".dmg", ".dmg.sig", ".deb", ".deb.sig", ".appimage", ".appimage.sig", ".appimage.tar.gz", ".appimage.tar.gz.sig", ".app.tar.gz", ".app.tar.gz.sig", ".zip")
+              for a in assets:
+                  name = a["name"]
+                  low = name.lower()
+                  if name == "latest.json" or name.startswith("SHA256SUMS-") or name == "UNSIGNED.txt":
+                      continue
+                  if any(low.endswith(ext) for ext in keep_exts):
+                      continue
+                  subprocess.run(["gh", "release", "delete-asset", tag, name, "--yes"], check=False)
+                  print(f"Removed stray release asset: {name}")
+          except Exception as exc:
+              print(f"Cleanup stray assets skipped: {exc}", file=sys.stderr)
+          '
           # 仅上传合法且非空的 Release 资产文件（安装包、压缩包、签名、校验和），杜绝任何中间临时文件被误传
           while IFS= read -r -d '' file; do
             gh release upload "$GITHUB_REF_NAME" "$file" --clobber

@@ -7101,7 +7101,6 @@ class CustomWordSuffixCollisionTests(unittest.TestCase):
             dict(d) for d in self._saved]
         tr._CUSTOM_WORD_RX_CACHE.clear()
         tr._CUSTOM_COMBINED_CACHE["key"] = None
-        tr._CUSTOM_COMBINED_CACHE["rx"] = None
 
     def test_new_word_never_reuses_a_live_token_suffix(self):
         word = "回归词"
@@ -7352,11 +7351,13 @@ class MaskOffloadTests(unittest.TestCase):
         """
         import ner_engine
         seen = []
+        contexts = []
         real = ner_engine.begin_budget
 
-        def spy(seconds):
+        def spy(seconds, **kwargs):
             seen.append(seconds)
-            return real(seconds)
+            contexts.append(kwargs)
+            return real(seconds, **kwargs)
 
         flow = self._flow({"model": "gpt-4o-mini",
                            "messages": [{"role": "user", "content": "张三"}]})
@@ -7365,6 +7366,9 @@ class MaskOffloadTests(unittest.TestCase):
             self._drive(flow)
         self.assertEqual(seen, [tr._ner_req_budget(raw_len)],
                          "代理链路的 NER 总预算没打开或值与体积不匹配")
+        self.assertIsInstance(contexts[0]["deadline"], float)
+        self.assertIsInstance(contexts[0]["cancel_event"], threading.Event)
+        self.assertIsNone(flow.response, "正常请求不应被预算接线阻断")
 
     def test_ner_budget_is_capped_for_the_client_timeout(self):
         """预算按体积伸缩、有上下界，且**默认上限不得大到撞客户端超时**（P0-a）。
@@ -7410,14 +7414,25 @@ class MaskOffloadTests(unittest.TestCase):
         self.assertTrue(mask[0].get("ner_truncated"), "降级未在 MASK 事件里标出")
         self.assertEqual(mask[0].get("ner_skip_reasons"), {"budget_exhausted": 3})
 
-    def test_ner_too_long_limit_is_generous(self):
-        """单条长度上限不能太低：超过就**整条**不做 NER（比预算更容易咬人）。
+    def test_ner_segment_size_keeps_single_call_short(self):
+        """分段粒度必须让**单段**推理远短于单次调用上限。
 
-        真实流量里出现过 6208 字的单条正文，旧上限 2000 字让那条里的中文人名全明文。
+        旧契约是「单条上限不能太低，否则整条不做识别」（那时超限 = 整条跳过）；
+        分段识别上线后那条路径已经消失，新契约是**单段成本可控**：
+          · 段太大 -> 一次 deadline 收手就白扔一大段文本；
+          · 段太大 -> 段级缓存变粗，正文改一行就要整段重推（实测 12000 字改 1 个字后的
+            第二轮：段长 4000 = 778ms，段长 20000 = 2308ms）。
+        单位成本实测 0.28ms/字（1 线程，见 ner_engine 顶部成本模型），4 线程快 3.5 倍，
+        这里按保守值算。
         """
         import ner_engine
-        self.assertGreaterEqual(ner_engine.MAX_TEXT_CHARS, 20000,
-                                "单条上限过小会让长叶子整条不做语义识别")
+        self.assertGreaterEqual(ner_engine.MAX_TEXT_CHARS, 1000,
+                                "段太小会让窗口重叠占比过高、开销变大")
+        seg_s = ner_engine.MAX_TEXT_CHARS * 0.28 / 1000.0
+        self.assertLessEqual(
+            seg_s, ner_engine.CALL_BUDGET_S / 3.0,
+            "单段需 %.1fs，超过单次调用上限（%.1fs）的 1/3：deadline 收手会整段不缓存"
+            % (seg_s, ner_engine.CALL_BUDGET_S))
 
     def test_call_budget_can_finish_a_max_length_leaf(self):
         """单次调用上限必须够跑完一条达到长度上限的文本，**并且留出余量**。
@@ -8366,6 +8381,125 @@ class CredentialSynonymAndRestoreTests(unittest.TestCase):
         tr.restore("echo {{CONNSTR_kppmhp}}", dead_sid)
         self.assertGreaterEqual(tr._NO_SESSION_ORPHANS.get(dead_sid, [0])[0], 1,
                                 "无会话请求遇到占位符必须如实记录孤儿计数")
+
+
+class CustomWordTableIsolationTests(unittest.TestCase):
+    """词表执行计划：`re:` 词必须被隔离，一个坏词不得拖垮整张词表。
+
+    事故（2026-09-30，用户实测）：词表里写了 `re:(?i)(Beijing)`，只要表里还有比它更长的
+    词，它就会落到合并 alternation 的非首位，整条编译抛 `global flags not at the start
+    of the expression`。旧实现把该异常兜成「词表降级为空」→ **自定义词 + 内置敏感词组
+    一起静默失效**，代理照常 200，只留一行进程日志。用户看到的是「关掉 NER 后什么都
+    不脱敏」，从而误判成 NER 的问题。
+
+    隔离后：普通词仍走合并正则（性能不变），`re:` 词各自独立编译，坏词只毁它自己，
+    且原因登记进 `word_table_issues()`（面板 / 一键自检 / 事件详情共用）。
+    """
+
+    LONG = "某某超长自定义敏感词集团股份有限公司"   # 必须比 re: 词更长，才复现旧事故
+
+    def setUp(self):
+        self._old_ner = tr.NER_ENABLED
+        tr.NER_ENABLED = False            # 本类只验证确定性词表层
+        self._old_words = dict(tr.CUSTOM_WORDS)
+        self._old_disabled = tr.SENSITIVE_DISABLED
+        self._old_word_disabled = tr.SENSITIVE_WORD_DISABLED
+        self._old_whole = tr.SENSITIVE_WORD_WHOLE
+        tr.SENSITIVE_DISABLED = set()
+        tr.SENSITIVE_WORD_DISABLED = {}
+        tr.SENSITIVE_WORD_WHOLE = set()
+        tr.sessions.clear()
+        self._reset_caches()
+
+    def tearDown(self):
+        tr.NER_ENABLED = self._old_ner
+        tr.CUSTOM_WORDS.clear()
+        tr.CUSTOM_WORDS.update(self._old_words)
+        tr.SENSITIVE_DISABLED = self._old_disabled
+        tr.SENSITIVE_WORD_DISABLED = self._old_word_disabled
+        tr.SENSITIVE_WORD_WHOLE = self._old_whole
+        tr._refresh_custom_words_sorted()
+        self._reset_caches()
+        tr.sessions.clear()
+
+    def _reset_caches(self):
+        tr._CUSTOM_WORD_RX_CACHE.clear()
+        tr._CUSTOM_COMBINED_CACHE["key"] = None
+        tr._CUSTOM_COMBINED_CACHE["plan"] = None
+        tr._clear_word_table_issues()
+
+    def _set_words(self, words):
+        tr.CUSTOM_WORDS.clear()
+        tr.CUSTOM_WORDS.update({w: "TERM" for w in words})
+        tr._refresh_custom_words_sorted()
+        self._reset_caches()
+
+    def _mask(self, text, sid="cw-iso"):
+        tr.sessions.clear()
+        tr._new_session(sid)
+        return tr.mask(text, sid)
+
+    def test_inline_flag_word_does_not_kill_table(self):
+        """`re:(?i)(Beijing)` 不得再让整表失效（旧实现在此恒失效）。"""
+        self._set_words([self.LONG, "下载", "re:(?i)(Beijing)"])
+        out = self._mask("请下载资料，联系 Beijing 与 BEIJING")
+        self.assertNotIn("下载", out, "普通词必须照常生效（旧实现在此处整表失效）")
+        self.assertNotIn("Beijing", out)
+        self.assertNotIn("BEIJING", out)
+        self.assertEqual(tr.word_table_issues(), {}, "该写法合法，不该被登记为问题")
+
+    def test_duplicate_named_group_words_are_isolated(self):
+        """两个词共用命名组：旧实现整表失效，现在必须各自生效。"""
+        self._set_words([self.LONG, "下载", r"re:(?P<n>\d{4})", r"re:(?P<n>[a-z]+)"])
+        out = self._mask("请下载资料，编号 20260930")
+        self.assertNotIn("下载", out, "同名命名组不得拖垮整表")
+
+    def test_illegal_regex_skips_only_itself_and_is_reported(self):
+        """非法正则只跳过它自己，且必须留下可归因的问题登记。"""
+        self._set_words([self.LONG, "下载", "re:((a)", r"re:EMP-\d{6}"])
+        out = self._mask("请下载资料，编号 EMP-123456")
+        self.assertNotIn("下载", out, "坏词只能毁它自己")
+        self.assertNotIn("EMP-123456", out, "同表其他正则词照常生效")
+        issues = tr.word_table_issues()
+        self.assertTrue(any(k.startswith("re:((a)") for k in issues),
+                        "坏词必须被登记（否则面板/自检又变成「一头雾水」）")
+
+    def test_disabled_word_is_not_reported_as_issue(self):
+        """用户主动禁用的组/词不算问题，不该污染问题登记。"""
+        self._set_words([self.LONG, "下载"])
+        tr.SENSITIVE_WORD_DISABLED = {"TERM": {"下载"}}
+        self._reset_caches()
+        out = self._mask("请下载资料")
+        self.assertIn("下载", out, "被禁用的词不应命中")
+        self.assertEqual(tr.word_table_issues(), {})
+
+    def test_case_variants_reuse_one_placeholder(self):
+        """大小写变体复用同一占位符（旧实现是每次命中做 O(词数) 线性扫描，现在一次建索引）。"""
+        self._set_words(["Beijing"])
+        out = self._mask("Beijing 与 BEIJING")
+        toks = re.findall(r"\{\{[A-Z]+_[a-z]{6}\}\}", out)
+        self.assertEqual(len(toks), 2)
+        self.assertEqual(toks[0], toks[1], "大小写变体必须复用同一占位符")
+
+    def test_regex_word_original_is_matched_text(self):
+        """正则词的原文必须是**命中到的文本**，不能是正则本身。
+
+        否则还原会把 `re:EMP-\\d{6}` 这个模式串吐到用户屏幕上（隔离改造时实测踩到）。
+        """
+        self._set_words([r"re:EMP-\d{6}"])
+        text = "编号 EMP-123456 与 EMP-654321"
+        out = self._mask(text, "cw-iso-regex")
+        self.assertNotIn("EMP-123456", out)
+        self.assertEqual(tr.restore(out, "cw-iso-regex", final=True), text)
+
+    def test_plan_keeps_long_word_priority(self):
+        """长词优先：同位置同时命中时以更长的词为准（与旧合并实现语义一致）。"""
+        self._set_words(["北京市朝阳区建国路88号", "建国路"])
+        out = self._mask("地址：北京市朝阳区建国路88号")
+        self.assertNotIn("北京市朝阳区建国路88号", out)
+        self.assertEqual(len(re.findall(r"\{\{TERM_[a-z]{6}\}\}", out)), 1,
+                         "整段长词应作为一个整体命中，而不是被短词切开")
+        self.assertEqual(tr.word_table_issues(), {})
 
 
 if __name__ == "__main__":

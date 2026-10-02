@@ -615,8 +615,62 @@ def _s34(ctx):
                     "检查客户端/IDE 的代理地址是否指向本机端口；Docker 下需要 MASKIT_BIND_HOST=0.0.0.0 并映射端口")
 
 
+def _s35(ctx):
+    """敏感词表生效性（2026-09-30 事故）：词被跳过 / 整表没生效时必须说出来。
+
+    为什么值得单列一条规则：这类故障在面板上**完全看不出来** —— 词库页面显示得好好的、
+    代理照常 200，只是整张词表（自定义词 + 内置敏感词组）一个都不命中。用户唯一的
+    结论只能是「脱敏坏了」，而根因往往只是一个词的写法（例如 `re:(?i)(Beijing)`
+    的内联全局开关会让整条合并正则编译失败）。
+    """
+    issues = _dig(ctx, "words.issues", {}) or {}
+    configured = int(_num(_dig(ctx, "words.configured", 0)))
+    engine_count = _dig(ctx, "words.engine_count", None)
+    stale = bool(_dig(ctx, "words.engine_stale", True))
+    detail = ""
+    if isinstance(issues, dict) and issues:
+        detail = "；".join("%s -> %s" % (k, str(v)[:80]) for k, v in list(issues.items())[:3])
+    elif (not stale) and configured > 0 and engine_count == 0:
+        detail = "配置里有 %d 个词，但引擎报告的生效词数为 0" % configured
+    if not detail:
+        return None
+    if _is_en():
+        return _en("S35", "high", "Some sensitive words are not taking effect",
+                   detail,
+                   "Fix the listed words under Settings -> Word list (each re: pattern must compile on its own); saving hot-reloads immediately")
+    return _finding("S35", "high", "敏感词表有词未生效（可能漏脱敏）",
+                    detail,
+                    "在 设置 -> 敏感词库 修正列出的词（re: 正则必须能单独编译通过）；保存即热重载生效")
+
+
+def _s36(ctx):
+    """事件库死空间：删掉的明细只进 freelist，文件不会自己变小。
+
+    实测线上库 249MB 里 84MB 是这种"已删除但仍占盘"的空页（33%）—— 保留策略每天
+    都在删行，但此前全仓没有一处执行 VACUUM，所以体积只涨不落。只在确实浪费得多时提示；
+    引擎拿不到写锁时压缩会失败（`reclaim_space` 返回 ok=False），那种情况更需要让人看见。
+    """
+    db = _dig(ctx, "storage.db", {}) or {}
+    if not isinstance(db, dict) or not db.get("ok"):
+        return None
+    size_mb = _num(db.get("bytes")) / 1048576.0
+    free_mb = _num(db.get("free_bytes")) / 1048576.0
+    ratio = _num(db.get("free_ratio"))
+    if size_mb < 64 or ratio < 0.25:
+        return None
+    if _is_en():
+        return _en("S36", "low", "Event log file is holding dead space",
+                   "%.0fMB on disk, %.0fMB of it is free pages left by deleted rows (%.0f%%)"
+                   % (size_mb, free_mb, ratio * 100),
+                   "The next retention pass compacts it automatically; if it never drops, the engine rarely idles long enough to take the write lock")
+    return _finding("S36", "low", "事件库有死空间未回收",
+                    "磁盘占用 %.0fMB，其中 %.0fMB 是已删除行为空页（%.0f%%）"
+                    % (size_mb, free_mb, ratio * 100),
+                    "下一轮保留策略会自动压缩；若长期不下降，说明引擎长时间占用写锁、没有空隙可压")
+
+
 RULES = (_s01, _s02, _s03, _s04, _s10, _s11, _s12, _s20, _s21, _s22, _s23,
-         _s24, _s25, _s26, _s30, _s31, _s32, _s33, _s34)
+         _s24, _s25, _s26, _s30, _s31, _s32, _s33, _s34, _s35, _s36)
 
 # 「检查过且正常」的项：结论页要能告诉用户"这些都没问题"，否则一片空白会让人
 # 以为自检没跑。每项 = (id, 对应的规则集合, 正常时的一句话)。
@@ -638,9 +692,12 @@ OK_NOTES = (
     ("D", ("S20", "S21", "S22", "S26"),
      "语义识别与 CPU 状态正常（或未开启）",
      "Semantic recognition and CPU look normal (or NER is off)"),
-    ("E", ("S32", "S33", "S34"),
+    ("E", ("S32", "S33", "S34", "S36"),
      "事件库写入正常、磁盘充足",
      "Event DB writes healthy; disk space sufficient"),
+    ("F", ("S35",),
+     "敏感词表全部词均已生效",
+     "All sensitive words are in effect"),
 )
 
 

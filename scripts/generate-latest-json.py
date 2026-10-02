@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """自动组装 Tauri 更新元数据 latest.json。
 
-在指定目录下查找已签名的安装包（*.exe.sig），解析签名与版本信息，
-生成符合 tauri-plugin-updater 规范的 latest.json。
+在指定目录下查找已签名的安装包（*.exe.sig / *.app.tar.gz.sig / *.AppImage.sig /
+*.deb.sig），解析签名与版本信息，生成符合 tauri-plugin-updater 规范的 latest.json。
+
+Linux 的 deb 与 AppImage 各占一条独立条目（`linux-<arch>-deb` / `linux-<arch>`）：
+updater 以 `{os}-{arch}-{bundle_type}` 查找，取错载体时 install_deb 会直接报
+`invalid updater binary format`。
 
 用法：
   python scripts/generate-latest-json.py <目录路径> [--tag <tag>] [--repo <owner/repo>]
@@ -92,8 +96,10 @@ def main():
     # `glob` 的返回顺序由文件系统枚举决定，**不保证**把 updater 要的包排在前面。
     # 分类用「是不是这个平台的」，取用必须另外按 updater 可用性排序：下面每个平台
     # 都先 `_rank` 再取 `[0]`。直接取分类结果的第一个会让产物取决于目录枚举顺序
-    # （macOS 上实测取到 `.dmg`），而 `.dmg` / `.deb` 不是 updater 的下载目标，
+    # （macOS 上实测取到 `.dmg`），而 `.dmg` 根本不是 updater 的下载目标，
     # 写进 latest.json 就是让所有客户端的自动更新 404。
+    # 注意 `.deb` 不在此列：它是 `linux-<arch>-deb` 这条**独立条目**的正式载体
+    # （见下方 deb 拆分），只是不能被 AppImage 的那条取走。
     all_sigs = sorted(root.glob("**/*.sig"))
     win_sigs = [s for s in all_sigs if s.name.endswith(".exe.sig") or "windows" in s.as_posix().lower()]
     mac_sigs = [
@@ -114,12 +120,21 @@ def main():
         )
     ]
 
-    def _rank(sigs, *preferred_suffixes):
-        """按 updater 可接受的包形态排序：命中靠前后缀的优先，其余保持原序。
+    # deb 是「系统包管理器安装」形态，与 AppImage 不是同一个更新载体，必须拆开。
+    # 为什么不能共用 `linux-x86_64`：那条给 AppImage 用，deb 安装的客户端会先按
+    # `linux-x86_64-deb` 找、找不到才回退到 `linux-x86_64`，于是拿到 AppImage；
+    # 而 updater 的 install_deb 会先做 `is_deb()` 校验，失败即抛
+    # `invalid updater binary format`（v0.7.0 实测事故：deb 用户点更新直接报格式错）。
+    deb_sigs = [s for s in linux_sigs if s.name.lower().endswith(".deb.sig")]
+    linux_sigs = [s for s in linux_sigs if s not in deb_sigs]
 
-        tauri updater 只认增量更新包（Windows `.exe`、macOS `.app.tar.gz`、
-        Linux `.AppImage.tar.gz`）；`.dmg` / `.deb` 是给人手工装的，URL 虽然存在
-        但 updater 解不开。同名版本同时产出两种包是常态，所以必须显式定序。
+    def _rank(sigs, *preferred_suffixes):
+        """按 updater 可接受的包形态排序：命中靠前后缀的优先，其余按路径定序。
+
+        每条平台条目只认一种增量更新载体（Windows `.exe`、macOS `.app.tar.gz`、
+        Linux AppImage 条目要 `.AppImage.tar.gz`）；`.dmg` 是给人手工装的，URL
+        虽然存在但 updater 解不开。同一版本同时产出两种包是常态（macOS 必然同时
+        有 dmg 与 app.tar.gz），所以必须显式定序，不能靠目录枚举顺序。
         """
         def key(s):
             name = s.name.lower()
@@ -141,15 +156,25 @@ def main():
         s for s in linux_sigs
         if any(k in s.as_posix().lower() for k in ("arm64", "aarch64", "linux-arm64"))
     ], ".appimage.tar.gz.sig")
+    # deb 侧同口径按架构拆（包名里带 amd64 / arm64）。deb 条目只有 `.deb` 一种载体，
+    # 无需形态偏好，但仍过一遍 `_rank` 取得稳定顺序，避免同架构多包时产物随枚举漂移。
+    deb_x64_sigs = _rank([
+        s for s in deb_sigs
+        if any(k in s.as_posix().lower() for k in ("amd64", "x86_64", "x64", "linux-x64"))
+    ])
+    deb_arm64_sigs = _rank([
+        s for s in deb_sigs
+        if any(k in s.as_posix().lower() for k in ("arm64", "aarch64", "linux-arm64"))
+    ])
 
-    if not win_sigs and not mac_sigs and not linux_sigs:
+    if not win_sigs and not mac_sigs and not linux_sigs and not deb_sigs:
         print(f"No *.sig signature files found in {root}; skipping latest.json", file=sys.stderr)
         return 0
 
     # 2. 确定 tag 版本
     tag = args.tag or os.environ.get("GITHUB_REF_NAME", "")
     if not tag:
-        sample = (win_sigs or mac_sigs or linux_sigs)[0].name
+        sample = (win_sigs or mac_sigs or linux_sigs or deb_sigs)[0].name
         import re
         m = re.search(r"(\d+\.\d+\.\d+)", sample)
         if m:
@@ -198,6 +223,25 @@ def main():
         platforms["linux-aarch64"] = {
             "signature": sig_content,
             "url": f"https://github.com/{repo}/releases/download/{tag}/{bundle_name}",
+        }
+
+    # 5) Linux x86_64 (deb)：updater 运行时按 `{os}-{arch}-{bundle_type}` 查找，deb 安装的
+    #    客户端会命中这里。url 必须指向 .deb 本体（install_deb 的 is_deb 校验要求真 deb 字节）。
+    if deb_x64_sigs:
+        sig_path = deb_x64_sigs[0]
+        pkg_name = sig_path.with_suffix("").name  # 去掉 .sig → xxx.deb
+        platforms["linux-x86_64-deb"] = {
+            "signature": sig_path.read_text(encoding="utf-8").strip(),
+            "url": f"https://github.com/{repo}/releases/download/{tag}/{pkg_name}",
+        }
+
+    # 6) Linux aarch64 (deb)
+    if deb_arm64_sigs:
+        sig_path = deb_arm64_sigs[0]
+        pkg_name = sig_path.with_suffix("").name
+        platforms["linux-aarch64-deb"] = {
+            "signature": sig_path.read_text(encoding="utf-8").strip(),
+            "url": f"https://github.com/{repo}/releases/download/{tag}/{pkg_name}",
         }
 
     pub_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

@@ -58,6 +58,7 @@ function formatDuration(ms?: number | null): string {
 const NER_SKIP_LABELS: Record<string, string> = {
   too_long: 'settings.sw.nerSkipTooLong',
   budget_exhausted: 'settings.sw.nerSkipBudget',
+  cancelled: 'settings.sw.nerSkipCancelled',
   infer_failed: 'settings.sw.nerSkipInfer',
   deadline: 'settings.sw.nerSkipDeadline',
   model_unavailable: 'settings.sw.nerSkipModelUnavailable',
@@ -140,6 +141,14 @@ export function EventDetailDialog({
   seq: number | null
 }) {
   const { t, tf } = useI18n()
+  // Translate only known enums. New backend codes stay visible verbatim rather
+  // than becoming a missing translation key or an invented failure diagnosis.
+  const transportLabel = (kind: 'phase' | 'reason', value?: string | null) => {
+    if (!value) return t('transport.unknown')
+    const key = `transport.${kind}.${value}`
+    const label = t(key)
+    return label === key ? value : label
+  }
   // 高亮默认关：先让用户看到未加工的原文，要核对时再点开。
   // 默认开会让每次打开详情都是一片荧光绿，反而看不出重点。
   const [hl, setHl] = useState(false)
@@ -259,6 +268,30 @@ export function EventDetailDialog({
               <MetaItem k={t('detail.duration')} v={formatDuration(event.total_ms ?? event.upstream_ms ?? event.first_byte_ms)} />
             </div>
 
+            <section className="space-y-2 rounded-lg border bg-muted/20 p-3 text-xs" aria-label={t('transport.title')}>
+              <h3 className="font-medium">{t('transport.title')}</h3>
+              <dl className="grid grid-cols-2 gap-2">
+                {[
+                  [t('transport.phase'), transportLabel('phase', event.transport?.phase)],
+                  [t('transport.reason'), transportLabel('reason', event.transport?.reason)],
+                  [t('transport.connection'), event.transport?.server_conn_id || t('transport.unknown')],
+                  [t('transport.protocol'), !event.transport?.protocol || event.transport.protocol === 'unknown' ? t('transport.unknown') : event.transport.protocol],
+                  [t('transport.reused'), event.transport?.reused == null ? t('transport.unknown') : t(event.transport.reused ? 'transport.yes' : 'transport.no')],
+                  [t('transport.proxy'), event.transport?.via_proxy == null ? t('transport.unknown') : t(event.transport.via_proxy ? 'transport.yes' : 'transport.no')],
+                  [t('transport.idle'), event.transport?.idle_s == null ? t('transport.unknown') : String(event.transport.idle_s)],
+                  [t('transport.connect'), event.transport?.connect_ms == null ? t('transport.unknown') : formatDuration(event.transport.connect_ms)],
+                  [t('transport.tls'), event.transport?.tls_ms == null ? t('transport.unknown') : formatDuration(event.transport.tls_ms)],
+                  [t('transport.evidence'), event.transport?.evidence_complete == null ? t('transport.unknown') : t(event.transport.evidence_complete ? 'transport.complete' : 'transport.partial')],
+                ].map(([label, value]) => <div key={label} className="min-w-0"><dt className="text-muted-foreground">{label}</dt><dd className="break-all">{value}</dd></div>)}
+              </dl>
+              <p className="text-muted-foreground">{t('transport.caution')}</p>
+              {event.failure_phase && <p>{t('transport.localPhase')}: {transportLabel('phase', event.failure_phase)}</p>}
+              {event.upstream_may_have_executed && <p>{t('transport.executed')}</p>}
+            </section>
+            {(event.ner_init_ms != null || event.ner_infer_ms != null || event.ner_budget_wait_ms != null) && (
+              <p className="text-xs text-muted-foreground">{t('detail.nerTiming')}: {[event.ner_init_ms, event.ner_infer_ms, event.ner_budget_wait_ms].map((v) => v == null ? t('transport.unknown') : formatDuration(v)).join(' / ')}</p>
+            )}
+
             {/* 流式信息（stream_actual 与 stream_mode 背离提示） */}
             {event.stream_mode && (
               <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-muted/40 p-2.5 text-xs">
@@ -365,7 +398,7 @@ export function EventDetailDialog({
             {(event.msg || event.reason) && (
               <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs leading-relaxed text-amber-700 dark:text-amber-400">
                 {event.msg && <div className="whitespace-pre-wrap">{event.msg}</div>}
-                {event.reason && <div className="mt-1 text-muted-foreground">{event.reason}</div>}
+                {event.reason && <div className="mt-1 text-muted-foreground">{transportLabel('reason', event.reason)}</div>}
               </div>
             )}
 
@@ -415,7 +448,7 @@ export function EventDetailDialog({
                       </span>
                     )}
                     {(event.unresolved ?? 0) > 0 && (
-                      <span className="text-amber-600 dark:text-amber-400">
+                      <span className="text-amber-600 dark:text-amber-400" title={t('logs.unresolvedHint')}>
                         {t('logs.colUnresolved')} <strong>{event.unresolved}</strong>
                       </span>
                     )}
@@ -429,6 +462,14 @@ export function EventDetailDialog({
                 <p className="mt-1.5 text-[11px] text-muted-foreground leading-relaxed">
                   {stageInfo.desc}
                 </p>
+                {/* 未还原占位符样本：让「模型把占位符写错/自造」与「映射过期」一眼可分。
+                    旧事件没有这个字段时不渲染（不给正常请求加噪声）。 */}
+                {Array.isArray(event.unresolved_samples) && event.unresolved_samples.length > 0 && (
+                  <div className="mt-1.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] leading-snug text-amber-700 dark:text-amber-300">
+                    <span>{t('logs.unresolvedSamples')}</span>
+                    <span className="ml-1 font-mono">{event.unresolved_samples.join(' / ')}</span>
+                  </div>
+                )}
               </div>
             )}
 

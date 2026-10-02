@@ -404,7 +404,7 @@ impl EngineManager {
 
     /// `panel_alive` 的可测版本（显式端口）。
     fn panel_alive_on(port: u16) -> bool {
-        let client = match reqwest::blocking::Client::builder()
+        let client = match reqwest::blocking::Client::builder().no_proxy()
             .timeout(Duration::from_millis(800))
             .build()
         {
@@ -440,7 +440,7 @@ impl EngineManager {
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
                 let base = format!("http://127.0.0.1:{}", engine_port());
-                if let Ok(client) = reqwest::blocking::Client::builder()
+                if let Ok(client) = reqwest::blocking::Client::builder().no_proxy()
                     .timeout(Duration::from_secs(3))
                     .build()
                 {
@@ -713,7 +713,7 @@ impl EngineManager {
         if token.is_empty() {
             return Err("token 为空，跳过优雅停".into());
         }
-        let client = reqwest::blocking::Client::builder()
+        let client = reqwest::blocking::Client::builder().no_proxy()
             .timeout(Duration::from_secs(2))
             .build()
             .map_err(|e| e.to_string())?;
@@ -1759,7 +1759,7 @@ pub fn run() {
                                     .map(|s| s.trim().to_string())
                                     .unwrap_or_default();
                                 let base = format!("http://127.0.0.1:{}", engine_port());
-                                if let Ok(client) = reqwest::blocking::Client::builder()
+                                if let Ok(client) = reqwest::blocking::Client::builder().no_proxy()
                                     .timeout(Duration::from_secs(5))
                                     .build()
                                 {
@@ -2098,6 +2098,42 @@ mod panel_alive_tests {
         assert!(!EngineManager::port_ready_on(port));
         assert!(!EngineManager::panel_alive_on(port));
         drop(socket); // 两次探测结束后才释放端口。
+    }
+
+    #[test]
+    fn local_http_probe_ignores_proxy_environment() {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+        const CHILD_PORT: &str = "MASKIT_TEST_LOCAL_HTTP_PORT";
+        if let Ok(port) = std::env::var(CHILD_PORT) {
+            assert!(EngineManager::panel_alive_on(port.parse().unwrap()));
+            return;
+        }
+        // Change proxy variables only in a child, never in the parallel test runner.
+        let (listener, port) = hold_port();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let end = Instant::now() + Duration::from_secs(4);
+            while Instant::now() < end {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", "panel_alive_tests::local_http_probe_ignores_proxy_environment"])
+            .env(CHILD_PORT, port.to_string()).env("NO_PROXY", "").env("no_proxy", "");
+        for key in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+            child.env(key, "http://127.0.0.1:0");
+        }
+        let output = child.output().unwrap();
+        server.join().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
     }
 
     #[test]

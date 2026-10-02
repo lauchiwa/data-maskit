@@ -16,6 +16,8 @@ mitmproxy 本地显式代理 - 只拦目标站点聊天接口，脱敏请求 + �
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
 import asyncio
 import codecs
+import copy
+from types import SimpleNamespace
 import collections
 import concurrent.futures
 import threading
@@ -31,7 +33,9 @@ import time
 import secrets
 import uuid
 from pathlib import Path
-from mitmproxy import http
+from mitmproxy import http, ctx, exceptions
+from connection_policy import ConnectionGovernance, validate_connection_policy
+from body_buffer import decode_body
 from urllib.parse import urlparse
 from shield_defaults import (
     DEFAULT_DOMAINS,
@@ -54,6 +58,178 @@ import base64
 import hashlib
 import fnmatch
 from typing import NamedTuple
+
+# Transport evidence is event-loop owned; workers only read frozen metadata.
+_CONNECTIONS = ConnectionGovernance()
+_CONNECTION_STATS = {}
+_HEARTBEAT = {}
+_HEARTBEAT_TASK = None
+_METRICS_POOL = None
+_MASK_CANCEL_BY_CLIENT = {}
+_MASK_WORK_CONTEXT = threading.local()
+
+
+class _ClientFlowCancelled(asyncio.CancelledError):
+    """Client stream ended: return normally from the mitmproxy hook, not its task."""
+
+
+def _cancel_signal(flow):
+    signal = getattr(flow, "_shield_cancel_wakeup", None)
+    if signal is None:
+        signal = asyncio.Event()
+        flow._shield_cancel_wakeup = signal
+    return signal
+
+
+def _dispose_stream(flow):
+    stream = getattr(getattr(flow, "response", None), "stream", None)
+    dispose = getattr(stream, "_maskit_dispose", None)
+    if callable(dispose):
+        dispose()
+
+
+def _on_stream_cancel(flow, reason):
+    _dispose_stream(flow)
+    flow._shield_cancel_reason = reason
+    _cancel_signal(flow).set()
+    event = getattr(flow, "_shield_mask_cancel", None)
+    if event is not None:
+        event.set()
+    token = _aux_token(flow)
+    owned = token.session_ref if token is not None else None
+    _aux_abandon(flow)
+    if (owned is not None and not token.submitted
+            and not flow.metadata.get("shield_mask_pending")):
+        _drop(flow.metadata.get("session_id"), expect=owned)
+
+
+def _record_client_cancel(flow, phase):
+    if getattr(flow, "_shield_cancel_recorded", False):
+        return
+    flow._shield_cancel_recorded = True
+    _transport_event("error", flow)
+    flow.metadata["transport"] = _safe_transport_snapshot(flow)
+    req = getattr(flow, "request", None)
+    _emit("CANCEL", sid=flow.metadata.get("session_id", ""),
+          host=getattr(req, "host", ""), method=getattr(req, "method", ""),
+          path=str(getattr(req, "path", "")).split("?", 1)[0],
+          reason=getattr(flow, "_shield_cancel_reason", "client_disconnected"),
+          failure_phase=phase, transport=_transport_snapshot(flow))
+
+
+_CONNECTIONS.on_cancel = _on_stream_cancel
+
+
+def _transport_event(name, *args):
+    try:
+        getattr(_CONNECTIONS, name)(*args)
+    except Exception:
+        _CONNECTIONS.observation_errors += 1
+
+
+def _safe_transport_snapshot(flow):
+    try:
+        return _CONNECTIONS.snapshot(flow)
+    except Exception:
+        # Diagnostic failures (including non-weakrefable test flows) cannot affect traffic.
+        _CONNECTIONS.observation_errors += 1
+        return {"phase": "unknown", "evidence_complete": False}
+
+
+def _transport_snapshot(flow):
+    return dict((getattr(flow, "metadata", None) or {}).get("transport") or {})
+
+
+def _transport_complete(flow):
+    _transport_event("response_complete", flow)
+    flow.metadata["transport"] = _safe_transport_snapshot(flow)
+
+
+def requestheaders(flow):
+    # Also guard live option changes: rejection must precede any body forwarding.
+    if getattr(getattr(ctx, "options", None), "stream_large_bodies", None) is not None:
+        flow.response = http.Response.make(
+            503, b'{"error":{"code":"unsafe_request_streaming"}}',
+            {"content-type": "application/json"})
+
+
+def configure(updated):
+    # Automatic body streaming can send plaintext before request() masks it.
+    if getattr(getattr(ctx, "options", None), "stream_large_bodies", None) is not None:
+        raise exceptions.OptionsError("Maskit requires stream_large_bodies to remain unset")
+
+
+async def _heartbeat_loop():
+    global _CONNECTION_STATS, _HEARTBEAT
+    loop = asyncio.get_running_loop()
+    expected = loop.time()
+    while True:
+        _CONNECTION_STATS = _CONNECTIONS.stats()
+        _HEARTBEAT = {"generated_at": int(time.time()),
+                      "loop_lag_ms": round(max(0, loop.time() - expected) * 1000, 2)}
+        # Only one queued write; never use the DNS/default executor or block the loop.
+        await loop.run_in_executor(_METRICS_POOL, write_runtime_metrics, True)
+        expected = loop.time() + 2.0
+        await asyncio.sleep(2.0)
+
+
+def running():
+    global _HEARTBEAT_TASK, _METRICS_POOL
+    configure(set())
+    if _HEARTBEAT_TASK is not None and not _HEARTBEAT_TASK.done():
+        return
+    _transport_event("running")
+    _METRICS_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="maskit-metrics")
+    _HEARTBEAT_TASK = asyncio.get_running_loop().create_task(_heartbeat_loop())
+
+
+def done():
+    global _HEARTBEAT_TASK, _METRICS_POOL
+    if _HEARTBEAT_TASK is not None:
+        _HEARTBEAT_TASK.cancel()
+        _HEARTBEAT_TASK = None
+    if _METRICS_POOL is not None:
+        _METRICS_POOL.shutdown(wait=False, cancel_futures=True)
+        _METRICS_POOL = None
+    for events in _MASK_CANCEL_BY_CLIENT.values():
+        for event in events:
+            event.set()
+    _MASK_CANCEL_BY_CLIENT.clear()
+    _transport_event("done")
+
+
+def client_disconnected(client):
+    for event in _MASK_CANCEL_BY_CLIENT.get(str(client.id), ()):
+        event.set()
+
+
+def server_connect(data):
+    _transport_event("server_connect", data)
+
+
+def server_connected(data):
+    _transport_event("server_connected", data)
+
+
+def server_connect_error(data):
+    _transport_event("server_connect_error", data)
+
+
+def server_disconnected(data):
+    _transport_event("server_disconnected", data)
+
+
+def tls_start_server(data):
+    _transport_event("tls_start_server", data)
+
+
+def tls_established_server(data):
+    _transport_event("tls_established_server", data)
+
+
+def tls_failed_server(data):
+    _transport_event("tls_failed_server", data)
+
 
 # 内置正则规则（敏感词字面在 config.json，正则规则固定，避免 UI 误改）
 ID_BOUND_L = r"(?<![A-Za-z0-9])"
@@ -817,7 +993,7 @@ def _debug(tag, sid, text):
 
 
 def _touch(sid):
-    s = sessions.get(sid)
+    s = _session_get(sid)
     if s:
         s["ts"] = time.time()
 
@@ -1848,7 +2024,7 @@ def _remember(fwd, labels, orig, label):
 
 
 # 按长度降序的敏感词表（长词优先匹配，保证同一位置长词先命中）。
-# 唯一消费者是 _custom_combined_regex，而它只在合并正则缓存未命中时才会走到这里，
+# 唯一消费者是 _custom_words_plan，而它只在执行计划缓存未命中时才会走到这里，
 # 所以下面的排序不进 mask 热路径。
 _CUSTOM_WORDS_SORTED = ()
 
@@ -2838,9 +3014,63 @@ _SINGLE_WORD_BOUND = r"A-Za-z0-9_\u4e00-\u9fff"
 # 退化回子串匹配（宁可多打码，不可漏打码）；ASCII 词边界照旧，Acme 不会命中 AcmeCorp。
 _WHOLE_WORD_BOUND = r"A-Za-z0-9_"
 _CUSTOM_WORD_RX_CACHE = {}
-# 合并正则缓存：500 词 × 10 万字符从 O(词数×长度) 降到 O(长度)（审计性能项）。
+# 词表执行计划缓存：把全部启用词编译成一份**有序**执行计划。
+# 500 词 × 10 万字符从 O(词数×长度) 降到 O(长度)（审计性能项）。
 # 词表/禁用状态变化时 key 失效重建；key 计算是 O(词数) 的元组比较，微秒级。
-_CUSTOM_COMBINED_CACHE = {"key": None, "rx": None}
+#
+# 计划元素（顺序即执行顺序，按词长降序 = 长词优先，与逐词替换语义一致）：
+#   ("literal", rx, index)           连续普通词合并成的一条 alternation
+#   ("regex",   rx, (word, label))   单个 re: 词，**独立编译**
+#
+# ⚠️ 为什么 re: 词必须独立编译、绝不能拼进同一条 alternation（2026-09-30 实测事故）：
+# 用户写的 `re:(?i)(Beijing)` 单看合法（面板保存也是逐词编译 -> 放行），但只要词表里
+# 存在比它更长的词，它就会落到 alternation 的非首位，整条编译抛
+# `global flags not at the start of the expression`；旧实现把该异常兜成「词表降级为
+# 空」-> **自定义词 + 内置敏感词组一起静默失效**，代理照常 200，只留一行进程日志。
+# 用户看到的现象是「关掉 NER 后什么都不脱敏了」，而根因与 NER 毫无关系。
+# 被隔离掉的同类问题还有：跨词同名命名组（redefinition of group name）、反向引用 \1
+# 因别的词插进来导致组号漂移而指错组。隔离后这些写法各自独立成立，坏词只毁它自己。
+#
+# `key` 槽位与旧实现同名同义（None = 失效重建）：测试夹具直接改它来清缓存。
+# （旧实现还有个 `rx` 槽位，执行计划上线后没有消费者了，已直接删除。）
+_CUSTOM_COMBINED_CACHE = {"key": None, "plan": None}
+
+
+# 词表问题登记表（词 -> 原因）。容量有限、同词只记首次，配置换代时清空。
+# 存在的理由：这些问题以前**只在进程日志里留一行**，面板、事件、一键自检全看不见，
+# 用户唯一能得出的结论是「脱敏坏了」。现在由 /api/status、一键自检与 MASK/RESTORE
+# 事件详情共用它，把「哪个词、什么原因、怎么改」直接摆到用户面前。
+_WORD_TABLE_ISSUES = {}
+_WORD_TABLE_ISSUES_LOCK = threading.Lock()
+_WORD_TABLE_ISSUES_MAX = 20
+
+
+def _note_word_table_issue(word, reason):
+    """登记一条词表问题（线程安全；同词只记首次，最多留 `_WORD_TABLE_ISSUES_MAX` 条）。"""
+    try:
+        key = str(word or "")[:200]
+        with _WORD_TABLE_ISSUES_LOCK:
+            if key in _WORD_TABLE_ISSUES or len(_WORD_TABLE_ISSUES) >= _WORD_TABLE_ISSUES_MAX:
+                return
+            _WORD_TABLE_ISSUES[key] = str(reason or "")[:200]
+        _log(f"[mask] 词表问题：{key} —— {reason}")
+    except Exception:
+        pass
+
+
+def word_table_issues():
+    """当前词表问题快照（词 -> 原因）。空 dict = 全部词都能用。
+
+    出口三处：`/api/status`（面板设置页）、一键自检、MASK/RESTORE 事件详情。
+    """
+    with _WORD_TABLE_ISSUES_LOCK:
+        return dict(_WORD_TABLE_ISSUES)
+
+
+def _clear_word_table_issues():
+    """配置换代后清空：上一代词表的问题不该挂在新一代上（新词表会在下次构建计划时重评）。"""
+    with _WORD_TABLE_ISSUES_LOCK:
+        _WORD_TABLE_ISSUES.clear()
 
 
 def _custom_word_regex(word):
@@ -2865,67 +3095,103 @@ def _custom_word_regex(word):
     return rx
 
 
-def _custom_combined_regex():
-    """全部启用词合并为一条正则（词按长度降序，同一位置长词优先，与逐词替换语义一致）。
+def _literal_word_pattern(word):
+    """普通词 -> 一条**纯字面量**片段（escaped，永不编译失败）。
 
-    支持 re: 前缀的正则型自定义词（审计规则专项 P3）：如 re:EMP-\\d{6}。
-    正则词不 re.escape，直接拼入合并正则。
-
-    P0 修复（审计意见）：正则词编译保护——用户填的非法正则（缺括号等）
-    会 re.compile 抛 PatternError，导致整个合并正则失败 → mask() 异常 →
-    fail-closed 503，全部客户端被拒。这里逐词 try 编译，坏词跳过并留痕，
-    其余词照常生效；绝不让词表配置错误升级成全局阻断。
-
-    缓存命中判断必须放在构建 parts 之前：合并正则的 key 已完整覆盖词表与禁用状态
-    （_custom_word_enabled 只读 SENSITIVE_DISABLED / SENSITIVE_WORD_DISABLED），
-    命中时直接返回，既省掉热路径上的排序与拼接，也避免「跳过非法正则词」的日志
-    每次请求都重打一遍（原实现把日志与 parts 构建放在检查之前，命中缓存也会刷日志）。
+    边界规则与旧的合并实现完全一致（勿改）：
+      · 单字词用 `_SINGLE_WORD_BOUND`（含汉字，避免「密」打中「密码」）；
+      · 显式「整词匹配」的词用 `_WHOLE_WORD_BOUND`（不含汉字，否则中文词永不命中）；
+      · 其余（>=2 字）无边界，子串匹配 —— 宁可多打码，不可漏打码。
     """
-    key = (
+    esc = re.escape(word)
+    if len(word) == 1 or word in SENSITIVE_WORD_WHOLE:
+        bound = _SINGLE_WORD_BOUND if len(word) == 1 else _WHOLE_WORD_BOUND
+        return rf"(?<![{bound}]){esc}(?![{bound}])"
+    return esc
+
+
+def _custom_words_plan_key():
+    """计划缓存键：完整覆盖词表内容与禁用状态（`_custom_word_enabled` 只读这两个集合）。"""
+    return (
         tuple(CUSTOM_WORDS.items()),
         tuple(sorted(SENSITIVE_DISABLED)),
         tuple(sorted((l, w) for l, ws in SENSITIVE_WORD_DISABLED.items() for w in ws)),
         tuple(sorted(SENSITIVE_WORD_WHOLE)),
     )
-    if _CUSTOM_COMBINED_CACHE["key"] == key and _CUSTOM_COMBINED_CACHE["rx"] is not None:
-        return _CUSTOM_COMBINED_CACHE["rx"]
-    parts = []
-    skipped = []
+
+
+def _custom_words_plan():
+    """构建（或取缓存）词表执行计划，语义见 `_CUSTOM_COMBINED_CACHE` 的注释。
+
+    两遍：① 按长词优先顺序把启用词摊成 `word` / `regex` 两种条目（`re:` 词在此单独
+    编译，坏词只跳过它自己并登记原因）；② 把**连续**的 `word` 条目合并成一条
+    alternation（`re:` 词天然成为分界线），逐字面量段编译。
+
+    任何编译失败都**只影响它自己**：段编译失败退化为逐词 pattern，单词失败只跳过该词。
+    旧实现在这一步失败时把**整张词表**置空（自定义词 + 内置敏感词组一起失效），
+    是本轮修复的核心缺陷。
+    """
+    key = _custom_words_plan_key()
+    cache = _CUSTOM_COMBINED_CACHE
+    if cache["key"] == key and cache["plan"] is not None:
+        return cache["plan"]
+
+    items = []          # ("word", word, label) | ("regex", compiled_rx, word, label)
     for word, label in _custom_words_sorted():
         if not word or not _custom_word_enabled(word, label):
             continue
         if word.startswith("re:"):
-            # 正则型自定义词：单独编译校验，失败跳过（不阻断其他词）
             try:
-                re.compile(word[3:], re.IGNORECASE)
+                rx = re.compile(word[3:], re.IGNORECASE)
             except re.error as e:
-                skipped.append((word, str(e)))
+                # 非法正则只跳过它自己（旧行为），但必须留痕给面板/自检/事件
+                _note_word_table_issue(word, f"正则无效，已跳过该词：{e}")
                 continue
-            parts.append(word[3:])
-            continue
-        esc = re.escape(word)
-        if len(word) == 1 or word in SENSITIVE_WORD_WHOLE:
-            # 单字词或显式整词开关：两侧加边界，避免子串误伤。
-            # 边界字符类分档：单字词用 _SINGLE_WORD_BOUND（含汉字，避免「密」打中
-            # 「密码」）；整词开关用 _WHOLE_WORD_BOUND（不含汉字）——否则中文词永不命中，
-            # 见该常量处的说明。单字判在前，故单字词的行为未变。
-            bound = _SINGLE_WORD_BOUND if len(word) == 1 else _WHOLE_WORD_BOUND
-            parts.append(rf"(?<![{bound}]){esc}(?![{bound}])")
+            items.append(("regex", rx, word, label))
         else:
-            parts.append(esc)
-    if skipped:
-        for w, err in skipped[:5]:
-            _log(f"[mask] 跳过非法正则词 {w[:60]}...：{err}")
-    # 整体再包一层 try：parts 拼合本身也可能因用户正则里的 | 破坏结构，
-    # 兜底降级为空正则（全部词不生效但代理不 503）
-    try:
-        rx = re.compile("|".join(parts), re.IGNORECASE) if parts else None
-    except re.error as e:
-        _log(f"[mask] 合并正则编译失败，词表降级为空（坏词已跳过）：{e}")
-        rx = None
-    _CUSTOM_COMBINED_CACHE["key"] = key
-    _CUSTOM_COMBINED_CACHE["rx"] = rx
-    return rx
+            items.append(("word", word, label))
+
+    # 大小写索引：命中文本 -> (词表里的原始 key, 标签)，让 ACME/acme 复用同一个原词与
+    # 占位符。旧实现是**每次命中**都对 CUSTOM_WORDS 做一次 O(词数) 的 `next()` 线性
+    # 扫描（5000 词表 + 上千命中 = 百万级比较），这里只建一次。冲突时取词表中**首个**
+    # 匹配（与旧实现 `next(...)` 同义）。
+    index = {}
+    for it in items:
+        if it[0] == "word":
+            index.setdefault(it[1].lower(), (it[1], it[2]))
+
+    plan = []
+    batch = []
+
+    def _flush():
+        if not batch:
+            return
+        try:
+            rx = re.compile("|".join(_literal_word_pattern(w) for w, _l in batch),
+                            re.IGNORECASE)
+        except re.error as e:                       # 纯 escaped 字面量，理论上不可达
+            rx = None
+            _note_word_table_issue(batch[0][0],
+                                   f"普通词合并编译失败，已改为逐词匹配：{e}")
+        if rx is not None:
+            plan.append(("literal", rx, index))
+        else:
+            # 兜底：逐词独立 pattern。**绝不整表置空** —— 那等于把用户整张词表废掉
+            plan.extend(("literal", re.compile(_literal_word_pattern(w), re.IGNORECASE), index)
+                        for w, _l in batch)
+        del batch[:]
+
+    for it in items:
+        if it[0] == "word":
+            batch.append((it[1], it[2]))
+        else:
+            _flush()
+            plan.append(("regex", it[1], it[3]))
+    _flush()
+
+    cache["key"] = key
+    cache["plan"] = plan
+    return plan
 
 
 def _sync_custom_word_mappings():
@@ -3470,7 +3736,7 @@ def _ner_warn_once(key, msg):
 
 
 @contextlib.contextmanager
-def _ner_doc_budget(seconds):
+def _ner_doc_budget(seconds, *, deadline=None, cancel_event=None):
     """给一段连续调用（如整份 Office 文档逐 run 脱敏）设 NER 总预算。
 
     单条短文本实测约 10ms，几千个 run 会线性堆到分钟级，而扩展侧 HTTP 超时更短，
@@ -3481,7 +3747,10 @@ def _ner_doc_budget(seconds):
     except Exception:
         yield
         return
-    ner_engine.begin_budget(seconds)
+    if deadline is None and cancel_event is None:
+        ner_engine.begin_budget(seconds)
+    else:
+        ner_engine.begin_budget(seconds, deadline=deadline, cancel_event=cancel_event)
     try:
         yield
     finally:
@@ -3728,7 +3997,7 @@ def mask(text, sid):
                            "OffsetMap 坐标合成降级，本次跳过 NER 识别: %s: %s"
                            % (type(e).__name__, e))
 
-    s = sessions.get(sid)
+    s = _session_get(sid)
     if s is None:
         _new_session(sid)
         s = sessions[sid]
@@ -3762,23 +4031,26 @@ def mask(text, sid):
             text, edits = _mask_excluding_placeholders_ed(text, prefix_rx, _prefix_sub)
             _update_om(edits, curr_len)
 
-    cw_rx = _custom_combined_regex()
-    if cw_rx:
-        # 单次扫描替换全部自定义词（长词优先，与旧逐词循环语义一致但 O(长度)）
-        # 跳过已有占位符片段（防污染：自定义词含 hex 子串会劈开占位符）
-        # 大小写不敏感（IGNORECASE）：ACME/acme/Acme 都匹配，但 CUSTOM_WORDS 的 key
-        # 可能是 Acme —— 用小写反查 label，避免大小写变体拿不到 label 回退到 TERM。
-        _cw_label_lower = {w.lower(): lbl for w, lbl in CUSTOM_WORDS.items()}
-        def _cw_sub(m):
+    # 自定义词扫描。计划由 `_custom_words_plan()` 产出：普通词合并成一条 alternation
+    # （O(长度)，长词优先），`re:` 词各自独立成项 —— 隔离用户正则的全局 flag、命名组
+    # 与反向引用，坏词只毁它自己而不是整张词表（见该函数的注释）。
+    # 跳过已有占位符片段（防污染：自定义词含 hex 子串会劈开占位符）。
+    for _cw_kind, _cw_rx, _cw_meta in _custom_words_plan():
+        def _cw_sub(m, _kind=_cw_kind, _meta=_cw_meta):
             word = m.group(0)
-            label = _cw_label_lower.get(word.lower(), "")
-            # _hit 需要原始 key 来建 fwd 映射；大小写变体统一用查到的原始 key
-            orig_key = next((k for k in CUSTOM_WORDS if k.lower() == word.lower()), word)
+            if _kind == "literal":
+                # 大小写变体统一用词表里的原始 key（ACME/acme 复用同一占位符）
+                orig_key, label = _meta.get(word.lower()) or (word, "")
+            else:
+                # 正则型词：原文是**命中到的文本**（每个命中各自建映射，绝不把正则
+                # 本身当原文 —— 那会让还原吐出 `re:...` 字面量），标签取词表里那个词的
+                orig_key, label = word, _meta
             _hit(orig_key, label)
             return fwd.get(orig_key, word)
         curr_len = len(text)
-        text, edits = _mask_excluding_placeholders_ed(text, cw_rx, _cw_sub)
+        text, edits = _mask_excluding_placeholders_ed(text, _cw_rx, _cw_sub)
         _update_om(edits, curr_len)
+
 
     # 被豁免的连接串**区间** [start, end)（end 即 userinfo 结尾的 `@` 之后）：
     # RULES 里 CONNSTR 排在 EMAIL 之前，本列表用于让 EMAIL 避开与这些区间重叠的
@@ -3963,7 +4235,7 @@ def _lookup(token, sid):
     （它需要表达「该网段的 .0」却只有不透明 token），那属于脱敏格式的设计，
     不是还原侧能补的。
     """
-    s = sessions.get(sid)
+    s = _session_get(sid)
     hit = None
     if s:
         hit = s["rev"].get(token)
@@ -4023,7 +4295,7 @@ def restore(text, sid, channel="", escape=False, final=False):
              原文里的引号、换行必须按 JSON 转义，否则客户端解析工具参数直接报错。
     final:   True = 不再等后续 chunk，缓冲区一次性吐出。
     """
-    s = sessions.get(sid)
+    s = _session_get(sid)
     if not isinstance(text, str):
         return text
     if not s:
@@ -4347,7 +4619,7 @@ def _cmd_record(sid, hit, channel_kind, blocked=False):
     就把既有条目升级为「已阻断」，而不是新增一条——时间线里一条命令只该有一行，
     「有没有被拦」是这行的属性。
     """
-    s = sessions.get(sid)
+    s = _session_get(sid)
     if not isinstance(s, dict):
         return
     snippet, pid, label = hit
@@ -4371,7 +4643,7 @@ def _cmd_is_echo(sid, snippet):
     = 用户自己问的（或上下文带进来的），上游没有凭空多给任何东西 →
     **既不记录也不改写**。优先级：回声抑制 > 白名单 > 黑名单。
     """
-    s = sessions.get(sid)
+    s = _session_get(sid)
     if not isinstance(s, dict) or not snippet:
         return False
     return str(snippet) in _ensure_cmd_req_snippets(s)
@@ -4389,7 +4661,7 @@ def _remember_request_cmd_snippets(sid, content):
     首次真要判定回声时由 `_ensure_cmd_req_snippets` 扫一次即丢。
     """
     try:
-        s = sessions.get(sid)
+        s = _session_get(sid)
         if not isinstance(s, dict) or not content:
             return
         pats = (COMMAND_BLOCK or {}).get("patterns") or []
@@ -4458,7 +4730,7 @@ def _cmd_process(text, channel, sid, escape=False, final=False):
     # （收尾帧的文本常常是空的，缓冲里却还压着上一块的尾巴）。
     if not text and not final:
         return text
-    s = sessions.get(sid)
+    s = _session_get(sid)
     if not isinstance(s, dict):
         return text
     kind = _cmd_channel_kind(channel)
@@ -4574,7 +4846,7 @@ _RESTORE_MAX_DEPTH = 24
 
 def _count_unresolved(sid, n=1):
     """会话级 unresolved 计数（与 restore() 维护同一字段，只用于诊断展示）。"""
-    s = sessions.get(sid)
+    s = _session_get(sid)
     if isinstance(s, dict):
         try:
             s["unresolved"] = int(s.get("unresolved") or 0) + n
@@ -5034,6 +5306,9 @@ def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0, flag=None):
     flag：可选单元素 list，任一叶子真的被替换过就置 True（见 `_mask_hit`）。
     调用方靠它决定「要不要回写请求体」——没命中就一个字都不改，保住上游前缀缓存。
     """
+    control = getattr(_MASK_WORK_CONTEXT, "control", None)
+    if control is not None:
+        _check_mask_work(*control)
     if depth > _MASK_MAX_DEPTH:
         raise ValueError("json_depth_exceeded: 请求嵌套超过脱敏递归上限，拒绝透传")
     in_business = any(k in _MASK_BUSINESS_KEYS for k in path)
@@ -5106,7 +5381,7 @@ def _seed_known(text, sid):
 
     客户端历史里带上来的上一轮占位符，本轮响应若被模型复述，仍能正确还原。
     """
-    s = sessions.get(sid)
+    s = _session_get(sid)
     if not s or not text:
         return
     for token in set(_PLACEHOLDER_RX.findall(text)):
@@ -5153,7 +5428,7 @@ def _mask_event_items(sid, limit=30):
     端点显式建会话正是为了让 inflight 保护落在真会话上。
     凭据类标签恒只回 digest+preview（不落原文），与项目隐私红线一致。
     """
-    s = sessions.get(sid) or {}
+    s = _session_get(sid) or {}
     fwd = s.get("fwd") or {}
     labels = s.get("labels") or {}
     last_hits = s.get("last_hits") or set()
@@ -5256,7 +5531,7 @@ def mask_body(text, sid):
         try:
             spliced = _splice_mask(
                 text.encode("utf-8"), masked_root,
-                {o: t for o, t in (sessions.get(sid, {}).get("fwd") or {}).items() if t},
+                {o: t for o, t in (_session_get(sid, {}).get("fwd") or {}).items() if t},
             )
         except Exception:
             spliced = None
@@ -5470,7 +5745,7 @@ def _audit_response(flow, sid, host, method, path, source, streamed_text=None,
         #   · 思考通道的命中**不产生条目**（设计决定：模型在思考里权衡「要不要 rm -rf /」
         #     不是下发命令），但它能压掉全量扫描的对应误报——S9 扫的是混了思考块的
         #     全量拼接文本，这正是 §6.4 记录的既有污染。
-        s_cmd = sessions.get(sid) or {}
+        s_cmd = _session_get(sid) or {}
         slot_hits = s_cmd.get("cmd_hits") or []
         reason_snips = s_cmd.get("cmd_reason_snippets") or ()
         if slot_hits or reason_snips:
@@ -5699,17 +5974,27 @@ def error(flow):
     """连接/上游异常兜底：清会话 + 按类型记录事件。
 
     按错误性质区分事件类型（曾全部记 ERR 计入 alerts，正常操作也被当异常）：
-    - Client disconnected：客户端主动断开（IDE 按 ESC/切换话题/关窗口），
-      正常操作，记 CANCEL（不进 alerts，日志仍可见）
-    - getaddrinfo failed：上游域名解析临时失败（多为上游断连后的重连期），
-      记 DNS_ERROR（不进 alerts，属上游侧）
-    - 其余（server closed connection / 上游重置等）：记 ERR（计入 alerts）
+    - Client disconnected：客户端断开，可能是用户取消或 SDK 超时，记 CANCEL；
+    - getaddrinfo failed：域名解析失败，记 DNS_ERROR；不据此认定故障责任方；
+    - 其余连接/协议错误记 ERR。具体阶段以 transport 证据为准。
     """
+    cancel_event = getattr(flow, "_shield_mask_cancel", None)
+    if cancel_event is not None:
+        cancel_event.set()
+    _dispose_stream(flow)
+    _transport_event("error", flow)
+    flow.metadata["transport"] = _safe_transport_snapshot(flow)
+    if getattr(flow, "_shield_cancel_reason", None) in (
+            "client_cancelled", "client_disconnected", "client_protocol_error"):
+        _record_client_cancel(flow, flow.metadata["transport"].get("phase", "unknown"))
+    token = _aux_token(flow)
+    owned_session = token.session_ref if token is not None else None
+    _aux_abandon(flow)
     sid = flow.metadata.get("session_id")
     try:
         host = getattr(flow.request, "host", None) or getattr(flow.request, "pretty_host", "")
         path = flow.metadata.get("shield_orig_path") or getattr(flow.request, "path", "")
-        s = sessions.get(sid, {}) if sid else {}
+        s = _session_get(sid, {}) if sid else {}
         source = s.get("source", {})
         err = getattr(flow, "error", None)
         msg = ""
@@ -5721,14 +6006,11 @@ def error(flow):
             return
         ev_type = "ERR"
         if "Client disconnected" in msg:
-            ev_type = "CANCEL"  # 用户主动取消，非故障
+            ev_type = "CANCEL"  # 客户端断开；不能据此推断用户主动操作
         elif "getaddrinfo" in msg or "Name or service not known" in msg:
             ev_type = "DNS_ERROR"  # 上游域名解析失败，属上游侧
-        # 诊断前缀：区分「发请求时连接就已经是死的」（典型是复用了被上游关掉的空闲连接）
-        # 与「上游已经开始回包、中途断开」（上游侧问题）。两者现象都是 connection closed，
-        # 但修法完全不同 —— 没有这组字段只能靠猜（2026-09-20 排查即卡在这里）。
-        #   resp=0 → 连响应头都没收到；resp=1 → 上游已开始回包。
-        #   ms 短（<1s）且 resp=0 → 连接在发送阶段就不可用；ms 长 → 上游迟迟不回或中途挂起。
+        # resp 仅记录是否存在 response 对象；耗时与缺失响应都不能单独证明
+        # 复用了坏连接、请求已写出，或上游应用已经处理。
         try:
             _elapsed_ms = int((time.time() - float(getattr(flow.request, "timestamp_start", 0) or 0)) * 1000)
         except Exception:
@@ -5743,7 +6025,7 @@ def error(flow):
         # P0-b：脱敏耗时与「脱敏完成到出错之间等了多久」必须进事件 —— 否则
         # 「卡在脱敏」与「卡在上游」在事件行上长得一模一样（2026-09-28 实测就因此
         # 把 58.5s 的冷缓存脱敏误读成上游问题、又把纯上游慢误判成脱敏问题，来回两次）。
-        # 判据：mask 接近 ms 总量 ⇒ 时间都花在脱敏；两者差得远 ⇒ 卡在上游首包。
+        # upstream_wait 仅为脱敏完成后的累计等待，不代表请求已到达上游。
         # upstream_wait=-1 表示拿不到脱敏完成时刻（例如脱敏未跑完就出错）。
         try:
             _mask_ms = flow.metadata.get("shield_mask_ms")
@@ -5768,14 +6050,19 @@ def error(flow):
             msg = "[via egress_proxy] " + msg
         up_name = flow.metadata.get("shield_upstream") or (s.get("upstream_name") if s else "") or ""
         model = flow.metadata.get("shield_model") or (s.get("model") if s else "") or ""
-        _emit(ev_type, host=host or "", method=getattr(flow.request, "method", "") or "",
-              path=path.split("?")[0] if isinstance(path, str) else "",
-              sid=sid or "", msg="flow_error:" + msg,
-              upstream=up_name, model=model, **source)
+        if not getattr(flow, "_shield_cancel_recorded", False):
+            _emit(ev_type, transport=_transport_snapshot(flow), host=host or "", method=getattr(flow.request, "method", "") or "",
+                  path=path.split("?")[0] if isinstance(path, str) else "",
+                  sid=sid or "", msg="flow_error:" + msg,
+                  upstream=up_name, model=model, **source)
     except Exception:
         pass
-    if sid:
-        _drop(sid)
+    if sid and not flow.metadata.get("shield_mask_pending"):
+        token = _aux_token(flow)
+        if token is None:
+            _drop(sid)
+        elif not token.submitted and owned_session is not None:
+            _drop(sid, expect=owned_session)
 
 
 # ========== mitmproxy hooks ==========
@@ -6112,28 +6399,53 @@ def mask_pool_stats():
     return adm
 
 
-async def _await_with_deadline(fut, timeout_s):
-    """等待脱敏结果，带端到端 deadline（B-5）。超时抛 `asyncio.TimeoutError`。
-
-    用 `shield` 包一层：超时只取消这层等待，**不取消**已经开跑的 worker
-    （线程池里的任务本来就取消不了，shield 让这个语义显式化而不是靠实现细节）。
-    调用方的责任：超时后给客户端结构化错误，并**丢弃**这次结果（不回写 flow），
-    孤儿 worker 可能的签发副作用记为已知边界（设计文档 §4.3）。
-    """
-    return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s)
+async def _await_with_deadline(fut, timeout_s, cancel_signal=None):
+    """Wait without cancelling the actual worker; client abort still completes the hook."""
+    if cancel_signal is None:
+        return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s)
+    shielded = asyncio.shield(fut)
+    aborted = asyncio.create_task(cancel_signal.wait())
+    try:
+        finished, _ = await asyncio.wait((shielded, aborted), timeout=max(0.0, timeout_s),
+                                         return_when=asyncio.FIRST_COMPLETED)
+        # Surface waiter failures instead of misreporting them as timeouts.
+        if aborted in finished:
+            aborted.result()
+        # Client termination wins a simultaneous worker completion: no late success.
+        if cancel_signal.is_set():
+            raise _ClientFlowCancelled()
+        if shielded in finished:
+            return shielded.result()
+        raise asyncio.TimeoutError()
+    finally:
+        if shielded.done() and not shielded.cancelled():
+            shielded.exception()
+        else:
+            shielded.cancel()  # only the shield wrapper, never the running worker
+        aborted.cancel()
+        await asyncio.gather(aborted, return_exceptions=True)
 
 
 _RUNTIME_METRICS_FILE = "engine-runtime.json"
 _RUNTIME_METRICS_MIN_INTERVAL_S = 30.0
 _RUNTIME_METRICS_LAST = [0.0]
+_RUNTIME_METRICS_LOCK = threading.Lock()
 
 
 def write_runtime_metrics(force=False):
+    if not _RUNTIME_METRICS_LOCK.acquire(blocking=False):
+        return False
+    try:
+        return _write_runtime_metrics(force)
+    finally:
+        _RUNTIME_METRICS_LOCK.release()
+
+
+def _write_runtime_metrics(force=False):
     """把本进程的运行指标写进数据目录（面板的 /api/engine/metrics 与自检读它）。
 
-    调用点挂在请求路径上（节流到 30s 一次）：引擎进程没有定时器，而挂在这里
-    意味着"有流量时才更新" —— 恰好也是指标有意义的时候。写失败只记一次日志，
-    绝不影响流量。
+    请求路径节流到 30s，独立心跳在无请求时也刷新。文件 I/O 只在线程中执行；
+    写失败不影响转发，也不会把旧快照伪装成新数据。
     """
     now = time.time()
     if not force and now - _RUNTIME_METRICS_LAST[0] < _RUNTIME_METRICS_MIN_INTERVAL_S:
@@ -6148,6 +6460,17 @@ def write_runtime_metrics(force=False):
             "aux_pool": aux_pool_stats(),
             "audit": audit_runtime_stats(),
             "engine_deadline_s": _ENGINE_DEADLINE_S,
+            "transport": dict(_CONNECTION_STATS),
+            "heartbeat": dict(_HEARTBEAT),
+        }
+
+        # 敏感词表：**引擎里真正生效的词数**与**问题清单**（词 -> 原因）。
+        # 必须由引擎进程产生：panel 是另一个进程，它只能看到配置里"写了多少词"，
+        # 看不到引擎里"真正生效了几个词"。2026-09-30 那次「整表静默失效」正是因为
+        # 这个差异没有任何出口 —— 面板显示一切正常，用户却什么都脱敏不了。
+        payload["word_table"] = {
+            "count": len(CUSTOM_WORDS),
+            "issues": word_table_issues(),
         }
         try:
             import ner_engine
@@ -6187,21 +6510,274 @@ def _retry_after_seconds():
     """
     return round(1.0 + random.random() * 2.0, 2)
 
-# A-3：整包响应侧的重活池（解析/还原/序列化、RESTORE 摘要、审计、响应扫描）。
-# 为什么是 2 个线程：这些活彼此独立、CPU 密集但有 GIL 交替，2 个足够吃掉
-# 「一条大响应把事件循环占满」的问题，又不会在弱机上把核抢光。
-# 真正的并发上限由 B-4 的 in-flight 字节预算兜住（这里只是执行位）。
-# ⚠️ 已知边界：这条池**故意**没有字节准入与取消失败的机制 ——
-# 它承载的是响应侧还原/审计，投递项被拒或超时都意味着"把未还原的占位符交给用户"
-# （{{EMAIL_xxxx}} 直接漏到页面上），比排队更糟。所以这里只能测"慢"，不能测"丢"。
-# 真正的背压点在更上游（读取 flow 的速度），属独立改造。
-# 这条池承载响应侧还原/审计。它**不能**像脱敏池那样"满了就拒"：被拒或超时都意味着
-# 把未还原的占位符交给用户（占位符会直接漏到页面上），比排队更糟 ——
-# 所以这里的背压形态是**等**，不是**丢**（真正的"丢"只能在更上游：少读 flow）。
-# 能做的上限是：在 worker 里解码**之前**抢槽位，把"已解码副本"的数量钉在
-# `_AUX_MAX_INFLIGHT` 以内（排队项此时只持有 flow 引用，内容内存由 mitmproxy 自己兜）。
-_AUX_MAX_INFLIGHT = 4
-_AUX_SLOTS = threading.BoundedSemaphore(_AUX_MAX_INFLIGHT)
+# A-3：响应侧重活在独立池执行，准入覆盖等待上游、排队和运行全生命周期。
+# worker 数限制 CPU 并发，条数/字节预算限制保留的任务输入。
+def _aux_pool_width():
+    """Conservative startup width; no runtime executor replacement."""
+    cores = (getattr(os, "process_cpu_count", os.cpu_count)() or 2)
+    default = 1 if cores <= 2 else max(2, min(4, cores // 2))
+    try:
+        override = int(os.environ.get("MASKIT_AUX_WORKERS", "0"))
+        return max(1, min(4, override)) if override else default
+    except (TypeError, ValueError):
+        return default
+
+
+_AUX_MAX_INFLIGHT = _aux_pool_width()
+# Reservations cover upstream-inflight, queued AND running jobs. 1 MiB is the
+# worst-case UTF-8 retained SSE window, not a speculative 32 MiB per response.
+# Queued jobs charge actual wire bytes; the worker atomically charges decoded
+# bytes before retaining them. A separate SINGLE decode workspace permits bounded
+# expansion before that charge: <=2 * admitted request/response ceiling + 32 MiB
+# codec window + 64 KiB Brotli chunk slack. Request ceiling is its already-charged
+# masked size (which may exceed the 32 MiB incoming/response cap).
+# Parse-tree expansion and session/reuse tables have separate limits.
+_AUX_MAX_JOBS = 64
+_AUX_MAX_BYTES = 128 * 1024 * 1024
+_AUX_RESPONSE_MAX = 32 * 1024 * 1024
+_AUX_BASE_BYTES = 4 * _SSE_KEEP_MAX
+# Allocations inside admission may run cyclic finalizers that release an older
+# token. Reentrancy is required even though ordinary callers are serialized.
+_AUX_BUDGET_LOCK = threading.RLock()
+_AUX_DECODE_LOCK = threading.Lock()
+_AUX_JOBS = 0
+_AUX_BYTES = 0
+_AUX_SESSION = threading.local()
+
+
+def _session_get(sid, default=None):
+    owned = getattr(_AUX_SESSION, "owned", None)
+    if owned is not None and owned[0] == sid:
+        return owned[1] if owned[1] is not None else default
+    return sessions.get(sid, default)
+
+
+@contextlib.contextmanager
+def _aux_session(sid, session_ref):
+    old = getattr(_AUX_SESSION, "owned", None)
+    _AUX_SESSION.owned = (sid, session_ref)
+    try:
+        yield
+    finally:
+        _AUX_SESSION.owned = old
+
+
+class _AuxReservation:
+    def __init__(self, size, owner_id=None):
+        self.size = size
+        self.owner_id = owner_id
+        self.request_size = 0
+        self.submitted = False
+        # Uncharged construction is safe even if GC runs or allocation fails.
+        self.released = True
+        self.future = None
+        self.abandoned = False
+        self.session_ref = None
+
+    def __deepcopy__(self, memo):
+        # A generic Python copy may copy runtime attrs too. _aux_token's owner
+        # check prevents that copy from consuming or releasing this owner's quota.
+        return self
+
+    def __del__(self):
+        # Submitted jobs retain their owner until actual completion. Avoid even
+        # acquiring the lock for the common already-released finalizer case.
+        if not self.released and not self.submitted:
+            self.release()
+
+    def release(self):
+        global _AUX_JOBS, _AUX_BYTES
+        with _AUX_BUDGET_LOCK:
+            if self.released:
+                return
+            self.released = True
+            _AUX_JOBS -= 1
+            _AUX_BYTES -= self.size
+            self.future = None
+            self.session_ref = None
+
+    def retain_response(self, size):
+        """Charge actual wire + decoded bytes before they leave decode workspace."""
+        global _AUX_BYTES
+        with _AUX_BUDGET_LOCK:
+            desired = self.request_size + max(_AUX_BASE_BYTES, size)
+            extra = max(0, desired - self.size)
+            if self.released or _AUX_BYTES + extra > _AUX_MAX_BYTES:
+                raise RuntimeError("aux decoded byte budget exceeded")
+            _AUX_BYTES += extra
+            self.size += extra
+
+
+def _aux_token(flow):
+    """Runtime-only ownership: never serialized by Flow.get_state/copy/FlowWriter."""
+    token = getattr(flow, "_shield_aux_reservation", None)
+    return token if token is not None and token.owner_id == id(flow) else None
+
+
+def _message_bytes(message):
+    if message is None:
+        return b""
+    raw = getattr(message, "raw_content", None)
+    return raw if raw is not None else (getattr(message, "content", None) or b"")
+
+
+class _AuxBody:
+    """Immutable wire input; decode at most once, only after entering the worker."""
+    def __init__(self, message, *, request=False, limit=None, token=None):
+        self.raw_content = _message_bytes(message)
+        headers = getattr(message, "headers", {})
+        self.headers = ({"content-encoding": headers.get("content-encoding", "identity")}
+                        if request else copy.deepcopy(headers))
+        self.status_code = getattr(message, "status_code", 0)
+        self._content = None
+        self._decode_error = False
+        self._limit = _AUX_RESPONSE_MAX if limit is None else limit
+        self._token = token if not request else None
+
+    @property
+    def content(self):
+        if self._content is None:
+            if self._decode_error:
+                raise ValueError("aux body decoding previously failed")
+            # Only one bounded, not-yet-charged decoding workspace may exist.
+            # No decompression or large body copying runs on the event loop.
+            with _AUX_DECODE_LOCK:
+                content = None
+                try:
+                    content = decode_body(self.raw_content,
+                                          self.headers.get("content-encoding") or "identity",
+                                          self._limit)
+                    if self._token is not None:
+                        retained = len(self.raw_content)
+                        if content is not self.raw_content:
+                            retained += len(content)
+                        self._token.retain_response(retained)
+                    self._content = content
+                    self._token = None
+                except Exception as exc:
+                    # A failed Future retains exception tracebacks. Do not let
+                    # them retain an uncharged decode workspace after this lock.
+                    content = None
+                    self._decode_error = True
+                    self._token = None
+                    exc.__traceback__ = exc.__cause__ = exc.__context__ = None
+                    raise exc from None
+        return self._content
+
+
+def _aux_request_size(flow):
+    request = getattr(flow, "request", None)
+    wire = len(_message_bytes(request))
+    decoded = flow.metadata.get("shield_request_decoded_bytes", wire)
+    kind = ((getattr(request, "headers", {}).get("content-encoding") or "identity").lower())
+    return (max(wire, decoded) if kind in ("identity", "none") else wire + decoded), decoded
+
+
+def _aux_reserve(flow, response_bytes=None):
+    global _AUX_JOBS, _AUX_BYTES
+    token = _aux_token(flow)
+    request_size, _ = _aux_request_size(flow)
+    size = request_size + max(_AUX_BASE_BYTES, response_bytes or 0)
+    with _AUX_BUDGET_LOCK:
+        if token is not None and token.released:
+            token = None  # A completed in-place replay obtains a fresh owner.
+        if token is not None and token.submitted:
+            return None  # Never steal capacity from a live job on replay/reset.
+        extra = size - token.size if token else size
+        rejected = ((not token and _AUX_JOBS >= _AUX_MAX_JOBS) or
+                    _AUX_BYTES + extra > _AUX_MAX_BYTES or
+                    (response_bytes or 0) > _AUX_RESPONSE_MAX)
+        if not rejected:
+            if token is None:
+                token = _AuxReservation(size, id(flow))
+                token.session_ref = _session_get(flow.metadata.get("session_id"))
+                _AUX_JOBS += 1
+                token.released = False
+                flow._shield_aux_reservation = token
+            else:
+                token.size = size
+            token.request_size = request_size
+            _AUX_BYTES += extra
+            return token
+    # Never take the stats lock while holding the budget lock: a stats allocation
+    # may run a cyclic finalizer that needs the budget lock on another thread.
+    _aux_stat_add("rejected")
+    return None
+
+
+def _aux_abandon(flow):
+    """Loop-owned abort: a running job retains its reservation until completion."""
+    token = _aux_token(flow)
+    if token is not None:
+        if not token.submitted:
+            token.release()
+        else:
+            # Future.cancel() leaves a WorkItem (and all args) in the executor
+            # queue. Releasing here would allow an unbounded cancel/submit storm.
+            # Skip queued work when dequeued; retain capacity until then.
+            token.abandoned = True
+
+
+def _aux_snapshot(flow):
+    # No mutable live flow, response, headers or metadata reach a worker. Immutable
+    # bytes are shared safely; metadata excludes the lifecycle token.
+    resp = getattr(flow, "response", None)
+    token = _aux_token(flow)
+    _, request_limit = _aux_request_size(flow)
+    return SimpleNamespace(
+        request=_AuxBody(getattr(flow, "request", None), request=True,
+                         limit=request_limit),
+        response=_AuxBody(resp, token=token) if resp else None,
+        metadata=copy.deepcopy({k: flow.metadata[k] for k in (
+            "session_id", "shield_model", "shield_upstream", "probe_id",
+            "audit_canaries", "shield_reasoning_effort", "shield_stream_degraded",
+            "shield_stream_requested", "shield_streamed", "transport") if k in flow.metadata}))
+
+
+def _aux_submit(token, sid, session_ref, fn, *args):
+    """Exactly one bounded submission and one actual-completion resource owner."""
+    if token is None or token.released or token.submitted:
+        raise RuntimeError("aux reservation unavailable")
+    token.submitted = True
+    with _AUX_PENDING_LOCK:
+        _AUX_PENDING[0] += 1
+
+    def run():
+        if token.abandoned:
+            _aux_stat_add("cancelled_queued")
+            return None
+        with _aux_session(sid, session_ref):
+            return fn(*args)
+
+    def done(future):
+        nonlocal session_ref, args, fn
+        try:
+            if not future.cancelled():
+                future.exception()
+        finally:
+            try:
+                if session_ref is not None:
+                    _drop(sid, expect=session_ref)
+            finally:
+                # Futures retain done callbacks after execution. Clear closure
+                # cells too, not merely token fields; GC/refcount timing is irrelevant.
+                session_ref, args, fn = None, (), None
+                token.release()
+                with _AUX_PENDING_LOCK:
+                    _AUX_PENDING[0] -= 1
+
+    try:
+        future = _AUX_POOL.submit(run)
+        token.future = future
+    except BaseException:
+        token.release()
+        with _AUX_PENDING_LOCK:
+            _AUX_PENDING[0] -= 1
+        raise
+    future.add_done_callback(done)
+    return future
+
+
 # 预览/对话抽取的源文本上限：两个 helper 的输出上限是 800B / 4000 字，源文本给到
 # 256KB 早已远超需要（含超长 SSE 首包）。见 _emit_restore_summary 的注释。
 _PREVIEW_SRC_MAX = 64 * 1024
@@ -6217,7 +6793,8 @@ def _audit_text_probe_bytes():
 # 所以"流结束了"不再等于"审计已经落库"。测试/诊断/关卡用 aux_drain() 对齐。
 _AUX_PENDING_LOCK = threading.Lock()
 _AUX_PENDING = [0]
-_AUX_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="maskit-aux")
+_AUX_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=_AUX_MAX_INFLIGHT,
+                                                 thread_name_prefix="maskit-aux")
 # ⚠️ `_AUX_STATS` 的写入发生在 aux 线程（池里）与事件循环线程两处，而读取
 # （`aux_pool_stats` → /api/engine/metrics 与一键自检）在第三个线程。
 # 此前“峰值 / 等待累计 / stream_finish”这些键是**首次插入**（会改 size），与读取侧的
@@ -6243,12 +6820,15 @@ def _aux_stat_max(key, value):
 # 这条 await 之后就是"把还原结果写回 flow.response"，一旦超时放弃，客户端拿到的就是
 # **带占位符（或未还原明文）的响应** —— 那是本产品的核心承诺（本地还原后再出网/交付），
 # 比"慢"严重得多；改回 503 又会把一条已经成功的上游响应判死。
-# 两种"修法"都比等待更糟，所以这里**刻意不设硬超时**（与 request 侧 `_await_with_deadline`
-# 不同：那边超时是 fail-closed 拒绝未脱敏请求，方向一致）。
-# 但不留痕的等待是不可诊断的：弱机上多智能体并发时用户只会看到"响应很慢"。
-# 于是超过 `_AUX_WAIT_TRACE_S` 就发一条带 `aux_wait_ms` 的事件，让 /api/logs、
-# 导出的 CSV 与自检都能回答"慢在哪"。
+# 但"短超时后放弃"与"等到永远"都错：
+#   · 短超时放弃 → 客户端拿到带占位符（或未还原明文）的响应，违反核心承诺；
+#   · 等到永远   → 客户端自己的超时先到，真实结果是连接被挂到断开（用户侧即
+#                  502 / connection closed），比明确回 503 更差，而且不可诊断。
+# 因此分两层：超过 `_AUX_WAIT_TRACE_S` 留痕；超过 `_AUX_WAIT_HARD_S` 不再等，
+# 回本地失败（上游可能已执行），绝不建议自动重发。
+# 硬上限只对**尚未向客户端写出任何字节**的整包路径生效；流式已边下边发，只能留痕。
 _AUX_WAIT_TRACE_S = 2.0
+_AUX_WAIT_HARD_S = 120.0          # 响应侧等待脱敏线程池的硬上限（秒）：超时回 503
 _AUX_WAIT_TRACE_MS = [0.0]        # 本进程见过的最长等待（写进运行指标供自检读）
 
 
@@ -6261,6 +6841,10 @@ def aux_pool_stats():
         depth = None
     with _AUX_STATS_LOCK:
         out = dict(_AUX_STATS)
+    with _AUX_BUDGET_LOCK:
+        out.update(reserved_jobs=_AUX_JOBS, reserved_bytes=_AUX_BYTES,
+                   max_jobs=_AUX_MAX_JOBS, max_bytes=_AUX_MAX_BYTES,
+                   workers=_AUX_MAX_INFLIGHT)
     out["queue_depth"] = depth
     # 最长等待（ms）：0 = 从未超过留痕阈值
     out["max_wait_ms"] = round(float(_AUX_WAIT_TRACE_MS[0]), 1)
@@ -6309,21 +6893,35 @@ def _ner_metrics_of_this_round():
         return {}
 
 
+_NER_METRIC_MAP = {
+    "init_ms": "ner_init_ms", "infer_ms": "ner_infer_ms",
+    "budget_wait_ms": "ner_budget_wait_ms", "sem_wait_ms": "ner_sem_wait_ms",
+    "calls": "ner_calls", "cache_hit": "ner_cache_hits", "cache_miss": "ner_cache_misses",
+    "windows": "ner_windows", "global_throttled": "ner_global_throttled",
+}
+_NER_EVENT_METRICS = frozenset(_NER_METRIC_MAP.values())
+
+
 def _ner_metric_fields():
-    """构造事件里的 NER 指标字段（无等待、无限流时不加噪声字段）。"""
-    m = _ner_metrics_of_this_round() or {}
-    out = {}
-    wait_ms = float(m.get("sem_wait_ms") or 0.0)
-    infer_ms = float(m.get("infer_ms") or 0.0)
-    if wait_ms >= 1.0 or infer_ms > 0:
-        out["ner_sem_wait_ms"] = round(wait_ms, 1)
-    if int(m.get("global_throttled") or 0) > 0:
-        out["ner_global_throttled"] = int(m["global_throttled"])
-    return out
+    """Request-local numeric evidence; decode wall time is not CPU time."""
+    metrics = _ner_metrics_of_this_round() or {}
+    if not any(metrics.values()):
+        return {}
+    return {target: (round(float(metrics.get(key) or 0), 2) if key.endswith("_ms")
+                     else int(metrics.get(key) or 0))
+            for key, target in _NER_METRIC_MAP.items()}
+
+
+def _check_mask_work(deadline, cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise _ClientFlowCancelled()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("mask processing deadline exhausted")
 
 
 def _mask_pipeline_worker(body, sid, raw_content, enum_changed, has_dup_keys,
-                          root_is_object, t_submit=0.0, model_rule=None, upstream=None):
+                          root_is_object, t_submit=0.0, deadline=None, cancel_event=None,
+                          model_rule=None, upstream=None):
     """在 `_MASK_POOL` 线程里跑脱敏重活（纯计算 + 本模块全局态，不碰 mitmproxy 对象）。
 
     `body` 由调用方解析好传入，就地改写（原实现即如此，调用方后续还要用）。
@@ -6344,10 +6942,13 @@ def _mask_pipeline_worker(body, sid, raw_content, enum_changed, has_dup_keys,
             _MASK_TIMEOUTS["peak_wait_ms"] = queue_wait_ms
     # A-6：名额必须在 worker 自己结束（含异常）时归还——超时返回给客户端后
     # 孤儿 worker 仍在跑，若由调用方归还，B-4 的并发上界就成了事后失真的数字。
+    old_control = getattr(_MASK_WORK_CONTEXT, "control", None)
+    _MASK_WORK_CONTEXT.control = (deadline, cancel_event)
     try:
         masked_bytes = None
         first_diff_byte = -1
-        with _ner_doc_budget(_ner_req_budget(len(raw_content))):
+        _check_mask_work(deadline, cancel_event)
+        with _ner_doc_budget(_ner_req_budget(len(raw_content)), deadline=deadline, cancel_event=cancel_event):
             # 脱敏前记录扫描范围 + 各角色文本（仅内存，归因用，不落原文）
             scan_scope = _request_scope(body)
             role_texts = _collect_role_texts(body)
@@ -6372,6 +6973,7 @@ def _mask_pipeline_worker(body, sid, raw_content, enum_changed, has_dup_keys,
             # 直接 KeyError → 整个脱敏管线抛异常 → fail-closed 503，所有列表根请求全挂。
             renamed = {}
             for key in list(body.keys()):
+                _check_mask_work(deadline, cancel_event)
                 new_key = key
                 if (isinstance(key, str) and key != _ROOT_WRAP_KEY
                         and not _mask_key_exempt(key, ())):
@@ -6422,7 +7024,7 @@ def _mask_pipeline_worker(body, sid, raw_content, enum_changed, has_dup_keys,
                     try:
                         spliced = _splice_mask(
                             raw_content, masked_root,
-                            {o: t for o, t in (sessions.get(sid, {}).get("fwd") or {}).items() if t},
+                            {o: t for o, t in (_session_get(sid, {}).get("fwd") or {}).items() if t},
                         )
                     except Exception:
                         spliced = None
@@ -6449,16 +7051,85 @@ def _mask_pipeline_worker(body, sid, raw_content, enum_changed, has_dup_keys,
                 # （含分隔符、键序、\u 转义、数字字面量写法），这是 Prompt Cache 命中的前提。
                 # _seed_known 照常跑：客户端历史里带来的占位符本轮响应若被模型复述仍要能还原。
                 _seed_known(raw_content.decode("utf-8", "replace"), sid)
+        _check_mask_work(deadline, cancel_event)
         return _MaskResult(
             masked_bytes, first_diff_byte, scan_scope, role_texts,
             _ner_skips_of_this_round(), _ner_metric_fields(),
             round(queue_wait_ms, 1),
         )
     finally:
+        _MASK_WORK_CONTEXT.control = old_control
         _mask_release(len(raw_content))
 
 
 async def request(flow: http.HTTPFlow):
+    # Native replay/copy must start a new attempt, not inherit terminal lifecycle flags.
+    for key in tuple(flow.metadata):
+        if key.startswith("shield_") or key in ("session_id", "transport", "_maskit_transport", "_maskit_cancel_observers"):
+            flow.metadata.pop(key, None)
+    if getattr(flow, "_shield_request_seen", False):
+        for name in ("_shield_cancel_wakeup", "_shield_cancel_reason", "_shield_cancel_recorded"):
+            if hasattr(flow, name):
+                delattr(flow, name)
+    flow._shield_request_seen = True
+    completed = False
+    cancel_event = threading.Event()
+    client_id = str(getattr(getattr(flow, "client_conn", None), "id", ""))
+    _MASK_CANCEL_BY_CLIENT.setdefault(client_id, set()).add(cancel_event)
+    flow._shield_mask_cancel = cancel_event
+    _transport_event("request_started", flow)
+    try:
+        if _cancel_signal(flow).is_set():
+            raise _ClientFlowCancelled()
+        await _request_impl(flow)
+        if cancel_event.is_set() and getattr(flow, "response", None) is None:
+            raise _ClientFlowCancelled()
+        if (getattr(flow, "response", None) is None and _aux_token(flow) is not None
+                and _aux_reserve(flow) is None):
+            # Masking can expand the request body. Account for the actual retained
+            # bytes before upstream send, without reserving 32 MiB for every job.
+            flow.response = http.Response.make(
+                503, b'{"error":{"code":"shield_aux_busy","upstream_sent":false}}',
+                {"content-type": "application/json"})
+            _emit("BLOCK", sid=flow.metadata.get("session_id"), reason="aux_busy",
+                  block_source="engine")
+        completed = True
+    except _ClientFlowCancelled:
+        # Returning from the hook is essential: mitmproxy must issue HookCompleted
+        # and drain its already-queued protocol error for this stream.
+        cancel_event.set()
+        _aux_abandon(flow)
+        _record_client_cancel(flow, "local_request")
+        flow.response = http.Response.make(
+            503, b'{"error":{"code":"shield_request_cancelled"}}',
+            {"content-type": "application/json", "x-should-retry": "false"})
+    finally:
+        cancel_event.set()
+        if hasattr(flow, "_shield_mask_cancel"):
+            delattr(flow, "_shield_mask_cancel")
+        pending = _MASK_CANCEL_BY_CLIENT.get(client_id)
+        if pending is not None:
+            pending.discard(cancel_event)
+            if not pending:
+                _MASK_CANCEL_BY_CLIENT.pop(client_id, None)
+        if not completed or getattr(flow, "response", None) is not None:
+            token = _aux_token(flow)
+            owned_session = token.session_ref if token is not None else None
+            if getattr(flow, "response", None) is not None:
+                flow.metadata["shield_local_response"] = True
+            _aux_abandon(flow)
+            if (not flow.metadata.get("shield_mask_pending") and token is not None
+                    and not token.submitted and owned_session is not None):
+                _drop(flow.metadata.get("session_id"), expect=owned_session)
+            _transport_event("error", flow)
+        flow.metadata["transport"] = _safe_transport_snapshot(flow)
+        if completed and getattr(flow, "response", None) is None and not _cancel_signal(flow).is_set():
+            # Request waiters are gone; response owns a fresh wake signal. This also
+            # keeps recorded/test flows usable when hooks are driven on separate loops.
+            flow._shield_cancel_wakeup = asyncio.Event()
+
+
+async def _request_impl(flow: http.HTTPFlow):
     _maybe_reload()  # 热重载：加词即时生效
     method = getattr(flow.request, "method", "") or ""
     source = _client_source(flow)
@@ -6483,6 +7154,15 @@ async def request(flow: http.HTTPFlow):
         flow.metadata["shield_upstream"] = up_name
         # 出口代理必须在任何 return 之前挂上（含下面的 passthrough_unlisted_path 分支）
         _apply_egress_proxy(flow, matched_up)
+        try:
+            validate_connection_policy(matched_up.get("connection_policy"), http2=False)
+        except ValueError:
+            flow.response = http.Response.make(
+                503, b'{"error":{"code":"unsupported_connection_policy"}}',
+                {"content-type": "application/json"})
+            _emit("BLOCK", host=host, method=method, path=path.split("?")[0],
+                  reason="unsupported_connection_policy", block_source="engine", **source)
+            return
         if not _upstream_path_ok(matched_up, path):
             if method in _READONLY_METHODS:
                 # 白名单外的只读请求同样要带 upstream 级协议头：/v1/models 这类
@@ -6745,6 +7425,17 @@ async def request(flow: http.HTTPFlow):
     # 必须在**任何签发副作用之前**（§4.2 不变式 7）：队列满就干净利落地拒掉，
     # 不能"先签了占位符再拒"——那会把复用表和 `_RECENT_*` 污染成"存在但从未上行"的条目。
     # 判据是字节预算 + 条数上限（按条数算的最坏值会失控：16 条 × 32MB = 512MB）。
+    flow.metadata["shield_request_decoded_bytes"] = len(raw_content)
+    _mask_deadline = time.monotonic() + _ENGINE_DEADLINE_S
+    _mask_cancel = getattr(flow, "_shield_mask_cancel", None)
+    if _aux_reserve(flow) is None:
+        _emit("BLOCK", host=host, method=method, path=path.split("?")[0], sid=sid,
+              reason="aux_busy", block_source="engine", upstream=up_name, **source)
+        flow.response = http.Response.make(
+            503, b'{"error":{"code":"shield_aux_busy","upstream_sent":false}}',
+            {"content-type": "application/json"})
+        _drop(sid)
+        return
     if not _mask_admit(len(raw_content)):
         _st = mask_pool_stats()
         _emit("BLOCK", host=host, method=method, path=path.split("?")[0], sid=sid,
@@ -6773,21 +7464,37 @@ async def request(flow: http.HTTPFlow):
         # 重活交给专职线程（见 _MASK_POOL）：本函数是 async 钩子，mitmproxy 会在
         # 事件循环里 await 它——等待期间其他连接的收发照常进行，一条慢会话不再冻住整机。
         _t_submit = time.perf_counter()
+        # 全部位置传参：run_in_executor 不接受 kwargs，实参顺序必须与
+        # `_mask_pipeline_worker` 的签名严格一致 —— 上游的 deadline/cancel_event 在前，
+        # 本分支的 model_rule/upstream 追加在后。改签名时两处一起改。
         try:
             _fut = asyncio.get_running_loop().run_in_executor(
                 _MASK_POOL, _mask_pipeline_worker,
                 body, sid, raw_content, enum_changed, has_dup_keys, root_is_object, _t_submit,
-                _model_rule, matched_up,
+                _mask_deadline, _mask_cancel, _model_rule, matched_up,
             )
         except Exception:
-            # 任务没进池 → worker 的 finally 永不执行。不在这里归还，名额与排队字节
-            # 就是**永久**泄漏（几次之后所有请求都被判 engine_busy，网关等于挂了）。
+            # Submit failed: no worker will run its finally, so return admission here.
             _mask_abandon(len(raw_content))
             raise
+        _mask_session = _session_get(sid)
+        flow.metadata["shield_mask_pending"] = True
+
+        def mask_finished(future):
+            flow.metadata.pop("shield_mask_pending", None)
+            if not future.cancelled():
+                future.exception()
+            if _mask_cancel is not None and _mask_cancel.is_set() and _mask_session is not None:
+                _drop(sid, expect=_mask_session)
+
+        _fut.add_done_callback(mask_finished)
         try:
             # ---- B-5：端到端 deadline ----
-            _res = await _await_with_deadline(_fut, _ENGINE_DEADLINE_S)
+            _res = await _await_with_deadline(_fut, max(0.0, _mask_deadline - time.monotonic()),
+                                               _cancel_signal(flow))
         except asyncio.TimeoutError:
+            if _mask_cancel is not None:
+                _mask_cancel.set()
             # 与 `peak_wait_ms` 同一把锁：`_MASK_TIMEOUTS` 是一个整体快照，
             # 两个字段分开加锁会让 `/api/engine/metrics` 读到“计数已增、峰值未更新”。
             with _MASK_ADMISSION_LOCK:
@@ -6817,6 +7524,8 @@ async def request(flow: http.HTTPFlow):
                 pass
             return
         # scan_scope / role_texts 在脱敏前算好带回：后面的 MASK 事件与会话都要用。
+        if _res.masked_bytes is not None:
+            flow.metadata["shield_request_decoded_bytes"] = len(_res.masked_bytes)
         scan_scope = _res.scan_scope
         role_texts = _res.role_texts
         # 本轮语义识别有没有降级（空 dict = 全程生效）：MASK 事件如实上报，
@@ -6847,12 +7556,12 @@ async def request(flow: http.HTTPFlow):
         _debug(f"REQUEST {host}{path.split('?')[0]} -- 脱敏后(发往上游)", sid,
                _raw2.decode("utf-8", errors="replace"))
 
-    fwd = sessions.get(sid, {}).get("fwd", {})
-    labels = sessions.get(sid, {}).get("labels", {})
+    fwd = _session_get(sid, {}).get("fwd", {})
+    labels = _session_get(sid, {}).get("labels", {})
     # 本次实际命中的唯一原文（mask 里累积，跨字符串叶子不覆盖）。
     # hit_count=本次命中数；new_count=其中本次新增的（_hit 在 _remember 前记录）
-    last_hits = sessions.get(sid, {}).get("last_hits") or set()
-    new_orig = sessions.get(sid, {}).get("new_orig") or set()
+    last_hits = _session_get(sid, {}).get("last_hits") or set()
+    new_orig = _session_get(sid, {}).get("new_orig") or set()
     hit_count = len(last_hits)
     new_count = len(last_hits & new_orig)
     items = []
@@ -6912,7 +7621,7 @@ async def request(flow: http.HTTPFlow):
         pass
     # model 存入会话：RESTORE 事件（含流式接管路径）从会话读取，避免响应阶段再解析请求体
     try:
-        s_sess = sessions.get(sid)
+        s_sess = _session_get(sid)
         if s_sess is not None:
             s_sess["model"] = model
             # 标记 in-flight：请求已发出、响应未到，_sweep 不得按 TTL 删本会话
@@ -6985,9 +7694,18 @@ async def request(flow: http.HTTPFlow):
         # 这三项能直接区分「我们改了字节」与「上游自己 miss」。
         body_rewritten=body_rewritten,
         first_diff_byte=first_diff_byte,
-        suffix_reused=bool(sessions.get(sid, {}).get("suffix_reused")),
+        suffix_reused=bool(_session_get(sid, {}).get("suffix_reused")),
         **source,
     )
+
+
+class _ResponseResult(NamedTuple):
+    content: bytes | None  # already encoded wire bytes; no loop-side compression
+    ok: bool
+    error: str | None
+    block: http.Response | None
+    debug_text: str | None
+    summary: dict | None  # worker-prepared event, published only by the result owner
 
 
 def _response_offload(flow, sid, host, method, emit_path, source, ct):
@@ -6996,27 +7714,18 @@ def _response_offload(flow, sid, host, method, emit_path, source, ct):
     只**读** flow，不改它的任何字段；需要正文的三处一律显式传 `streamed_text`
     （restore 后的文本），回写统一交给调用它的协程（§4.2 不变式 3）。
 
-    返回 `(new_content, ok, err, block, debug_text)`：
+    返回 `_ResponseResult`，包含编码后的正文和已准备的 RESTORE 事件：
       new_content  None = 未还原（体积超限或非结构化 ct），事件循环保持原文；
       err          非空 = 还原阶段抛异常（调用方记 ERR）；**审计与响应扫描照常执行**
                    —— 它们是安全层，不能因为"还原没做"就整段跳过（见下方注释）；
       block        非空 = 要把响应换成这个 503（命令拦截或审计熔断）。
     """
     _aux_stat_add("submitted")
-    # 先抢槽位再解码：本函数体内所有 O(body) 的工作（解码、还原、审计、扫描）
-    # 都在槽位保护下，"已解码副本"不会随并发请求数线性增长。
-    _waited0 = time.perf_counter()
-    _AUX_SLOTS.acquire()
-    try:
-        _aux_stat_max("peak_inflight", _AUX_MAX_INFLIGHT - _AUX_SLOTS._value)
-        _aux_stat_add("wait_ms_total", (time.perf_counter() - _waited0) * 1000)
-        return _response_offload_locked(flow, sid, host, method, emit_path, ct, source)
-    finally:
-        _AUX_SLOTS.release()
+    return _response_offload_locked(flow, sid, host, method, emit_path, ct, source)
 
 
 def _stream_finish_offload(flow, sid, host, method, emit_path, source, restored_text,
-                          session_ref=None):
+                          session_ref=None, enqueued_at=None):
     """流式收尾的审计 + 响应扫描（0.6.0：从事件循环搬到 `_AUX_POOL`）。
 
     为什么**可以**搬：整包路径的 `_response_offload` 早就在 aux 线程里调用同样的
@@ -7030,10 +7739,20 @@ def _stream_finish_offload(flow, sid, host, method, emit_path, source, restored_
     实测收尾成本（事件循环原被占住的时间）：64KB ≈ 15ms、1MB ≈ 127ms、4MB ≈ 216ms。
     """
     _waited0 = time.perf_counter()
-    _AUX_SLOTS.acquire()
+    # 流式收尾是"投递即返回"，事件循环侧看不到任何等待 —— 这里是唯一能证明
+    # "响应慢在池排队"的位置：排队时长 = 投递时刻 → 真正开跑的时刻。
+    _queued_ms = 0.0
+    if enqueued_at:
+        _queued_ms = (_waited0 - enqueued_at) * 1000.0
+        if _queued_ms >= _AUX_WAIT_TRACE_MS[0]:
+            _AUX_WAIT_TRACE_MS[0] = _queued_ms
+        if _queued_ms >= _AUX_WAIT_TRACE_S * 1000.0:
+            _emit("ERR", host=host, method=method, path=emit_path.split("?")[0], sid=sid,
+                  msg="流式收尾在脱敏线程池排队 %.0fms（池宽 %d，见 aux_pool_stats）" % (
+                      _queued_ms, _AUX_POOL._max_workers),
+                  reason="stream_finish_wait", aux_wait_ms=round(_queued_ms, 1), **source)
     try:
-        _aux_stat_max("peak_inflight", _AUX_MAX_INFLIGHT - _AUX_SLOTS._value)
-        _aux_stat_add("wait_ms_total", (time.perf_counter() - _waited0) * 1000)
+        _aux_stat_add("wait_ms_total", _queued_ms)
         _aux_stat_add("stream_finish")
         # `apply_block=False`：流式响应此刻已逐块下发到客户端，**再写 flow.response
         # 既拦不住也已经晚了**；而且这里是 aux 线程，`flow.response = ...` 是 mitmproxy
@@ -7048,12 +7767,6 @@ def _stream_finish_offload(flow, sid, host, method, emit_path, source, restored_
         # 与整包路径同口径：失败必须留痕（审计是安全层，不能因为搬了线程就静默丢）
         _aux_stat_add("failed")
         _log("[stream] 收尾审计/扫描失败：%s: %s" % (type(e).__name__, str(e)[:120]))
-    finally:
-        _AUX_SLOTS.release()
-        # 只丢"自己那条"会话：投递到现在之间可能已经有同 sid 的新会话了（见 _drop 注释）
-        _drop(sid, expect=session_ref)
-        with _AUX_PENDING_LOCK:
-            _AUX_PENDING[0] -= 1
 
 
 def aux_drain(timeout=10.0):
@@ -7075,8 +7788,7 @@ def aux_drain(timeout=10.0):
 
 
 def _response_offload_locked(flow, sid, host, method, emit_path, ct, source):
-    """`_response_offload` 的本体（已持槽位）。拆出来只为让 acquire/release 与业务
-    逻辑不交叉：任何提前 return 都不会漏掉 release。"""
+    """Response computation under the submission's count/byte reservation."""
     raw = flow.response.content or b""
     new_content = None
     err = None
@@ -7103,7 +7815,7 @@ def _response_offload_locked(flow, sid, host, method, emit_path, ct, source):
         else raw.decode("utf-8", errors="replace")
 
     block = None
-    cmd_blocked = (sessions.get(sid) or {}).get("cmd_blocked")
+    cmd_blocked = (_session_get(sid) or {}).get("cmd_blocked")
     if cmd_blocked:
         # W2-4：block 模式的**非流式**收敛——整包换成结构化错误。
         # 流式路径无法回收已下发的字节，那条路径靠槽位置空截断下发（见 _cmd_process）。
@@ -7115,10 +7827,7 @@ def _response_offload_locked(flow, sid, host, method, emit_path, ct, source):
             {"content-type": "application/json"},
         )
     ok = not cmd_blocked and not err
-    debug_text = text if (ok and DEBUG) else None
-    if ok:
-        _emit_restore_summary(flow, sid, host, method, emit_path, source, ok=True,
-                              streamed_text=text)
+    debug_text = text if DEBUG else None
     # 审计：apply_block=False —— 只构造熔断响应，回写由事件循环负责
     audit_block = _audit_response(flow, sid, host, method, emit_path, source,
                                   streamed_text=text, apply_block=False)
@@ -7126,8 +7835,16 @@ def _response_offload_locked(flow, sid, host, method, emit_path, ct, source):
         block = audit_block
     # 响应侧扫描：检测模型回复中不在本会话映射里的 PII（幻觉/训练数据泄漏）
     _scan_response(flow, sid, host, method, emit_path, source, streamed_text=text)
+    summary = None
+    if ok and block is None:
+        summary = _emit_restore_summary(
+            flow, sid, host, method, emit_path, source,
+            ok=True, streamed_text=text, prepare_only=True)
+    if new_content is not None:
+        from mitmproxy.net import encoding
+        new_content = encoding.encode(new_content, flow.response.headers.get("content-encoding") or "identity")
     _aux_stat_add("completed")
-    return (new_content, ok, err, block, debug_text)
+    return _ResponseResult(new_content, ok, err, block, debug_text, summary)
 
 
 async def response(flow: http.HTTPFlow):
@@ -7139,6 +7856,13 @@ async def response(flow: http.HTTPFlow):
     抛 AddonManagerError，而它只用于 Load/Running/Configure 这类生命周期事件，
     不涉及 response。
     """
+    if flow.metadata.get("shield_local_response"):
+        return
+    if _cancel_signal(flow).is_set():
+        _aux_abandon(flow)
+        _record_client_cancel(flow, "local_response")
+        return
+    _transport_complete(flow)
     sid = flow.metadata.get("session_id")
     if not sid:
         return
@@ -7151,28 +7875,73 @@ async def response(flow: http.HTTPFlow):
     method = getattr(flow.request, "method", "") or ""
     # reverse 模式下 host/path 已在 request 阶段改写为真实上游；session_id 存在即为已拦截流量
     if CAPTURE_MODE != "reverse" and not is_target(host, path):
+        _aux_abandon(flow)
         _drop(sid)
         return
-    if not flow.response or not flow.response.content:
+    if not flow.response or not _message_bytes(flow.response):
+        _aux_abandon(flow)
         _drop(sid)
         return
 
     ct = (flow.response.headers.get("content-type", "") or "").lower().strip()
     _touch(sid)
     _sweep()
-    source = sessions.get(sid, {}).get("source", {})
+    admission = _aux_token(flow)
+    s_cur = admission.session_ref if admission is not None and not admission.released else _session_get(sid)
+    source = (s_cur or {}).get("source", {})
     # 响应到达时间：整包路径在此刻记（首字节=响应完成）；流式在 _stream 首 chunk 记
-    s_cur = sessions.get(sid)
     if s_cur is not None and s_cur.get("resp_ts") is None:
         s_cur["resp_ts"] = time.time()
     # A-3：解析/还原/序列化 + RESTORE 摘要 + 审计 + 响应扫描全部下池。
     # 事件循环在这里只是 `await`，不再被 O(body) 的 CPU 活占住。
-    loop = asyncio.get_running_loop()
     _aux_t0 = time.perf_counter()
-    new_content, ok, err, block, debug_text = await loop.run_in_executor(
-        _AUX_POOL, _response_offload, flow, sid, host, method,
-        emit_path.split("?")[0], source, ct)
-    # 等待留痕（不设硬超时的理由见 _AUX_WAIT_TRACE_S 的注释）
+    future = None
+    try:
+        raw_size = len(_message_bytes(flow.response))
+        # Queue only immutable wire inputs. Output-limited decoding and the
+        # atomic actual-retained-byte upgrade happen inside the worker.
+        token = _aux_reserve(flow, raw_size)
+        if token is None:
+            raise RuntimeError("aux response byte budget exceeded")
+        snapshot = _aux_snapshot(flow)
+        future = _aux_submit(token, sid, s_cur, _response_offload,
+                             snapshot, sid, host, method, emit_path.split("?")[0],
+                             dict(source), ct)
+        wrapped = asyncio.wrap_future(future)
+        wrapped.add_done_callback(lambda f: None if f.cancelled() else f.exception())
+        result = await _await_with_deadline(wrapped, _AUX_WAIT_HARD_S, _cancel_signal(flow))
+        if token.abandoned:
+            # error() may terminate a flow while its response hook is awaiting.
+            # The worker still audits, but only the existing terminal outcome wins.
+            _aux_stat_add("late_completed")
+            return
+        new_content, ok, err, block, debug_text, summary = result
+    except _ClientFlowCancelled:
+        _aux_abandon(flow)
+        _aux_stat_add("cancelled")
+        _record_client_cancel(flow, "local_response")
+        return
+    except asyncio.CancelledError:
+        _aux_abandon(flow)
+        _aux_stat_add("cancelled")
+        raise
+    except Exception as exc:
+        _aux_abandon(flow)
+        reason = ("response_offload_timeout" if isinstance(exc, asyncio.TimeoutError)
+                  else "response_offload_failed")
+        _aux_stat_add("timeout" if isinstance(exc, asyncio.TimeoutError) else "failed")
+        _emit("ERR", host=host, method=method, path=emit_path.split("?")[0], sid=sid,
+              reason=reason, failure_phase="local_response", upstream_may_have_executed=True,
+              msg="Local response processing failed; upstream may have executed.", **source)
+        flow.response = http.Response.make(
+            503, json.dumps({"error": {"code": "shield_offload_timeout" if
+                isinstance(exc, asyncio.TimeoutError) else "shield_offload_failed",
+                "upstream_may_have_executed": True}}).encode(),
+            {"Content-Type": "application/json", "x-should-retry": "false"})
+        if future is None and s_cur is not None:
+            _drop(sid, expect=s_cur)
+        return
+    # 等待留痕（阈值与硬上限的分工见 _AUX_WAIT_TRACE_S 的注释）
     _aux_wait_ms = (time.perf_counter() - _aux_t0) * 1000.0
     if _aux_wait_ms >= _AUX_WAIT_TRACE_MS[0]:
         _AUX_WAIT_TRACE_MS[0] = _aux_wait_ms
@@ -7186,7 +7955,7 @@ async def response(flow: http.HTTPFlow):
                   _aux_wait_ms, _AUX_POOL._max_workers),
               reason="response_offload_wait", **_aux_wait_kw, **source)
     if err:
-        s_err = sessions.get(sid, {}) if sid else {}
+        s_err = _session_get(sid, {}) if sid else {}
         _emit("ERR", host=host, method=method, path=emit_path.split("?")[0], sid=sid,
               msg=err,
               upstream=s_err.get("upstream_name") or flow.metadata.get("shield_upstream") or "",
@@ -7194,8 +7963,15 @@ async def response(flow: http.HTTPFlow):
               **source)
     # ---- 回写（只在事件循环线程碰 flow）----
     if new_content is not None:
-        flow.response.content = new_content
-    if debug_text is not None:
+        if isinstance(flow.response, http.Response):
+            flow.response.raw_content = new_content
+            if "transfer-encoding" not in flow.response.headers:
+                flow.response.headers["content-length"] = str(len(new_content))
+        else:
+            flow.response.content = new_content
+    if ok and block is None and summary is not None:
+        _emit("RESTORE", **summary)
+    if DEBUG and debug_text is not None:
         _debug(f"RESPONSE {host}{path.split('?')[0]} -- 还原后(返回客户端)", sid, debug_text)
     if block is not None:
         flow.response = block
@@ -7218,7 +7994,7 @@ def _scan_response(flow, sid, host, method, path, source, streamed_text=None):
         resp = flow.response
         if resp is None:
             return
-        s = sessions.get(sid) or {}
+        s = _session_get(sid) or {}
         fwd = s.get("fwd", {})
         restored_origs = s.get("restored_origs") or set()
         now = time.time()
@@ -7325,13 +8101,13 @@ def _scan_response(flow, sid, host, method, path, source, streamed_text=None):
                                       "length": len(v)})
                     else:
                         items.append({"label": label, "original": v, "preview": _preview(v, label)})
-            s_scan = sessions.get(sid, {}) if sid else {}
+            s_scan = _session_get(sid, {}) if sid else {}
             up_name = s_scan.get("upstream_name") or (flow.metadata.get("shield_upstream") if hasattr(flow, "metadata") else "") or ""
             model_name = s_scan.get("model") or (flow.metadata.get("shield_model") if hasattr(flow, "metadata") else "") or ""
             _emit("SCAN_WARN", host=host, method=method, path=path, sid=sid, count=len(items), items=items[:10],
                   upstream=up_name, model=model_name, **source)
     except Exception as e:
-        s_scan = sessions.get(sid, {}) if sid else {}
+        s_scan = _session_get(sid, {}) if sid else {}
         _emit("ERR", host=host, method=method, path=path, sid=sid, msg="scan:" + str(e)[:120],
               upstream=s_scan.get("upstream_name", ""), model=s_scan.get("model", ""), **source)
 
@@ -7479,7 +8255,7 @@ def _restore_sse_data(data, sid, final=False, final_prefixes=()):
         return data
     slots = _sse_text_slots(data)
     if slots:
-        s = sessions.get(sid) or {}
+        s = _session_get(sid) or {}
         for channel, text, setter, escape in slots:
             channel_final = final or final_prefixes is None or channel.startswith(final_prefixes)
             restored = restore(text, sid, channel=channel, escape=escape, final=channel_final)
@@ -7510,7 +8286,7 @@ def _restore_sse_data(data, sid, final=False, final_prefixes=()):
     }.get(data.get("type"))
     if snapshot is not None and isinstance(data.get(snapshot[0]), str):
         channel = _sse_response_channel(data, snapshot[1])
-        s = sessions.get(sid) or {}
+        s = _session_get(sid) or {}
         s.get("pending", {}).pop(channel, None)
         s.get("flush_tmpl", {}).pop(channel, None)
 
@@ -7584,7 +8360,7 @@ def _cmd_flush_frames(sid, channel_prefixes, framing):
     所以调用方必须先吐本函数的帧，再吐 `pending` 的帧。
     block 模式下已命中的会话不再补发（回复已阻断）。
     """
-    s = sessions.get(sid)
+    s = _session_get(sid)
     if not isinstance(s, dict):
         return []
     pend = s.get("cmd_pend")
@@ -7626,7 +8402,7 @@ def _flush_pending(sid, channel_prefixes=None, framing="sse"):
 
     先吐命令拦截的前瞻缓冲（本轮末尾更靠前的文本），再吐占位符截留的尾巴。
     """
-    s = sessions.get(sid)
+    s = _session_get(sid)
     if not s:
         return ""
     out = _cmd_flush_frames(sid, channel_prefixes, framing)
@@ -7711,7 +8487,7 @@ def _restore_ndjson_line(line, sid, final=False):
     try:
         slots = _sse_text_slots(obj)
         if slots:
-            s = sessions.get(sid) or {}
+            s = _session_get(sid) or {}
             for channel, text, setter, escape in slots:
                 restored = restore(text, sid, channel=channel, escape=escape, final=final)
                 # 命令拦截：同 SSE 槽位路径（NDJSON 的增量文本也会被切成多块）
@@ -7860,7 +8636,7 @@ def _restore_ext_sse_event(block, sid, stream_id, final=False):
                     if replaced is not None:
                         flush_rest()
                         out_lines.append("data: " + json.dumps(replaced, ensure_ascii=False))
-                        s_ = sessions.get(sid) or {}
+                        s_ = _session_get(sid) or {}
                         pend = s_.get("pending") or {}
                         if pend.get(channel):
                             s_.setdefault("flush_tmpl", {})[channel] = json.dumps(replaced, ensure_ascii=False)
@@ -7901,7 +8677,7 @@ def restore_stream_chunk(text, sid, stream_id, content_type="", escape=False, fi
     `stream_id` 用于在当前会话中隔离半帧切片缓冲 `ext_frames[stream_id]`。
     当前扩展链路每次 mask 均签发唯一的独立 sid，单 sid 对应单条流；通道状态由 sid 隔离。
     """
-    s = sessions.get(sid)
+    s = _session_get(sid)
     if not isinstance(text, str):
         return text
     if not s:
@@ -7985,6 +8761,8 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
     Cohere v2）与 `ndjson`（换行分隔的 JSON 行，Ollama）。两种格式的占位符跨 TCP 块
     分裂问题靠同一套「只在帧完整时处理」解决。
     """
+    admission = _aux_token(flow)
+    session_ref = admission.session_ref if admission is not None and not admission.released else _session_get(sid)
     state = {
         "decoder": codecs.getincrementaldecoder("utf-8")(errors="replace"),
         "buf": "",
@@ -8008,8 +8786,9 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
         except Exception:
             pass
         if state["text_len"] < _SSE_KEEP_MAX:
-            state["text"].append(chunk)
-            state["text_len"] += len(chunk)
+            kept = chunk[:_SSE_KEEP_MAX - state["text_len"]]
+            state["text"].append(kept)
+            state["text_len"] += len(kept)
         elif not state["truncated"]:
             state["truncated"] = True
 
@@ -8030,25 +8809,52 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
         state["text"] = []          # 文本已转入局部变量，提前释放列表引用
         # 还原摘要留在循环上发（它只是读几个计数 + 800B 预览，已成微秒级）：
         # 这样 RESTORE → AUDIT/SCAN 的事件顺序与搬走之前**完全一致**。
+        _transport_complete(flow)
         _emit_restore_summary(flow, sid, host, method, emit_path, source, ok=True, streamed_text=restored_text, stream_actual="stream", stream_usage=state["usage"])
         # 审计与响应扫描是 O(body)（512KB 正则 + 摘要抽取），投递到 aux 池执行。
         # `_drop(sid)` 也交给它（见 _stream_finish_offload 的注释）。
-        with _AUX_PENDING_LOCK:
-            _AUX_PENDING[0] += 1
-        _session_ref = sessions.get(sid)
+        _session_ref = _session_get(sid)
         try:
-            _AUX_POOL.submit(_stream_finish_offload, flow, sid, host, method,
-                             emit_path, source, restored_text, _session_ref)
-        except Exception as e:
-            # 池已关（进程收尾）：宁可占一次循环，也不能把这次审计丢掉。
-            # ⚠️ 这里**不要**手动归还 `_AUX_PENDING`：下面的内联调用会走它自己的
-            # `finally` 归还（那里还负责 `_drop`），再扣一次会把计数压成负数，
-            # 于是 `aux_drain()` 误判“已排空”（测试与诊断会假绿）。
-            _log("[stream] aux 池不可用（%s），收尾改为内联执行" % type(e).__name__)
-            _stream_finish_offload(flow, sid, host, method, emit_path, source,
-                                   restored_text, _session_ref)
+            token = _aux_token(flow) or _aux_reserve(flow)
+            snapshot = _aux_snapshot(flow)
+            _aux_submit(token, sid, _session_ref, _stream_finish_offload,
+                        snapshot, sid, host, method, emit_path, dict(source),
+                        restored_text, _session_ref, time.perf_counter())
+        except Exception:
+            # Explicit failed audit, never unbudgeted synchronous work on the loop.
+            _aux_abandon(flow)
+            _aux_stat_add("stream_finish_failed")
+            _emit("ERR", host=host, method=method, path=emit_path, sid=sid,
+                  reason="stream_finish_failed", failure_phase="local_response", **source)
+            if _session_ref is not None:
+                _drop(sid, expect=_session_ref)
+
+    def _dispose():
+        nonlocal session_ref
+        state["done"] = True
+        state["aborted"] = True
+        state["buf"] = ""
+        state["text"] = []
+        state["text_len"] = 0
+        state["decoder"] = None
+        session_ref = None
 
     def _stream(data: bytes):
+        nonlocal session_ref
+        if state.get("aborted"):
+            return []
+        try:
+            with _aux_session(sid, session_ref):
+                return _stream_owned(data)
+        finally:
+            if state["done"]:
+                # mitmproxy may retain the stream callback on a completed flow.
+                # The submitted job now owns its session, or failure retired it.
+                session_ref = None
+                state["text"] = []
+                state["buf"] = ""
+
+    def _stream_owned(data: bytes):
         if state["done"]:
             return data
         try:
@@ -8062,7 +8868,7 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
             _touch(sid)  # 长生成期间刷新会话 TTL，防止 _sweep 误删活动中的流式会话
             # 首字节计时：第一次收到非空数据块即记（含流式接管路径）
             if data:
-                s_cur = sessions.get(sid)
+                s_cur = _session_get(sid)
                 if s_cur is not None:
                     if s_cur.get("resp_ts") is None:
                         s_cur["resp_ts"] = time.time()
@@ -8148,7 +8954,7 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
             # 流式处理失败：放弃改写，原样透传剩余数据，绝不把连接搞断。
             # 缓冲里已解码但未输出的部分必须拼回去，否则客户端收到缺块的半截流。
             state["done"] = True
-            s_sse = sessions.get(sid, {}) if sid else {}
+            s_sse = _session_get(sid, {}) if sid else {}
             _emit("ERR", host=host, method=method, path=emit_path, sid=sid, msg=f"{framing}_stream:" + str(e)[:160],
                   upstream=s_sse.get("upstream_name", ""), model=s_sse.get("model", ""), **source)
             try:
@@ -8192,24 +8998,27 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
             except Exception:
                 pass
             try:
-                _drop(sid)
+                _aux_abandon(flow)
+                if session_ref is not None:
+                    _drop(sid, expect=session_ref)
             except Exception:
                 pass
             # 这里无需防空返回：passthrough = 残留 + data，data 非空则必非空；
             # data 为空即末块，走 mitmproxy 的 EndOfMessage 分支（对 b"" 有过滤）。
             return passthrough
 
+    _stream._maskit_dispose = _dispose
     return _stream
 
 
-def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, streamed_text=None, stream_actual="whole", stream_usage=None):
+def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, streamed_text=None, stream_actual="whole", stream_usage=None, prepare_only=False):
     """记录 RESTORE 事件（流式与非流式共用）。
 
     stream_actual 表示引擎实际处理方式（区别于客户端请求类型 stream_mode）：
     - "stream"：responseheaders 流式接管，逐事件下发
     - "whole"：整包还原后一次性下发（黑名单上游 / stream_response 关闭 / 非 SSE）
     """
-    s = sessions.get(sid, {})
+    s = _session_get(sid, {})
     masked_count = len(s.get("fwd", {}))
     restored_count = int(s.get("restored", 0) or 0)
     restored_unique = len(s.get("restored_tokens", set()) or set())
@@ -8344,8 +9153,7 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
             hint = _reasoning_effort_hint(re_val)
     except Exception:
         pass
-    _emit(
-        "RESTORE",
+    summary = dict(
         block_source=block_source,
         # C-2：为什么整包（content_encoding:gzip / excluded_host / non_sse）。
         # 没有降级时**不带这个键**：前端按"有键才显示"处理，不给正常请求加噪声。
@@ -8359,6 +9167,12 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
         restored=restored_count,
         restored_unique=restored_unique,
         unresolved=unresolved,
+        # 未还原占位符样本（最多 5 条；样本本身是占位符，不含任何原文）。
+        # 此前**只有扩展链路**（panel 的 /api/ext/restore）外发它，代理链路只在
+        # 会话里收集 —— 面板只显示一个数字，用户无从区分「模型改写/自造占位符」
+        # 与「映射过期或引擎重启导致查不到原文」，而这两种情况的处置完全不同。
+        **({"unresolved_samples": [str(x)[:120] for x in (s.get("unresolved_samples") or [])][:5]}
+           if s.get("unresolved_samples") else {}),
         # 靠宽松兜底（模型剥了花括号）修回来的个数。
         # 这个计数一直存在于会话里，但**从没被发进事件**——注释写着「计数进
         # RESTORE 事件，让用户看得见」，实际 _emit 参数里没有它，于是
@@ -8373,6 +9187,7 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
         items=items,
         scan_scope=s.get("scan_scope") or {},  # RESTORE 归因：复用 MASK 的扫描范围
         http_status=getattr(flow.response, "status_code", None),
+        transport=_transport_snapshot(flow),
         model=s.get("model") or "",
         upstream=s.get("upstream_name") or "",
         dialog=resp_dialog,
@@ -8395,12 +9210,12 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
            if s.get("ner_skips") else {}),
         # 治理器派生字段（与 MASK 同源，从会话带过来）：详情弹窗回源的正是本条 RESTORE，
         # 不带就永远渲染不出来（前端 EventDetailDialog 读 event.ner_global_throttled）。
-        **({"ner_global_throttled": int(m.get("global_throttled") or 0),
-            "ner_sem_wait_ms": round(float(m.get("sem_wait_ms") or 0.0), 1)}
-           if (m := (s.get("ner_metrics") or {}))
-           and (m.get("global_throttled") or m.get("sem_wait_ms")) else {}),
+        **{k: v for k, v in (s.get("ner_metrics") or {}).items() if k in _NER_EVENT_METRICS},
         **source,
     )
+    if prepare_only:
+        return summary
+    _emit("RESTORE", **summary)
 
 
 def _raw_stream_passthrough(data: bytes):
@@ -8421,6 +9236,10 @@ def responseheaders(flow: http.HTTPFlow):
     消息结束时再传入 b""。_sse_stream_factory 在流末完成 RESTORE、审计、
     响应扫描和会话清理；关闭 stream_response 时自然回退到 response()。
     """
+    if flow.metadata.get("shield_local_response"):
+        return
+    _transport_event("responseheaders", flow)
+    flow.metadata["transport"] = _safe_transport_snapshot(flow)
     if not STREAM_RESPONSE:
         return
     sid = flow.metadata.get("session_id")
@@ -8460,7 +9279,7 @@ def responseheaders(flow: http.HTTPFlow):
     path = flow.request.path
     emit_path = flow.metadata.get("shield_orig_path") or path
     method = getattr(flow.request, "method", "") or ""
-    source = sessions.get(sid, {}).get("source", {})
+    source = _session_get(sid, {}).get("source", {})
     # 压缩体在 responseheaders 阶段仍是压缩字节，无法按事件解析；
     # 交回 response() 的整包路径，让 mitmproxy 先完成解压。
     content_encoding = (headers.get("content-encoding", "") or "").lower().strip()
@@ -8722,7 +9541,8 @@ def _read_settings():
 
             ups.append({"name": name, "base_path": base, "port": port, "target": target,
                         "paths": list(paths), "use_proxy": bool(u.get("use_proxy")),
-                        "extra_headers": extra_headers, "model_rules": model_rules})
+                        "extra_headers": extra_headers, "model_rules": model_rules,
+                        **({"connection_policy": u["connection_policy"]} if "connection_policy" in u else {})})
     if not ups:
         ups = list(DEFAULT_UPSTREAMS)
     # 出口代理：enabled 关闭时直接置 None，省得 request() 每次都判两个字段。
@@ -8858,7 +9678,12 @@ def _maybe_reload(force=False):
     # SENSITIVE_DISABLED / SENSITIVE_WORD_DISABLED 判断哪些词仍启用，放在前面会
     # 永远按上一代配置计算（禁用词要等第二次改配置才被清掉）。
     _refresh_custom_words_sorted()
-    _CUSTOM_WORD_RX_CACHE = {}  # 词表变更后丢掉编译缓存（换对象，不就地 clear）
+    _CUSTOM_WORD_RX_CACHE = {}
+    # 词表换代：上一代的问题登记作废（新词表会在下次构建计划时重新评估）；
+    # 计划缓存的键已含词表内容，本来就会自行失效，显式置空只为可读性。
+    _CUSTOM_COMBINED_CACHE["plan"] = None
+    _clear_word_table_issues()
+
     br = dict(DEFAULT_BUILTIN_RULES)
     raw_br = s.get("builtin_rules") or {}
     # 旧配置 IP 键迁移（与 panel.normalize_config 一致）：IP 拆 IP_PRIVATE/IP_INTERNAL

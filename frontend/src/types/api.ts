@@ -12,6 +12,40 @@ export interface UpstreamStatus {
   target: string
 }
 
+export interface ConnectionPolicy {
+  reuse: 'default' | 'never'
+  idle_ttl_s: number | null
+  connect_timeout_s: number
+  tls_handshake_timeout_s: number
+}
+
+export interface TransportCapabilities {
+  supported?: boolean
+  deadlines?: boolean
+  http1_reuse_policy?: boolean
+  observation?: boolean
+  observation_reason?: string | null
+  stream_cancellation?: boolean
+  stream_cancellation_reason?: string | null
+  version?: string
+  reason?: string
+}
+
+export interface TransportEvidence {
+  phase?: string
+  reason?: string | null
+  server_conn_id?: string | null
+  reused?: boolean | null
+  idle_s?: number | null
+  connect_ms?: number | null
+  tls_ms?: number | null
+  protocol?: string
+  via_proxy?: boolean | null
+  evidence?: string
+  evidence_complete?: boolean | null
+  request_written?: boolean | null
+}
+
 export interface UpstreamConfig {
   name: string
   port: number
@@ -22,6 +56,7 @@ export interface UpstreamConfig {
   extra_headers?: Record<string, string>
   model_rules?: ModelRule[]
   use_proxy?: boolean
+  connection_policy?: ConnectionPolicy | null
 }
 
 export interface ModelRule {
@@ -101,6 +136,21 @@ export interface ProxyStatus {
     /** 缓存冷热计数（本进程视角；代理链路真值在 engine-runtime.json） */
     cache?: { hit?: number; miss?: number; hit_rate?: number | null }
   }
+  /**
+   * 敏感词表生效口径：`configured`/`regex_words` 来自配置，`engine_count`/`issues`
+   * 来自**引擎进程**经 engine-runtime.json 外发的真值。
+   *
+   * 为什么要分开：2026-09-30 事故里整张词表因一个 `re:` 词编译失败而静默失效，
+   * 面板只看配置的话显示一切正常，用户却什么都脱敏不了。
+   * `issues` 是「词 -> 原因」，词本身是用户自己的配置内容，不含请求原文。
+   */
+  words?: {
+    configured: number
+    regex_words: number
+    engine_count: number | null
+    issues: Record<string, string>
+    engine_stale: boolean
+  }
   needs_ca: boolean
   wizard_recommended: boolean
   last_error: string
@@ -136,6 +186,16 @@ export interface EventItem extends SlimItem {
 }
 
 export interface ShieldEvent {
+  transport?: TransportEvidence
+  failure_phase?: string
+  upstream_may_have_executed?: boolean
+  ner_init_ms?: number
+  ner_infer_ms?: number
+  ner_budget_wait_ms?: number
+  ner_calls?: number
+  ner_windows?: number
+  ner_cache_hits?: number
+  ner_cache_misses?: number
   id: number
   /** epoch 秒 */
   ts: number
@@ -155,6 +215,8 @@ export interface ShieldEvent {
    * 无法还原（对应的原文从不存在），只能如实告诉用户。
    */
   unresolved?: number
+  /** 未还原占位符样本（引擎侧外发；仅未还原时存在，用于区分模型改写与映射丢失） */
+  unresolved_samples?: string[]
   /**
    * 靠宽松兜底修回来的占位符数（仅 RESTORE 事件）。模型把 {{}} 剥掉或写残时，
    * _LOOSE_PLACEHOLDER_RX 捞回来的那些。是成功路径，但值得看见——
@@ -371,6 +433,8 @@ export interface ShieldConfig {
   audit?: Record<string, unknown>
   _meta?: {
     builtin_rule_meta: Record<string, unknown>
+    transport_capabilities?: TransportCapabilities
+    warnings?: string[]
     version: string
   }
   [key: string]: unknown

@@ -56,7 +56,7 @@ while [[ $# -gt 0 ]]; do
       echo "选项:"
       echo "  --bundles <list>   打包格式，默认 deb,appimage"
       echo "  --version <ver>    指定版本号（如 0.6.2）"
-      echo "  --release-only     仅打包，不进行本地替换与自测"
+      echo "  --release-only     独立暂存目录构建，不替换源码态或已安装的引擎"
       echo "  --no-gates         跳过全量门禁检查"
       exit 0
       ;;
@@ -142,13 +142,19 @@ fi
 # 5. 版本设置（若指定）
 if [ -n "$TARGET_VERSION" ]; then
   info "同步指定版本号: $TARGET_VERSION..."
-  $PYTHON_BIN scripts/bump-version.py "$TARGET_VERSION"
+  "$PYTHON_BIN" scripts/bump-version.py "$TARGET_VERSION"
 fi
 
-# 6. 全量门禁校验
+# 6. 门禁前准备依赖；npm ci 失败必须中止，不回退到改写锁文件的 install。
+if [ ! -d "frontend/node_modules" ]; then
+  npm --prefix frontend ci
+fi
+mkdir -p src-tauri/resources/engine
+
+# 全量门禁校验
 if [ "$SKIP_GATES" = false ]; then
   info "执行全量门禁检查 (scripts/verify-all.py)..."
-  if ! $PYTHON_BIN scripts/verify-all.py --python "$PYTHON_BIN"; then
+  if ! "$PYTHON_BIN" scripts/verify-all.py --python "$PYTHON_BIN"; then
     error "全量门禁未通过，终止打包。若确需跳过可用 --no-gates 参数。"
     exit 1
   fi
@@ -157,87 +163,111 @@ else
   warn "已跳过全量门禁检查 (--no-gates)"
 fi
 
-# 7. 清理 engine/ 运行时产物（绝对保护 models/ 子目录）
-info "清理引擎开发态运行时数据..."
-find engine -maxdepth 1 -type f \( \
-  -name "*.sqlite3*" -o \
-  -name "*.jsonl" -o \
-  -name "config.json" -o \
-  -name "config.json.bak-*" -o \
-  -name "proxy_token" -o \
-  -name "*.log" -o \
-  -name "shield.pid" -o \
-  -name "shield-env-backup.json" -o \
-  -name "model_prices_cache.json" -o \
-  -name "diagnostics-*.json" \
-\) -delete || true
-
-# 检查本地 NER 模型状态
+# 7. 构建只按 spec 白名单收集资源，绝不删除源码态配置、凭据或事件库。
 NER_MODEL_DIR="engine/models/ner_mini_zh"
-if [ -f "$NER_MODEL_DIR/model_quantized.onnx" ] && [ -f "$NER_MODEL_DIR/tokenizer.json" ]; then
+NER_READY=true
+for model_file in model_quantized.onnx tokenizer.json config.json; do
+  if [ ! -s "$NER_MODEL_DIR/$model_file" ]; then NER_READY=false; fi
+done
+if [ "$NER_READY" = true ]; then
   success "NER 本地语义模型已就绪，将构建【全功能一体包】"
 else
-  warn "未检测到完整 NER 语义模型（缺 model_quantized.onnx），将构建【轻量规则包】"
+  warn "本地语义模型不完整；spec 会拒绝半套模型，完全缺失时才构建轻量规则包"
 fi
 
 # 8. 前端构建
 info "构建前端静态资源..."
-if [ ! -d "frontend/node_modules" ]; then
-  npm --prefix frontend ci || npm --prefix frontend install
-fi
 npm --prefix frontend run build
 success "前端构建产物就绪 (frontend/dist)"
 
-# 9. 引擎 Sidecar 打包 (PyInstaller)
+# 9. --release-only 在仓库外的固定暂存根构建：不碰源码态，也复用 cargo 增量缓存。
+ENGINE_DIST="$ROOT_DIR/dist_engine"
+ENGINE_WORK="$ROOT_DIR/build_engine"
+if [ "$RELEASE_ONLY" = true ]; then
+  STAGE_EXPLICIT=true
+  BUILD_STAGE="${MASKIT_BUILD_STAGE:-}"
+  if [ -z "$BUILD_STAGE" ]; then
+    STAGE_EXPLICIT=false
+    BUILD_STAGE="${XDG_CACHE_HOME:-$HOME/.cache}/maskit-build"
+  fi
+  mkdir -p "$BUILD_STAGE"
+  # 为什么不用 mktemp / ${TMPDIR:-/tmp}：实测本机 /tmp 是 tmpfs 16G，一次 release
+  # 构建就在里面留下 8.9G（cargo release target + 103MB 模型），且脚本不清理，两个
+  # 泄漏目录把 tmpfs 用到 68%——再来一次就是 ENOSPC，而且占的是内存。
+  # 固定路径同时让 cargo 增量缓存跨构建复用（原先每次全新编译 20 分钟起）。
+  STAGE_FS="$(findmnt -no FSTYPE -T "$BUILD_STAGE" 2>/dev/null || true)"
+  if [ "$STAGE_FS" = "tmpfs" ] || [ "$STAGE_FS" = "ramfs" ]; then
+    if [ "$STAGE_EXPLICIT" = true ]; then
+      warn "暂存目录 $BUILD_STAGE 在内存文件系统（$STAGE_FS）上，构建产物会占用 RAM。"
+    else
+      error "默认暂存目录 $BUILD_STAGE 位于内存文件系统（$STAGE_FS），release 构建会耗尽 tmpfs/RAM。"
+      echo "请用 MASKIT_BUILD_STAGE=<磁盘目录> 指定暂存根（不要放在 /tmp）。"
+      exit 1
+    fi
+  fi
+  ENGINE_DIST="$BUILD_STAGE/dist_engine"
+  ENGINE_WORK="$BUILD_STAGE/build_engine"
+  # 不用 ${CARGO_TARGET_DIR:-...}：继承来的值会把本次产物写进**上一次**的暂存根
+  # （实测过：dist_engine 在新目录、.deb 落在旧目录），清理与取证都会踩空。
+  export CARGO_TARGET_DIR="$BUILD_STAGE/tauri-target"
+  info "独立打包目录: $BUILD_STAGE (cargo target: $CARGO_TARGET_DIR)"
+fi
 info "使用 PyInstaller 打包 Python 引擎 sidecar..."
-rm -rf dist_engine build_engine
-$PYTHON_BIN -m PyInstaller engine/maskit-engine.spec --noconfirm --distpath dist_engine --workpath build_engine
+"$PYTHON_BIN" -m PyInstaller engine/maskit-engine.spec --noconfirm --distpath "$ENGINE_DIST" --workpath "$ENGINE_WORK"
 
-if [ ! -f "dist_engine/MaskitEngine/MaskitEngine" ]; then
-  error "PyInstaller 引擎产物缺失: dist_engine/MaskitEngine/MaskitEngine"
+SRC_ENGINE="$ENGINE_DIST/MaskitEngine"
+if [ ! -x "$SRC_ENGINE/MaskitEngine" ]; then
+  error "PyInstaller 引擎产物缺失: $SRC_ENGINE/MaskitEngine"
   exit 1
 fi
 
-# 10. 同步引擎到 Tauri resources 目录
-info "同步引擎至 Tauri 打包源目录 (src-tauri/resources/engine)..."
-SRC_ENGINE="src-tauri/resources/engine"
-rm -rf "$SRC_ENGINE"
-mkdir -p "$SRC_ENGINE"
+# 10. 验证实际打包产物；不安装、不调用生产面板、不依赖源码 PYTHONPATH。
+SMOKE_ARGS=(--engine "$SRC_ENGINE/MaskitEngine")
+if [ "$NER_READY" = true ]; then SMOKE_ARGS+=(--ner); fi
+"$PYTHON_BIN" tests/smoke_transport.py "${SMOKE_ARGS[@]}"
+PANEL_SMOKE_ARGS=(--engine "$SRC_ENGINE/MaskitEngine")
+if [ "$NER_READY" = true ]; then PANEL_SMOKE_ARGS+=(--expect-ner); fi
+"$PYTHON_BIN" tests/smoke_packaged_panel.py "${PANEL_SMOKE_ARGS[@]}"
 
-cp -a dist_engine/MaskitEngine/_internal "$SRC_ENGINE/_internal"
-cp dist_engine/MaskitEngine/MaskitEngine "$SRC_ENGINE/MaskitEngine"
-chmod +x "$SRC_ENGINE/MaskitEngine"
-
-ENGINE_FILES_COUNT=$(find "$SRC_ENGINE/_internal" -type f | wc -l)
-if [ "$ENGINE_FILES_COUNT" -lt 100 ]; then
-  error "打包源目录引擎同步异常（仅 $ENGINE_FILES_COUNT 个文件）"
-  exit 1
+# 11. 通过资源映射打包，不替换源码态或已安装的 resources/engine。
+# src-tauri/resources/engine 现在只被 `tauri dev` 与 local-dev-deploy.sh --restore 读取；
+# 本脚本走 bundle.resources 映射，不写它。但工作区里可能残留别的平台的引擎
+# （实测见过 245MB 的 Windows MaskitEngine.exe 躺在 Linux 工作区，restore 会照抄）。
+if [ -f "src-tauri/resources/engine/MaskitEngine.exe" ]; then
+  warn "src-tauri/resources/engine 里是 Windows 引擎，Linux 的 tauri dev / --restore 会读到它。"
+  warn "打包不受影响（走 bundle.resources 映射）；本地开发调试前请自行清理该目录。"
 fi
-success "打包源目录引擎已同步就绪 ($ENGINE_FILES_COUNT 个文件)"
-
-# 11. Tauri 打包
 info "执行 Tauri 构建 (bundles: $BUNDLES)..."
-CONFIG_ARGS=()
-if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ] && [ -z "${MASKIT_UPDATER_PRIVATE_KEY:-}" ]; then
-  info "未检测到更新签名密钥，以未签名模式 (unsigned) 构建..."
-  printf '%s\n' '{"bundle":{"createUpdaterArtifacts":false}}' > src-tauri/tauri.unsigned.json
-  CONFIG_ARGS=(--config src-tauri/tauri.unsigned.json)
+if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ] && [ -n "${MASKIT_UPDATER_PRIVATE_KEY:-}" ]; then
+  export TAURI_SIGNING_PRIVATE_KEY="$MASKIT_UPDATER_PRIVATE_KEY"
 fi
-
-node frontend/node_modules/@tauri-apps/cli/tauri.js build --bundles "$BUNDLES" "${CONFIG_ARGS[@]}"
+UNSIGNED=false
+if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+  info "未检测到更新签名密钥，以未签名模式 (unsigned) 构建..."
+  UNSIGNED=true
+fi
+CONFIG_JSON=$("$PYTHON_BIN" - "$SRC_ENGINE" "$UNSIGNED" <<'PY'
+import json, pathlib, sys
+bundle = {"resources": {str(pathlib.Path(sys.argv[1]).resolve()) + "/": "resources/engine/"}}
+if sys.argv[2] == "true":
+    bundle["createUpdaterArtifacts"] = False
+print(json.dumps({"build": {"beforeBuildCommand": None}, "bundle": bundle}))
+PY
+)
+node frontend/node_modules/@tauri-apps/cli/tauri.js build --bundles "$BUNDLES" --config "$CONFIG_JSON" -- --locked
 
 # 12. 产物校验与总结
 info "校验打包产物..."
-BUNDLE_DIR="src-tauri/target/release/bundle"
+BUNDLE_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/src-tauri/target}/release/bundle"
 OUTPUTS=()
 
-if [ -d "$BUNDLE_DIR/deb" ]; then
+if [[ ",$BUNDLES," == *,deb,* ]] && [ -d "$BUNDLE_DIR/deb" ]; then
   while IFS= read -r f; do
     OUTPUTS+=("$f")
   done < <(find "$BUNDLE_DIR/deb" -type f -name "*.deb")
 fi
 
-if [ -d "$BUNDLE_DIR/appimage" ]; then
+if [[ ",$BUNDLES," == *,appimage,* ]] && [ -d "$BUNDLE_DIR/appimage" ]; then
   while IFS= read -r f; do
     OUTPUTS+=("$f")
   done < <(find "$BUNDLE_DIR/appimage" -type f -name "*.AppImage")
@@ -247,6 +277,60 @@ if [ ${#OUTPUTS[@]} -eq 0 ]; then
   error "未找到任何生成的打包产物 (.deb / .AppImage)！"
   exit 1
 fi
+
+# 只查「产物存在 + 体积」是不够的：bundle.resources 一旦不生效，包照样生成、体积
+# 照样上百 MB，用户侧表现是启动即「引擎缺失」（src-tauri/src/lib.rs 那句报错），
+# 而这一步之前完全静默。所以逐个产物把内容列出来，按路径断言引擎与模型在包里。
+REQUIRED_ENTRIES=("resources/engine/MaskitEngine" "resources/engine/_internal/transparent.py")
+if [ "$NER_READY" = true ]; then
+  REQUIRED_ENTRIES+=("resources/engine/_internal/models/ner_mini_zh/model_quantized.onnx")
+fi
+
+verify_bundle_contents() {  # $1 = 产物路径
+  local listing="$ENGINE_WORK/bundle-listing.txt"
+  case "$1" in
+    *.deb)
+      if ! command -v dpkg-deb >/dev/null 2>&1; then
+        warn "缺少 dpkg-deb，无法校验 $(basename "$1") 的内容"
+        return 0
+      fi
+      dpkg-deb -c "$1" > "$listing"
+      ;;
+    *.AppImage)
+      local extract_dir="$ENGINE_WORK/appimage-check"
+      rm -rf "$extract_dir"; mkdir -p "$extract_dir"
+      if ! ( cd "$extract_dir" && APPIMAGE_EXTRACT_AND_RUN=1 "$1" --appimage-extract >/dev/null 2>&1 ); then
+        warn "$(basename "$1") 无法自解包，跳过内容校验"
+        rm -rf "$extract_dir"
+        return 0
+      fi
+      ( cd "$extract_dir" && find squashfs-root -mindepth 1 ) > "$listing"
+      rm -rf "$extract_dir"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+  local missing=()
+  for entry in "${REQUIRED_ENTRIES[@]}"; do
+    grep -q "/${entry}\$" "$listing" || missing+=("$entry")
+  done
+  rm -f "$listing"
+  if [ ${#missing[@]} -gt 0 ]; then
+    error "$(basename "$1") 内缺少：${missing[*]}"
+    error "安装包不含完整引擎，用户启动会直接报「引擎缺失」，终止发布。"
+    return 1
+  fi
+  if [ "$NER_READY" = true ]; then
+    success "$(basename "$1") 内容校验通过（引擎 + NER 模型）"
+  else
+    success "$(basename "$1") 内容校验通过（引擎，轻量规则包）"
+  fi
+}
+
+for out in "${OUTPUTS[@]}"; do
+  verify_bundle_contents "$out" || exit 1
+done
 
 echo ""
 echo -e "${GREEN}================================================================${NC}"
@@ -259,6 +343,6 @@ for out in "${OUTPUTS[@]}"; do
 done
 echo ""
 echo "安装使用建议:"
-echo "  • Debian/Ubuntu (.deb): sudo dpkg -i src-tauri/target/release/bundle/deb/*.deb"
-echo "  • 通用独立运行 (.AppImage): chmod +x src-tauri/target/release/bundle/appimage/*.AppImage && ./src-tauri/target/release/bundle/appimage/*.AppImage"
+echo "  • Debian/Ubuntu: 对上面列出的 .deb 文件执行 sudo dpkg -i <文件>"
+echo "  • AppImage: 对上面列出的文件赋予执行权限后启动；本脚本不会自动安装或启动"
 echo ""
