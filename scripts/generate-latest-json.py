@@ -88,7 +88,13 @@ def main():
     repo = args.repo or os.environ.get("GITHUB_REPOSITORY", "lauchiwa/data-maskit")
 
     # 1. 查找签名文件
-    all_sigs = list(root.glob("**/*.sig"))
+    #
+    # `glob` 的返回顺序由文件系统枚举决定，**不保证**把 updater 要的包排在前面。
+    # 分类用「是不是这个平台的」，取用必须另外按 updater 可用性排序：下面每个平台
+    # 都先 `_rank` 再取 `[0]`。直接取分类结果的第一个会让产物取决于目录枚举顺序
+    # （macOS 上实测取到 `.dmg`），而 `.dmg` / `.deb` 不是 updater 的下载目标，
+    # 写进 latest.json 就是让所有客户端的自动更新 404。
+    all_sigs = sorted(root.glob("**/*.sig"))
     win_sigs = [s for s in all_sigs if s.name.endswith(".exe.sig") or "windows" in s.as_posix().lower()]
     mac_sigs = [
         s for s in all_sigs
@@ -108,15 +114,33 @@ def main():
         )
     ]
 
-    linux_x64_sigs = [
+    def _rank(sigs, *preferred_suffixes):
+        """按 updater 可接受的包形态排序：命中靠前后缀的优先，其余保持原序。
+
+        tauri updater 只认增量更新包（Windows `.exe`、macOS `.app.tar.gz`、
+        Linux `.AppImage.tar.gz`）；`.dmg` / `.deb` 是给人手工装的，URL 虽然存在
+        但 updater 解不开。同名版本同时产出两种包是常态，所以必须显式定序。
+        """
+        def key(s):
+            name = s.name.lower()
+            for i, suffix in enumerate(preferred_suffixes):
+                if name.endswith(suffix):
+                    return (i, s.as_posix())
+            return (len(preferred_suffixes), s.as_posix())
+        return sorted(sigs, key=key)
+
+    win_sigs = _rank(win_sigs, ".exe.sig")
+    mac_sigs = _rank(mac_sigs, ".app.tar.gz.sig")
+
+    linux_x64_sigs = _rank([
         s for s in linux_sigs
         if any(k in s.as_posix().lower() for k in ("amd64", "x86_64", "x64", "linux-x64"))
         or not any(k in s.as_posix().lower() for k in ("arm64", "aarch64", "linux-arm64"))
-    ]
-    linux_arm64_sigs = [
+    ], ".appimage.tar.gz.sig")
+    linux_arm64_sigs = _rank([
         s for s in linux_sigs
         if any(k in s.as_posix().lower() for k in ("arm64", "aarch64", "linux-arm64"))
-    ]
+    ], ".appimage.tar.gz.sig")
 
     if not win_sigs and not mac_sigs and not linux_sigs:
         print(f"No *.sig signature files found in {root}; skipping latest.json", file=sys.stderr)

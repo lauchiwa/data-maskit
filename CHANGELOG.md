@@ -11,6 +11,8 @@
 ### 修复 / Bug Fixes
 - 修正 Windows 发布校验和清单的换行格式，确保每个文件的摘要独占一行。
   *Fix newlines in Windows release checksum manifests so each file digest occupies its own line.*
+- `latest.json` 的各平台安装包按 updater 可用形态显式定序，不再取决于目录枚举顺序，避免 macOS 写入 `.dmg` 链接导致自动更新 404。
+  *Pick each platform's updater bundle for `latest.json` by explicit preference instead of directory enumeration order, so macOS no longer records a `.dmg` URL that makes auto-update 404.*
 
 ## [0.103.0] - 2026-09-28
 
