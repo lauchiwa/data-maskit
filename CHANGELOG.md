@@ -2,6 +2,16 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [Unreleased]
+
+### 修复
+- 发版：更新元数据补齐 `linux-<arch>-deb` 条目并对 `.deb` 单独签名，deb 安装的 Linux 客户端不再报 `invalid updater binary format`。
+
+---
+
+### Fixed
+- Release: the update manifest now ships signed `linux-<arch>-deb` entries, so Linux clients installed from `.deb` no longer fail with `invalid updater binary format`.
+
 ## [0.7.0] - 2026-10-02
 
 ### 修复

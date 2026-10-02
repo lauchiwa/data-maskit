@@ -15,6 +15,10 @@
    （release job 用 `merge-multiple: false` 下载，文件落在 `release-assets/maskit-*/` 下）；
 3. macOS 必须优先取 `*.app.tar.gz.sig` —— Tauri updater 要的是 `.app.tar.gz`，
    不是 `.dmg`，取错了自动更新会 404。
+4. Linux 的 deb 与 AppImage 必须各占一条独立条目（`linux-<arch>-deb` / `linux-<arch>`）：
+   updater 以 `{os}-{arch}-{bundle_type}` 查找，deb 安装的客户端若回退命中 AppImage，
+   `install_deb` 的 `is_deb()` 校验失败 → 用户看到 `invalid updater binary format`
+   （v0.7.0 线上实测：deb 用户点更新必失败）。
 """
 import contextlib
 import importlib.util
@@ -108,6 +112,47 @@ class GenerateLatestJsonTests(unittest.TestCase):
             "signature": "LINUX-ARM-SIG",
             "url": "https://github.com/o/r/releases/download/v0.2.7/Maskit_0.2.7_aarch64.AppImage.tar.gz",
         })
+
+    # ---------- 2b. deb 必须独立成条（v0.7.0 线上事故回归） ----------
+
+    def test_deb_gets_own_target_without_polluting_appimage(self):
+        """deb 安装的客户端按 `linux-x86_64-deb` 查找，不能回退拿到 AppImage。
+
+        同一份 release 里 AppImage 与 deb 的签名文件名都含 "amd64"，
+        因此既要拆出独立条目，也不能让 deb 的 .sig 顶掉 AppImage 的 url。
+        """
+        self._sig("Maskit_0.7.0_amd64.AppImage.sig", "APPIMAGE-SIG")
+        self._sig("Maskit_0.7.0_amd64.deb.sig", "DEB-SIG")
+        self.assertEqual(self._run([str(self.dir), "--tag", "v0.7.0", "--repo", "o/r"]), 0)
+
+        platforms = self._latest()["platforms"]
+        self.assertEqual(platforms["linux-x86_64"], {
+            "signature": "APPIMAGE-SIG",
+            "url": "https://github.com/o/r/releases/download/v0.7.0/Maskit_0.7.0_amd64.AppImage",
+        })
+        self.assertEqual(platforms["linux-x86_64-deb"], {
+            "signature": "DEB-SIG",
+            "url": "https://github.com/o/r/releases/download/v0.7.0/Maskit_0.7.0_amd64.deb",
+        })
+
+    def test_deb_arm64_target(self):
+        self._sig("Maskit_0.7.0_aarch64.AppImage.sig", "APPIMAGE-ARM-SIG")
+        self._sig("Maskit_0.7.0_arm64.deb.sig", "DEB-ARM-SIG")
+        self.assertEqual(self._run([str(self.dir), "--tag", "v0.7.0", "--repo", "o/r"]), 0)
+
+        platforms = self._latest()["platforms"]
+        self.assertEqual(set(platforms), {"linux-aarch64", "linux-aarch64-deb"})
+        self.assertEqual(platforms["linux-aarch64-deb"], {
+            "signature": "DEB-ARM-SIG",
+            "url": "https://github.com/o/r/releases/download/v0.7.0/Maskit_0.7.0_arm64.deb",
+        })
+
+    def test_deb_only_release_still_produces_latest_json(self):
+        """只有 deb 签名时不能被当成「没有任何签名」而跳过，tag 也要能从 deb 文件名解析。"""
+        self._sig("Maskit_0.7.0_amd64.deb.sig", "DEB-SIG")
+        self.assertEqual(self._run([str(self.dir)]), 0)
+        self.assertEqual(set(self._latest()["platforms"]), {"linux-x86_64-deb"})
+        self.assertEqual(self._latest()["version"], "v0.7.0")
 
     def test_macos_prefers_app_tar_gz_over_dmg(self):
         """updater 要 .app.tar.gz；取成 .dmg 会让自动更新 404。"""
