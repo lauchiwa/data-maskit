@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from mitmproxy import io as flow_io
+from mitmproxy.flow import Error
 from mitmproxy.test import tflow
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
@@ -240,6 +241,35 @@ assert (tr._AUX_JOBS, tr._AUX_BYTES) == (0, 0)
                 gc.collect()
                 self.assertIsNone(ref())
                 self.assertEqual(callback(b"already finished"), b"already finished")
+
+    def test_cancelled_sse_disposes_retained_callback_without_restore(self):
+        class Session(dict):
+            pass
+        flow = self.flow("aux-sse-abort")
+        owned = Session(tr.sessions["aux-sse-abort"])
+        tr.sessions["aux-sse-abort"] = owned
+        ref = weakref.ref(owned)
+        token = tr._aux_reserve(flow)
+        callback = tr._sse_stream_factory(flow, "aux-sse-abort", "api.openai.com", "POST", "/v1/test", {})
+        flow.response.stream = callback
+        callback(b'data: {"choices":[{"delta":{"content":"synthetic text"}}]}\n\n')
+        callback(b'data: {"unfinished":"synthetic buffered text')
+        del owned
+        tr._on_stream_cancel(flow, "client_cancelled")
+        flow.error = Error("stream reset by client (CANCEL)")
+        tr.error(flow)
+        gc.collect()
+        self.assertTrue(token.released)
+        self.assertNotIn("aux-sse-abort", tr.sessions)
+        self.assertIsNone(ref())
+        cells = dict(zip(callback.__code__.co_freevars, (c.cell_contents for c in callback.__closure__)))
+        self.assertTrue(cells["state"]["done"])
+        self.assertEqual(cells["state"]["buf"], "")
+        self.assertEqual(cells["state"]["text"], [])
+        self.assertEqual(callback(b"late data"), [])
+        self.assertEqual(callback(b""), [])
+        self.assertFalse(any(kind in ("RESTORE", "ERR") for kind, _ in self.events))
+        self.assertEqual(sum(kind == "CANCEL" for kind, _ in self.events), 1)
 
     def test_stream_queue_metric_uses_measured_queue_wait(self):
         flow = self.flow("aux-stream-metric")

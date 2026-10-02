@@ -203,6 +203,9 @@ fi
 SMOKE_ARGS=(--engine "$SRC_ENGINE/MaskitEngine")
 if [ "$NER_READY" = true ]; then SMOKE_ARGS+=(--ner); fi
 "$PYTHON_BIN" tests/smoke_transport.py "${SMOKE_ARGS[@]}"
+PANEL_SMOKE_ARGS=(--engine "$SRC_ENGINE/MaskitEngine")
+if [ "$NER_READY" = true ]; then PANEL_SMOKE_ARGS+=(--expect-ner); fi
+"$PYTHON_BIN" tests/smoke_packaged_panel.py "${PANEL_SMOKE_ARGS[@]}"
 
 # 11. 通过资源映射打包，不替换源码态或已安装的 resources/engine。
 info "执行 Tauri 构建 (bundles: $BUNDLES)..."

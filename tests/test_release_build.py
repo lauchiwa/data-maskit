@@ -76,6 +76,9 @@ if name == "python":
     elif args[:1] == ["tests/smoke_transport.py"]:
         assert "--engine" in args and "--ner" in args
         assert pathlib.Path(args[args.index("--engine") + 1]).is_file()
+    elif args[:1] == ["tests/smoke_packaged_panel.py"]:
+        assert "--engine" in args and "--expect-ner" in args
+        assert pathlib.Path(args[args.index("--engine") + 1]).is_file()
     elif args[:1] == ["scripts/verify-all.py"]:
         assert (root / "frontend/node_modules").is_dir(), "dependencies must precede gates"
     elif args == ["--version"]:
@@ -116,6 +119,7 @@ elif name == "node":
             self.assertFalse((root / "src-tauri/tauri.unsigned.json").exists())
             calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
             self.assertTrue(any(args[:1] == ["tests/smoke_transport.py"] for _, args in calls))
+            self.assertTrue(any(args[:1] == ["tests/smoke_packaged_panel.py"] for _, args in calls))
             self.assertTrue(list((root / "staging").glob("*/tauri-target/release/bundle/deb/*.deb")))
 
 

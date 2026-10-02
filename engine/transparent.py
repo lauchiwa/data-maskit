@@ -68,6 +68,57 @@ _MASK_CANCEL_BY_CLIENT = {}
 _MASK_WORK_CONTEXT = threading.local()
 
 
+class _ClientFlowCancelled(asyncio.CancelledError):
+    """Client stream ended: return normally from the mitmproxy hook, not its task."""
+
+
+def _cancel_signal(flow):
+    signal = getattr(flow, "_shield_cancel_wakeup", None)
+    if signal is None:
+        signal = asyncio.Event()
+        flow._shield_cancel_wakeup = signal
+    return signal
+
+
+def _dispose_stream(flow):
+    stream = getattr(getattr(flow, "response", None), "stream", None)
+    dispose = getattr(stream, "_maskit_dispose", None)
+    if callable(dispose):
+        dispose()
+
+
+def _on_stream_cancel(flow, reason):
+    _dispose_stream(flow)
+    flow._shield_cancel_reason = reason
+    _cancel_signal(flow).set()
+    event = getattr(flow, "_shield_mask_cancel", None)
+    if event is not None:
+        event.set()
+    token = _aux_token(flow)
+    owned = token.session_ref if token is not None else None
+    _aux_abandon(flow)
+    if (owned is not None and not token.submitted
+            and not flow.metadata.get("shield_mask_pending")):
+        _drop(flow.metadata.get("session_id"), expect=owned)
+
+
+def _record_client_cancel(flow, phase):
+    if getattr(flow, "_shield_cancel_recorded", False):
+        return
+    flow._shield_cancel_recorded = True
+    _transport_event("error", flow)
+    flow.metadata["transport"] = _safe_transport_snapshot(flow)
+    req = getattr(flow, "request", None)
+    _emit("CANCEL", sid=flow.metadata.get("session_id", ""),
+          host=getattr(req, "host", ""), method=getattr(req, "method", ""),
+          path=str(getattr(req, "path", "")).split("?", 1)[0],
+          reason=getattr(flow, "_shield_cancel_reason", "client_disconnected"),
+          failure_phase=phase, transport=_transport_snapshot(flow))
+
+
+_CONNECTIONS.on_cancel = _on_stream_cancel
+
+
 def _transport_event(name, *args):
     try:
         getattr(_CONNECTIONS, name)(*args)
@@ -5730,11 +5781,15 @@ def error(flow):
     - getaddrinfo failed：域名解析失败，记 DNS_ERROR；不据此认定故障责任方；
     - 其余连接/协议错误记 ERR。具体阶段以 transport 证据为准。
     """
-    cancel_event = flow.metadata.get("shield_mask_cancel")
+    cancel_event = getattr(flow, "_shield_mask_cancel", None)
     if cancel_event is not None:
         cancel_event.set()
+    _dispose_stream(flow)
     _transport_event("error", flow)
     flow.metadata["transport"] = _safe_transport_snapshot(flow)
+    if getattr(flow, "_shield_cancel_reason", None) in (
+            "client_cancelled", "client_disconnected", "client_protocol_error"):
+        _record_client_cancel(flow, flow.metadata["transport"].get("phase", "unknown"))
     token = _aux_token(flow)
     owned_session = token.session_ref if token is not None else None
     _aux_abandon(flow)
@@ -5798,10 +5853,11 @@ def error(flow):
             msg = "[via egress_proxy] " + msg
         up_name = flow.metadata.get("shield_upstream") or (s.get("upstream_name") if s else "") or ""
         model = flow.metadata.get("shield_model") or (s.get("model") if s else "") or ""
-        _emit(ev_type, transport=_transport_snapshot(flow), host=host or "", method=getattr(flow.request, "method", "") or "",
-              path=path.split("?")[0] if isinstance(path, str) else "",
-              sid=sid or "", msg="flow_error:" + msg,
-              upstream=up_name, model=model, **source)
+        if not getattr(flow, "_shield_cancel_recorded", False):
+            _emit(ev_type, transport=_transport_snapshot(flow), host=host or "", method=getattr(flow.request, "method", "") or "",
+                  path=path.split("?")[0] if isinstance(path, str) else "",
+                  sid=sid or "", msg="flow_error:" + msg,
+                  upstream=up_name, model=model, **source)
     except Exception:
         pass
     if sid and not flow.metadata.get("shield_mask_pending"):
@@ -6146,15 +6202,31 @@ def mask_pool_stats():
     return adm
 
 
-async def _await_with_deadline(fut, timeout_s):
-    """等待脱敏结果，带端到端 deadline（B-5）。超时抛 `asyncio.TimeoutError`。
-
-    用 `shield` 包一层：超时只取消这层等待，**不取消**已经开跑的 worker
-    （线程池里的任务本来就取消不了，shield 让这个语义显式化而不是靠实现细节）。
-    调用方的责任：超时后给客户端结构化错误，并**丢弃**这次结果（不回写 flow），
-    孤儿 worker 可能的签发副作用记为已知边界（设计文档 §4.3）。
-    """
-    return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s)
+async def _await_with_deadline(fut, timeout_s, cancel_signal=None):
+    """Wait without cancelling the actual worker; client abort still completes the hook."""
+    if cancel_signal is None:
+        return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s)
+    shielded = asyncio.shield(fut)
+    aborted = asyncio.create_task(cancel_signal.wait())
+    try:
+        finished, _ = await asyncio.wait((shielded, aborted), timeout=max(0.0, timeout_s),
+                                         return_when=asyncio.FIRST_COMPLETED)
+        # Surface waiter failures instead of misreporting them as timeouts.
+        if aborted in finished:
+            aborted.result()
+        # Client termination wins a simultaneous worker completion: no late success.
+        if cancel_signal.is_set():
+            raise _ClientFlowCancelled()
+        if shielded in finished:
+            return shielded.result()
+        raise asyncio.TimeoutError()
+    finally:
+        if shielded.done() and not shielded.cancelled():
+            shielded.exception()
+        else:
+            shielded.cancel()  # only the shield wrapper, never the running worker
+        aborted.cancel()
+        await asyncio.gather(aborted, return_exceptions=True)
 
 
 _RUNTIME_METRICS_FILE = "engine-runtime.json"
@@ -6415,22 +6487,25 @@ def _aux_reserve(flow, response_bytes=None):
         if token is not None and token.submitted:
             return None  # Never steal capacity from a live job on replay/reset.
         extra = size - token.size if token else size
-        if ((not token and _AUX_JOBS >= _AUX_MAX_JOBS) or
-                _AUX_BYTES + extra > _AUX_MAX_BYTES or
-                (response_bytes or 0) > _AUX_RESPONSE_MAX):
-            _aux_stat_add("rejected")
-            return None
-        if token is None:
-            token = _AuxReservation(size, id(flow))
-            token.session_ref = _session_get(flow.metadata.get("session_id"))
-            _AUX_JOBS += 1
-            token.released = False
-            flow._shield_aux_reservation = token
-        else:
-            token.size = size
-        token.request_size = request_size
-        _AUX_BYTES += extra
-    return token
+        rejected = ((not token and _AUX_JOBS >= _AUX_MAX_JOBS) or
+                    _AUX_BYTES + extra > _AUX_MAX_BYTES or
+                    (response_bytes or 0) > _AUX_RESPONSE_MAX)
+        if not rejected:
+            if token is None:
+                token = _AuxReservation(size, id(flow))
+                token.session_ref = _session_get(flow.metadata.get("session_id"))
+                _AUX_JOBS += 1
+                token.released = False
+                flow._shield_aux_reservation = token
+            else:
+                token.size = size
+            token.request_size = request_size
+            _AUX_BYTES += extra
+            return token
+    # Never take the stats lock while holding the budget lock: a stats allocation
+    # may run a cyclic finalizer that needs the budget lock on another thread.
+    _aux_stat_add("rejected")
+    return None
 
 
 def _aux_abandon(flow):
@@ -6642,7 +6717,7 @@ def _ner_metric_fields():
 
 def _check_mask_work(deadline, cancel_event):
     if cancel_event is not None and cancel_event.is_set():
-        raise asyncio.CancelledError()
+        raise _ClientFlowCancelled()
     if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError("mask processing deadline exhausted")
 
@@ -6782,16 +6857,27 @@ def _mask_pipeline_worker(body, sid, raw_content, enum_changed, has_dup_keys,
 
 
 async def request(flow: http.HTTPFlow):
+    # Native replay/copy must start a new attempt, not inherit terminal lifecycle flags.
+    for key in tuple(flow.metadata):
+        if key.startswith("shield_") or key in ("session_id", "transport", "_maskit_transport", "_maskit_cancel_observers"):
+            flow.metadata.pop(key, None)
+    if getattr(flow, "_shield_request_seen", False):
+        for name in ("_shield_cancel_wakeup", "_shield_cancel_reason", "_shield_cancel_recorded"):
+            if hasattr(flow, name):
+                delattr(flow, name)
+    flow._shield_request_seen = True
     completed = False
     cancel_event = threading.Event()
     client_id = str(getattr(getattr(flow, "client_conn", None), "id", ""))
     _MASK_CANCEL_BY_CLIENT.setdefault(client_id, set()).add(cancel_event)
-    flow.metadata["shield_mask_cancel"] = cancel_event
+    flow._shield_mask_cancel = cancel_event
     _transport_event("request_started", flow)
     try:
+        if _cancel_signal(flow).is_set():
+            raise _ClientFlowCancelled()
         await _request_impl(flow)
         if cancel_event.is_set() and getattr(flow, "response", None) is None:
-            raise asyncio.CancelledError()
+            raise _ClientFlowCancelled()
         if (getattr(flow, "response", None) is None and _aux_token(flow) is not None
                 and _aux_reserve(flow) is None):
             # Masking can expand the request body. Account for the actual retained
@@ -6802,9 +6888,19 @@ async def request(flow: http.HTTPFlow):
             _emit("BLOCK", sid=flow.metadata.get("session_id"), reason="aux_busy",
                   block_source="engine")
         completed = True
+    except _ClientFlowCancelled:
+        # Returning from the hook is essential: mitmproxy must issue HookCompleted
+        # and drain its already-queued protocol error for this stream.
+        cancel_event.set()
+        _aux_abandon(flow)
+        _record_client_cancel(flow, "local_request")
+        flow.response = http.Response.make(
+            503, b'{"error":{"code":"shield_request_cancelled"}}',
+            {"content-type": "application/json", "x-should-retry": "false"})
     finally:
         cancel_event.set()
-        flow.metadata.pop("shield_mask_cancel", None)
+        if hasattr(flow, "_shield_mask_cancel"):
+            delattr(flow, "_shield_mask_cancel")
         pending = _MASK_CANCEL_BY_CLIENT.get(client_id)
         if pending is not None:
             pending.discard(cancel_event)
@@ -6821,6 +6917,10 @@ async def request(flow: http.HTTPFlow):
                 _drop(flow.metadata.get("session_id"), expect=owned_session)
             _transport_event("error", flow)
         flow.metadata["transport"] = _safe_transport_snapshot(flow)
+        if completed and getattr(flow, "response", None) is None and not _cancel_signal(flow).is_set():
+            # Request waiters are gone; response owns a fresh wake signal. This also
+            # keeps recorded/test flows usable when hooks are driven on separate loops.
+            flow._shield_cancel_wakeup = asyncio.Event()
 
 
 async def _request_impl(flow: http.HTTPFlow):
@@ -7109,7 +7209,7 @@ async def _request_impl(flow: http.HTTPFlow):
     # 判据是字节预算 + 条数上限（按条数算的最坏值会失控：16 条 × 32MB = 512MB）。
     flow.metadata["shield_request_decoded_bytes"] = len(raw_content)
     _mask_deadline = time.monotonic() + _ENGINE_DEADLINE_S
-    _mask_cancel = flow.metadata.get("shield_mask_cancel")
+    _mask_cancel = getattr(flow, "_shield_mask_cancel", None)
     if _aux_reserve(flow) is None:
         _emit("BLOCK", host=host, method=method, path=path.split("?")[0], sid=sid,
               reason="aux_busy", block_source="engine", upstream=up_name, **source)
@@ -7169,7 +7269,8 @@ async def _request_impl(flow: http.HTTPFlow):
         _fut.add_done_callback(mask_finished)
         try:
             # ---- B-5：端到端 deadline ----
-            _res = await _await_with_deadline(_fut, max(0.0, _mask_deadline - time.monotonic()))
+            _res = await _await_with_deadline(_fut, max(0.0, _mask_deadline - time.monotonic()),
+                                               _cancel_signal(flow))
         except asyncio.TimeoutError:
             if _mask_cancel is not None:
                 _mask_cancel.set()
@@ -7377,13 +7478,22 @@ async def _request_impl(flow: http.HTTPFlow):
     )
 
 
+class _ResponseResult(NamedTuple):
+    content: bytes | None  # already encoded wire bytes; no loop-side compression
+    ok: bool
+    error: str | None
+    block: http.Response | None
+    debug_text: str | None
+    summary: dict | None  # worker-prepared event, published only by the result owner
+
+
 def _response_offload(flow, sid, host, method, emit_path, source, ct):
     """整包响应侧的重活（A-3），跑在 `_AUX_POOL` 线程里。
 
     只**读** flow，不改它的任何字段；需要正文的三处一律显式传 `streamed_text`
     （restore 后的文本），回写统一交给调用它的协程（§4.2 不变式 3）。
 
-    返回 `(new_content, ok, err, block, debug_text)`：
+    返回 `_ResponseResult`，包含编码后的正文和已准备的 RESTORE 事件：
       new_content  None = 未还原（体积超限或非结构化 ct），事件循环保持原文；
       err          非空 = 还原阶段抛异常（调用方记 ERR）；**审计与响应扫描照常执行**
                    —— 它们是安全层，不能因为"还原没做"就整段跳过（见下方注释）；
@@ -7504,15 +7614,16 @@ def _response_offload_locked(flow, sid, host, method, emit_path, ct, source):
         block = audit_block
     # 响应侧扫描：检测模型回复中不在本会话映射里的 PII（幻觉/训练数据泄漏）
     _scan_response(flow, sid, host, method, emit_path, source, streamed_text=text)
+    summary = None
     if ok and block is None:
-        flow.metadata["prepared_restore"] = _emit_restore_summary(
+        summary = _emit_restore_summary(
             flow, sid, host, method, emit_path, source,
             ok=True, streamed_text=text, prepare_only=True)
     if new_content is not None:
         from mitmproxy.net import encoding
         new_content = encoding.encode(new_content, flow.response.headers.get("content-encoding") or "identity")
     _aux_stat_add("completed")
-    return (new_content, ok, err, block, debug_text)
+    return _ResponseResult(new_content, ok, err, block, debug_text, summary)
 
 
 async def response(flow: http.HTTPFlow):
@@ -7525,6 +7636,10 @@ async def response(flow: http.HTTPFlow):
     不涉及 response。
     """
     if flow.metadata.get("shield_local_response"):
+        return
+    if _cancel_signal(flow).is_set():
+        _aux_abandon(flow)
+        _record_client_cancel(flow, "local_response")
         return
     _transport_complete(flow)
     sid = flow.metadata.get("session_id")
@@ -7573,13 +7688,18 @@ async def response(flow: http.HTTPFlow):
                              dict(source), ct)
         wrapped = asyncio.wrap_future(future)
         wrapped.add_done_callback(lambda f: None if f.cancelled() else f.exception())
-        result = await asyncio.wait_for(asyncio.shield(wrapped), timeout=_AUX_WAIT_HARD_S)
+        result = await _await_with_deadline(wrapped, _AUX_WAIT_HARD_S, _cancel_signal(flow))
         if token.abandoned:
             # error() may terminate a flow while its response hook is awaiting.
             # The worker still audits, but only the existing terminal outcome wins.
             _aux_stat_add("late_completed")
             return
-        new_content, ok, err, block, debug_text = result
+        new_content, ok, err, block, debug_text, summary = result
+    except _ClientFlowCancelled:
+        _aux_abandon(flow)
+        _aux_stat_add("cancelled")
+        _record_client_cancel(flow, "local_response")
+        return
     except asyncio.CancelledError:
         _aux_abandon(flow)
         _aux_stat_add("cancelled")
@@ -7628,10 +7748,8 @@ async def response(flow: http.HTTPFlow):
                 flow.response.headers["content-length"] = str(len(new_content))
         else:
             flow.response.content = new_content
-    if ok and block is None:
-        summary = snapshot.metadata.pop("prepared_restore", None)
-        if summary is not None:
-            _emit("RESTORE", **summary)
+    if ok and block is None and summary is not None:
+        _emit("RESTORE", **summary)
     if DEBUG and debug_text is not None:
         _debug(f"RESPONSE {host}{path.split('?')[0]} -- 还原后(返回客户端)", sid, debug_text)
     if block is not None:
@@ -8490,8 +8608,20 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
             if _session_ref is not None:
                 _drop(sid, expect=_session_ref)
 
+    def _dispose():
+        nonlocal session_ref
+        state["done"] = True
+        state["aborted"] = True
+        state["buf"] = ""
+        state["text"] = []
+        state["text_len"] = 0
+        state["decoder"] = None
+        session_ref = None
+
     def _stream(data: bytes):
         nonlocal session_ref
+        if state.get("aborted"):
+            return []
         try:
             with _aux_session(sid, session_ref):
                 return _stream_owned(data)
@@ -8656,6 +8786,7 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
             # data 为空即末块，走 mitmproxy 的 EndOfMessage 分支（对 b"" 有过滤）。
             return passthrough
 
+    _stream._maskit_dispose = _dispose
     return _stream
 
 

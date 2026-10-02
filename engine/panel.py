@@ -721,6 +721,7 @@ _TAIL_KEEP_FIELDS = {
     "ingress", "client_app", "transport",
     "failure_phase", "upstream_may_have_executed",
     "ner_init_ms", "ner_infer_ms", "ner_budget_wait_ms", "ner_calls", "ner_windows", "ner_cache_hits", "ner_cache_misses",
+    "ner_global_throttled", "ner_sem_wait_ms",
 }
 # tail 通道的双上限（P1，修面板 MemoryError）。
 # 为什么要限：`/api/logs` 是前端**轮询**接口（日志页与首页都调），而 tail 是

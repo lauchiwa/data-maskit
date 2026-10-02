@@ -1136,6 +1136,12 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
         </span>
       </div>
 
+      {!!cfg?._meta?.warnings?.length && (
+        <div role="alert" className="space-y-1 rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
+          {cfg._meta.warnings.map((warning, index) => <p key={index}>{warning}</p>)}
+        </div>
+      )}
+
       {/* embeddedTab（独立页模式）：隐藏 tab 栏，只渲染对应内容；URL 保持 /words /clients */}
       <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
         {!embeddedTab && (

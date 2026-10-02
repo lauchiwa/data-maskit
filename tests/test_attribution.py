@@ -529,6 +529,19 @@ class EmittedFieldRegistrationTests(unittest.TestCase):
                          "这些字段既没进导出/诊断白名单，也没在 NOT_EXPORTED 里说明理由："
                          "%s（漏登记就会像 engine_queue_bytes 一样静默丢出导出）" % unregistered)
 
+    def test_ner_inventory_reaches_every_projection_and_frontend_merge(self):
+        fields = set(tr._NER_EVENT_METRICS)
+        export, diag = self._whitelists()
+        self.assertGreaterEqual(len(fields), 9)
+        self.assertTrue(fields <= panel._TAIL_KEEP_FIELDS)
+        self.assertTrue(fields <= export)
+        self.assertTrue(fields <= diag)
+        types = (ROOT / "frontend/src/types/api.ts").read_text(encoding="utf-8")
+        merge = (ROOT / "frontend/src/lib/log-events.ts").read_text(encoding="utf-8")
+        for field in fields:
+            self.assertRegex(types, rf"\b{field}\?:\s*number")
+            self.assertRegex(merge, rf"\b{field}:\s*r\.{field}\s*\?\?\s*m\.{field}")
+
     def test_not_exported_list_has_no_rot(self):
         """NOT_EXPORTED 不许留腐烂条目：字段改名/删掉后，这里必须同步（否则它会
         悄悄把"新字段"也算成已登记 —— 名字相同但语义已变）。"""

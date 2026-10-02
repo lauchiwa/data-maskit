@@ -240,6 +240,7 @@ jobs:
           test -x src-tauri/resources/engine/MaskitEngine
           test "$(find src-tauri/resources/engine/_internal -type f | wc -l)" -ge 100
           python3 tests/smoke_transport.py --engine src-tauri/resources/engine/MaskitEngine --ner
+          python3 tests/smoke_packaged_panel.py --engine src-tauri/resources/engine/MaskitEngine --expect-ner
 
       - name: Select updater mode (Windows)
         if: runner.os == 'Windows'

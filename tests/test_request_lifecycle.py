@@ -84,10 +84,12 @@ class RequestLifecycleTests(unittest.TestCase):
             task = asyncio.create_task(tr.request(flow))
             await self.wait(entered.is_set)
             tr.client_disconnected(flow.client_conn)
-            self.assertTrue(flow.metadata["shield_mask_cancel"].is_set())
+            self.assertTrue(flow._shield_mask_cancel.is_set())
+            self.assertNotIn("shield_mask_cancel", flow.metadata)
             release.set()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
+            await task  # normal hook completion lets mitmproxy drain the stream error
+            self.assertEqual(flow.response.status_code, 503)
+            self.assertIn(b"shield_request_cancelled", flow.response.content)
             await self.wait(lambda: tr.mask_pool_stats()["inflight"] == self.baseline)
         with mock.patch.object(tr, "_mask_tree", blocked):
             try:

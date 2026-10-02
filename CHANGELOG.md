@@ -6,7 +6,9 @@
 
 ### 修复
 - 引擎：NER 请求预算过期不再续期，取消与等待不再额外开启推理窗口。
-- 引擎：响应任务采用有界准入与独立快照，修复超时后迟到结果、会话清理和内存保护失效。
+- 引擎：修复真实流取消、垃圾回收重入与压缩响应配额，避免迟到回复、假 503 和响应漏审计。
+- 构建：隔离发布构建并验收真实 frozen 引擎，保留本机运行数据，拒绝不完整模型包。
+- 面板：未知连接策略不再使整份配置回退；桌面控制面请求不再经过环境代理。
 - 面板：统一 HTTP/2 缺省为关闭，保留用户明确选择，避免模板与运行配置口径不一致。
 - 引擎：自定义词表里的 `re:` 词不再能拖垮整张词表（一个词编译失败曾让自定义词与内置词组一起静默失效）。
 - 引擎：无汉字的识别窗口不再送入语义模型，稀疏中文正文的识别耗时降约 74%（实测）。
@@ -25,7 +27,9 @@
 
 ### Fixed
 - Engine: expired NER request budgets no longer renew, and cancellation or waiting cannot grant extra inference windows.
-- Engine: bounded response admission and isolated snapshots prevent late results, session cleanup errors, and bypassed memory limits.
+- Engine: fixed native stream cancellation, GC reentrancy and compressed-response admission to prevent late replies, spurious 503s and skipped audits.
+- Build: isolate release builds and verify the actual frozen engine, preserving local runtime data and rejecting incomplete model bundles.
+- Panel: unknown connection policies no longer reset the entire configuration; desktop control-plane requests bypass environment proxies.
 - Panel: default HTTP/2 consistently to off while preserving explicit choices, avoiding drift between templates and runtime configuration.
 - Engine: one broken `re:` word can no longer take down the whole word table (a single bad pattern silently disabled custom and built-in groups together).
 - Engine: recognition windows without CJK characters are no longer sent to the semantic model — ~74% less inference time on sparsely-Chinese content (measured).

@@ -23,6 +23,10 @@ export interface TransportCapabilities {
   supported?: boolean
   deadlines?: boolean
   http1_reuse_policy?: boolean
+  observation?: boolean
+  observation_reason?: string | null
+  stream_cancellation?: boolean
+  stream_cancellation_reason?: string | null
   version?: string
   reason?: string
 }
@@ -177,6 +181,7 @@ export interface ShieldEvent {
   ner_infer_ms?: number
   ner_budget_wait_ms?: number
   ner_calls?: number
+  ner_windows?: number
   ner_cache_hits?: number
   ner_cache_misses?: number
   id: number
@@ -417,6 +422,7 @@ export interface ShieldConfig {
   _meta?: {
     builtin_rule_meta: Record<string, unknown>
     transport_capabilities?: TransportCapabilities
+    warnings?: string[]
     version: string
   }
   [key: string]: unknown
