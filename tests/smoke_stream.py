@@ -16,6 +16,7 @@
 """
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -139,8 +140,9 @@ def _run_proxy_pass(cmd_mode, srv):
 
     env = {**os.environ, "LLM_SHIELD_DATA_DIR": str(work), "PYTHONUTF8": "1",
            "PYTHONPATH": str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    mitm_cmd = shutil.which("mitmdump") or str(pathlib.Path(sys.executable).parent / "mitmdump")
     proc = subprocess.Popen(
-        ["mitmdump", "-s", str(TRANSPARENT_PY), "--listen-host", "127.0.0.1",
+        [mitm_cmd, "-s", str(TRANSPARENT_PY), "--listen-host", "127.0.0.1",
          "--mode", f"reverse:http://127.0.0.1:{UPSTREAM_PORT}@{PROXY_PORT}",
          "--set", "flow_detail=0", "--set", "connection_strategy=lazy"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,

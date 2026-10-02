@@ -7366,18 +7366,24 @@ class MaskOffloadTests(unittest.TestCase):
         self.assertEqual(seen, [tr._ner_req_budget(raw_len)],
                          "代理链路的 NER 总预算没打开或值与体积不匹配")
 
-    def test_ner_budget_scales_with_body_and_stays_generous(self):
-        """预算按体积线性伸缩、有上下界，且对真实长会话足够宽。
+    def test_ner_budget_is_capped_for_the_client_timeout(self):
+        """预算按体积伸缩、有上下界，且**默认上限不得大到撞客户端超时**（P0-a）。
 
-        实测成本（冷缓存、中文，见 tests/measure_ner_coverage.py）：43KB ≈ 3.9s、
-        1MB ≈ 11s。旧固定值 2.0s 在 200 条/43KB 上会让 96/200 个 NER-only 人名
-        明文出网 —— 所以这里守住「43KB 至少给 10s」。
+        口径变化（2026-09-28）：上限从 60s 收到默认 10s。原因不是省钱，是实测客户端
+        （Pi 等编程代理）解包超时 180s，而上游首包实测 p50 6.4s、max 99.8s；
+        60s 的脱敏上限会把冷缓存那一轮直接推过 180s（事故现场：脱敏 58.5s +
+        上游等待 >120s → resp=0）。所以默认上限必须显著小于客户端窗口。
+
+        实测成本（冷缓存、中文，见 tests/measure_ner_coverage.py）：43KB ≈ 3.9s。
+        默认 10s 仍能覆盖常见会话，超过的部分**降级但可见**（budget_exhausted）。
         """
         self.assertAlmostEqual(tr._ner_req_budget(0), tr._NER_REQ_BUDGET_BASE_S, places=3)
-        self.assertGreater(tr._ner_req_budget(43 * 1024), 10.0,
-                           "43KB 长会话的预算偏小（实测需 ~3.4s）")
-        self.assertGreater(tr._ner_req_budget(500 * 1024),
-                           tr._ner_req_budget(100 * 1024), "预算必须随体积增长")
+        self.assertGreaterEqual(tr._ner_req_budget(43 * 1024), 3.9,
+                                "43KB 长会话的预算跑不完实测成本（~3.9s）")
+        self.assertLessEqual(tr._NER_REQ_BUDGET_MAX_DEFAULT_S, 15.0,
+                             "默认上限过大：冷缓存一轮就会撞客户端 180s 超时窗口")
+        self.assertGreaterEqual(tr._ner_req_budget(500 * 1024),
+                                tr._ner_req_budget(100 * 1024), "预算不能随体积下降")
         self.assertLessEqual(tr._ner_req_budget(20 * 1024 * 1024), tr._NER_REQ_BUDGET_MAX_S,
                              "必须有上限：32MB 请求体全量 NER 要几分钟")
         for weird in (None, -5, 0.0):
@@ -7442,23 +7448,28 @@ class MaskOffloadTests(unittest.TestCase):
             % (tr._NER_REQ_BUDGET_PER_MB_S, per_mb_need))
         self.assertGreaterEqual(tr._NER_REQ_BUDGET_MAX_S, tr._NER_REQ_BUDGET_BASE_S)
 
-    def test_real_too_long_skip_lands_in_the_mask_event(self):
-        """端到端（不用 mock 跳过分账）：真发生一次跳过，事件里必须看得见。
+    def test_real_long_text_is_segmented_instead_of_skipped(self):
+        """端到端：超长叶子不再「整条跳过」，而是被**分段识别**（P1）。
 
-        上面两条用例都是 mock `request_skips` 验证接线，只能证明「没断线」；这条走真实
-        链路：引擎按请求记账 → 专职线程取回 → MASK 事件 → 待落库字段，任一段断掉都会红。
+        旧行为是记 `too_long` 后整条不做 NER —— 用户真实流量里出现过 6208 字的单条
+        正文，那一段的中文人名全明文上行。现在超过 `MAX_TEXT_CHARS` 会按窗口切分
+        逐段识别，所以这条用例断言的是「分段真的发生了」。
 
-        ⚠️ 必须把 `is_ner_available` 固定为 True，否则本用例会变成**环境依赖**：
-        CI 上不带语义模型（`engine/models/` 是 gitignore 的），而 transparent 在调
-        `extract_entities` **之前**就有一道模型可用性前置检查 —— 模型缺失时它直接记
-        `model_missing` 返回，叶子根本到不了 `too_long`（实测：本地绿、CI 红，报
-        `{'model_missing': 1} != {'too_long': 1}`）。
-        而 `too_long` 在 `extract_entities` 内部排在模型初始化**之前**，本来就不依赖模型。
+        ⚠️ 不依赖语义模型：分段计数（`cache_stats()["long_split_calls"]`）在
+        `_extract_long` 里累加，与推理是否可用无关 —— CI 上 `engine/models/` 是
+        gitignore 的，模型缺失时这条用例仍必须有效。
+
+        ⚠️ 但**必须**把 `is_ner_available` 固定为 True（2026-09-28 CI 实测）：
+        `transparent.mask()` 在调 `extract_entities` **之前**就有一道模型可用性前置
+        检查，模型缺失时直接记 `model_missing` 返回 —— 叶子根本到不了
+        `_extract_long`，断言 `long_split_calls` 必然失败（本地有模型所以绿）。
+        而 `_extract_long` 的计数本身不需要推理成功（段内 init 失败也照样计数）。
         """
         import ner_engine
         long_text = "系统提示词" * 4001          # 20005 字，超过单条上限
         self.assertGreater(len(long_text), ner_engine.MAX_TEXT_CHARS,
                            "用例前提：文本必须超过单条上限")
+        before = ner_engine.cache_stats()["long_split_calls"]
         events = []
         flow = self._flow({"model": "gpt-4o-mini",
                            "messages": [{"role": "user",
@@ -7472,11 +7483,12 @@ class MaskOffloadTests(unittest.TestCase):
                 _drive_request(flow)
         finally:
             tr.NER_ENABLED = old
+        after = ner_engine.cache_stats()["long_split_calls"]
+        self.assertGreater(after, before, "超长叶子没有走分段路径（又整条跳过了？）")
         mask = [kw for typ, kw in events if typ == "MASK"]
         self.assertTrue(mask, "未发出 MASK 事件")
-        self.assertTrue(mask[0].get("ner_truncated"), "真实降级未写进 MASK 事件")
-        self.assertEqual(mask[0].get("ner_skip_reasons"), {"too_long": 1},
-                         "跳过原因与条数应如实上报（不是统一个笼统标记）")
+        self.assertNotIn("too_long", mask[0].get("ner_skip_reasons") or {},
+                         "分段识别之后不应再有 too_long 这条整条跳过的记账")
 
     def test_ner_degradation_reaches_restore_event_too(self):
         """降级必须同时出现在 MASK 与 RESTORE 上。
@@ -7861,7 +7873,6 @@ class NerSkipReasonSurfacesTests(unittest.TestCase):
     def test_every_engine_skip_key_has_a_frontend_surface(self):
         keys = self._engine_skip_keys()
         # 非空转：正则失效时这两个断言会先失败，而不是悄悄通过
-        self.assertIn("too_long", keys)
         self.assertIn("deadline", keys)
         self.assertIn("model_unavailable", keys)
         dialog = (self.ROOT / "frontend/src/components/events/EventDetailDialog.tsx").read_text(encoding="utf-8")
@@ -7870,11 +7881,252 @@ class NerSkipReasonSurfacesTests(unittest.TestCase):
         for k in sorted(keys):
             self.assertIn("%s:" % k, dialog, "详情弹窗的 NER_SKIP_LABELS 缺 %s" % k)
             self.assertIn("'%s'" % k, settings, "设置页的 NER_SKIP_ITEMS 缺 %s" % k)
+        # 历史键必须继续有落点：旧版本写进库里的 `too_long` 仍会被渲染，
+        # 而 2026-09-28（P1）起引擎**不再产生**它（超长文本改为分段识别）。
+        # 这条反向守卫钉住「别顺手把标签一起清掉」——清掉老用户看到的就是裸键名。
+        for legacy in ("too_long",):
+            self.assertIn("%s:" % legacy, dialog, "详情弹窗的历史跳过键标签被删了：%s" % legacy)
+            self.assertIn("'%s'" % legacy, settings, "设置页的历史跳过键标签被删了：%s" % legacy)
         # 弹窗引用的标签键必须**真在字典里**（中英各一份），否则用户看到的是裸键名
         for m in re.finditer(r"'settings\.sw\.nerSkip[A-Za-z]+'", dialog):
             key = m.group(0).strip("'")
             self.assertGreaterEqual(i18n.count("'%s':" % key), 2,
                                     "i18n 缺少 %s（需中英双语）" % key)
+
+
+class NerBudgetConfigTests(unittest.TestCase):
+    """P0-a：单请求 NER 预算上限必须可配、有硬上限，且环境变量能硬覆盖。
+
+    事故背景：默认上限 60s 时，冷缓存一轮就能吃满（实测 mask_ms=60497.7），
+    而客户端解包超时只有 180s —— 上限必须是一个可调的、有界的量。
+    """
+
+    def test_set_ner_req_budget_clamps_and_env_wins(self):
+        old_cap = tr._NER_REQ_BUDGET_MAX_S
+        old_env = tr._NER_REQ_BUDGET_MAX_ENV
+        try:
+            tr._NER_REQ_BUDGET_MAX_ENV = None      # 模拟无环境变量
+            self.assertEqual(tr.set_ner_req_budget(30), 30.0)
+            self.assertEqual(tr._ner_req_budget(50 * 1024 * 1024), 30.0,
+                             "调大上限后大 body 应能拿到更多预算")
+            self.assertEqual(tr.set_ner_req_budget(9999), tr._NER_REQ_BUDGET_MAX_HARD_S,
+                             "上限本身必须有硬上限（否则又能拉回几分钟的脱敏）")
+            self.assertEqual(tr.set_ner_req_budget(-5), tr._NER_REQ_BUDGET_MAX_DEFAULT_S)
+            self.assertEqual(tr.set_ner_req_budget("abc"), tr._NER_REQ_BUDGET_MAX_DEFAULT_S)
+            # 环境变量存在时配置改不动（容器/CI 需要把参数固定住）
+            tr._NER_REQ_BUDGET_MAX_ENV = 7.0
+            tr._NER_REQ_BUDGET_MAX_S = 7.0
+            self.assertEqual(tr.set_ner_req_budget(60), 7.0,
+                             "环境变量应硬覆盖配置（否则容器里会时而生效时而不生效）")
+        finally:
+            tr._NER_REQ_BUDGET_MAX_S = old_cap
+            tr._NER_REQ_BUDGET_MAX_ENV = old_env
+
+    def test_read_settings_exposes_ner_budget(self):
+        """`_read_settings` 必须把配置里的预算读出来（读不到 = 改了也不生效）。"""
+        old_root = tr._DATA_ROOT
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            tr._DATA_ROOT = tmp
+            (tmp / "config.json").write_text(json.dumps({"ner_req_budget_s": 25}),
+                                             encoding="utf-8")
+            self.assertEqual(tr._read_settings()["ner_req_budget_s"], 25.0)
+            (tmp / "config.json").write_text(json.dumps({"ner_req_budget_s": -3}),
+                                             encoding="utf-8")
+            self.assertEqual(tr._read_settings()["ner_req_budget_s"], 10.0,
+                             "非正数必须回落默认（而不是变成 1s 把语义识别关掉）")
+        finally:
+            tr._DATA_ROOT = old_root
+
+    def test_reload_wires_ner_budget(self):
+        """热重载必须**真的**把配置值接到 `set_ner_req_budget`（静态守卫）。
+
+        为什么用源码断言而不真调 `_maybe_reload`：后者会重写 `UPSTREAMS` /
+        `TARGET_DOMAINS` / `CAPTURE_MODE` 等一大批模块全局态，给同文件其他用例留下
+        顺序依赖（本文件已有实例）。“接上线”这件事用一行源码断言就够硬了。
+        """
+        src = inspect.getsource(tr._maybe_reload)
+        self.assertIn("set_ner_req_budget(", src, "热重载没有同步 NER 预算：面板改了要重启才生效")
+        self.assertIn('"ner_req_budget_s"', src, "热重载读的不是配置里的那个键")
+
+    def test_long_text_boundary_is_exact(self):
+        """分段边界：恰好等于上限不分段，超一个字符才分段（P1）。
+
+        推理被 mock 掉：本用例只验证“要不要分段”，真跑 20000 字推理会拖慢单测。
+        """
+        import ner_engine
+
+        def fake_decode(text, deadline):
+            return [], True
+
+        with mock.patch.object(ner_engine, "_init_ner", lambda: True), \
+             mock.patch.object(ner_engine, "_decode_chunks", fake_decode):
+            before = ner_engine.cache_stats()["long_split_calls"]
+            ner_engine.extract_entities("啊" * ner_engine.MAX_TEXT_CHARS)
+            self.assertEqual(ner_engine.cache_stats()["long_split_calls"], before,
+                             "恰好等于上限不应进分段路径（否则每段都退化成一步）")
+            ner_engine.extract_entities("嗯" * (ner_engine.MAX_TEXT_CHARS + 1))
+            self.assertEqual(ner_engine.cache_stats()["long_split_calls"], before + 1,
+                             "超过上限一个字符就应该分段")
+
+
+class NerCacheStatsTests(unittest.TestCase):
+    """P0-c：缓存冷热必须能看见（实测同内容冷热差 138 倍）。
+
+    之前只能人肉翻事件库对比两条 mask_ms 才能发现「缓存命中率掉到 0」；
+    这组计数是那个结论的机器可读形式。
+    """
+
+    def test_hit_and_miss_are_counted(self):
+        import ner_engine
+        text = "缓存命中计数专用文本甲乙丙丁"
+        with ner_engine._CACHE_LOCK:
+            ner_engine._CACHE.pop(text, None)
+        base = ner_engine.cache_stats()
+        ner_engine.extract_entities(text)              # 首次：未命中
+        mid = ner_engine.cache_stats()
+        self.assertEqual(mid["miss"] - base["miss"], 1, "未命中未计数")
+        # 写一条负缓存（空结果）再查：命中路径不依赖模型，CI 无模型时也成立
+        ner_engine._cache_put(text, [])
+        ner_engine.extract_entities(text)              # 二次：命中
+        after = ner_engine.cache_stats()
+        self.assertEqual(after["hit"] - mid["hit"], 1, "命中未计数")
+        self.assertIsNotNone(after["hit_rate"], "有查询之后命中率不应是 None")
+
+    def test_governor_payload_carries_cache_counters(self):
+        """计数必须真的能走到出口（只在模块里自娱自乐等于没做）。"""
+        import ner_engine
+        self.assertIn("cache", ner_engine.status())
+        self.assertIn("long_split_calls", ner_engine.status()["cache"])
+
+    def test_runtime_metrics_carry_ner_budget_and_cache(self):
+        """P0-a/P0-c 的出口：`engine-runtime.json` 必须带上预算与缓存计数。
+
+        写成文件才算出口——面板 `/api/engine/metrics` 与自检都读它，
+        只放在模块内存里的计数对用户不可见。
+        """
+        old_root = tr._DATA_ROOT
+        old_last = tr._RUNTIME_METRICS_LAST[0]
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            tr._DATA_ROOT = tmp
+            tr._RUNTIME_METRICS_LAST[0] = 0.0
+            self.assertTrue(tr.write_runtime_metrics(force=True))
+            payload = json.loads((tmp / tr._RUNTIME_METRICS_FILE).read_text(encoding="utf-8"))
+            ner = payload.get("ner") or {}
+            self.assertEqual(ner.get("req_budget_s"), float(tr._NER_REQ_BUDGET_MAX_S),
+                             "预算上限没进运行指标（面板看不到实际生效值）")
+            self.assertIn("cache", ner, "缓存计数没进运行指标（P0-c 出口断了）")
+            self.assertIn("hit", ner["cache"])
+        finally:
+            tr._DATA_ROOT = old_root
+            tr._RUNTIME_METRICS_LAST[0] = old_last
+
+
+class NerLongTextSegmentationTests(unittest.TestCase):
+    """P1：超长文本分段识别（不再整条跳过）。"""
+
+    def test_segments_shift_offsets_and_merge_overlaps(self):
+        import ner_engine
+
+        def fake(seg):
+            # 每段首 2 字当一个 NAME 实体：不依赖模型、几何关系确定
+            return [{"type": "NAME", "start": 0, "end": 2, "text": seg[:2]}]
+
+        text = "甲" * (ner_engine.MAX_TEXT_CHARS + 500)
+        before = ner_engine.cache_stats()["long_split_calls"]
+        with mock.patch.object(ner_engine, "extract_entities", fake):
+            out = ner_engine._extract_long(text)
+        self.assertEqual(ner_engine.cache_stats()["long_split_calls"] - before, 1,
+                         "分段次数未计数")
+        self.assertTrue(out, "分段后一个实体都没拿到")
+        for e in out:
+            self.assertLessEqual(e["end"], len(text), "偏移平移越界")
+            self.assertEqual(e["text"], text[e["start"]:e["end"]], "偏移平移错位")
+        for a, b in zip(out, out[1:]):
+            self.assertLessEqual(a["end"], b["start"], "分段结果出现重叠漏裁剪")
+
+
+class NerErrorAttributionTests(unittest.TestCase):
+    """P0-b：resp=0 的 ERR 事件必须能区分「卡在脱敏」与「卡在上游」。
+
+    实测把 58.5s 的冷缓存脱敏误读成上游问题、又把纯上游慢误判成脱敏问题，
+    来回两次——根因就是 ERR 行上没有任何脱敏计时。
+    """
+
+    def _err_flow(self, mask_ms, done_delta_s):
+        md = {"shield_mask_ms": mask_ms}
+        if done_delta_s is not None:
+            md["shield_mask_done_at"] = time.time() - done_delta_s
+        return SimpleNamespace(
+            request=SimpleNamespace(host="api.example.com", path="/v1/chat/completions?x=1",
+                                    method="POST", raw_content=b"{}",
+                                    timestamp_start=time.time() - 120),
+            response=None, metadata=md, error=ValueError("connection closed"))
+
+    def _emit_err(self, flow):
+        events = []
+        with mock.patch.object(tr, "_emit", lambda typ, **kw: events.append((typ, kw))):
+            tr.error(flow)
+        errs = [kw for typ, kw in events if typ == "ERR"]
+        self.assertTrue(errs, "未发出 ERR 事件")
+        return errs[0]["msg"]
+
+    def test_stuck_in_mask_is_distinguishable(self):
+        # 脱敏刚结束就断了（upstream_wait ≈ 0）→ 时间都花在脱敏上
+        msg = self._emit_err(self._err_flow(58500.0, 0.1))
+        self.assertIn("mask=58500.0ms", msg)
+        m = re.search(r"upstream_wait=(\d+)ms", msg)
+        self.assertIsNotNone(m, "ERR 行缺少 upstream_wait（无法归因）")
+        self.assertLess(int(m.group(1)), 3000, "upstream_wait 应接近 0（刚脱敏完就断）")
+
+    def test_stuck_upstream_is_distinguishable(self):
+        # 脱敏 0.4s 完成后干等了 100s 才断 → 卡在上游
+        msg = self._emit_err(self._err_flow(422.7, 100.0))
+        m = re.search(r"upstream_wait=(\d+)ms", msg)
+        self.assertIsNotNone(m)
+        self.assertGreater(int(m.group(1)), 90000, "upstream_wait 应反映上游等待时长")
+
+    def test_missing_timestamp_does_not_crash(self):
+        msg = self._emit_err(self._err_flow(1000.0, None))
+        self.assertIn("upstream_wait=-1ms", msg, "拿不到完成时刻时必须如实标 -1")
+
+
+class PanelNerBudgetContractTests(unittest.TestCase):
+    """P0-a/P0-c：面板侧能存、能展示、能透传（否则后端改了也与用户无关）。"""
+
+    def test_normalize_ner_budget(self):
+        base = panel.default_config()
+
+        def norm(v):
+            raw = dict(base)
+            raw["ner_req_budget_s"] = v
+            return panel.normalize_config(raw)["ner_req_budget_s"]
+
+        self.assertEqual(norm(25), 25.0)
+        self.assertEqual(norm(9999), 120.0, "超上限必须钳到硬上限")
+        self.assertEqual(norm("abc"), 10.0, "非法值回落默认")
+        self.assertEqual(norm(0), 10.0, "非正数回落默认而不是变成 1s")
+        self.assertEqual(panel.default_config()["ner_req_budget_s"], 10.0,
+                         "默认必须是收紧后的 10s（否则冷缓存一轮又撞超时）")
+
+    def test_tail_lines_are_truncated(self):
+        line = "SHIELD\tMASK\t" + json.dumps(
+            {"type": "MASK", "msg": "x" * 5000,
+             "items": [{"label": "A", "preview": "p" * 500, "original": "ORIG"}]})
+        out = panel._tail_line_sanitize(line)
+        self.assertNotIn("ORIG", out, "tail 通道泄漏了 items[].original")
+        self.assertLess(len(out), 2000, "tail 单行未做长度上限（轮询接口的内存放大源）")
+
+    def test_engine_metrics_projection_keeps_ner_cache(self):
+        eng = {"schema": 1, "ner": {"enabled": True, "req_budget_s": 10.0,
+                                    "budget_env_override": False,
+                                    "cache": {"hit": 3, "miss": 1, "hit_rate": 0.75},
+                                    "governor": {}}}
+        out = panel._project_engine_metrics(eng)
+        self.assertEqual(out["ner"]["req_budget_s"], 10.0)
+        self.assertEqual(out["ner"]["cache"]["hit"], 3,
+                         "缓存计数没进 /api/engine/metrics 的投影（P0-c 出口断了）")
 
 
 class NerCacheConcurrencyTests(unittest.TestCase):

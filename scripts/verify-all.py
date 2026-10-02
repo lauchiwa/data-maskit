@@ -136,8 +136,14 @@ def _child_env(python: str) -> dict:
     env = dict(os.environ)
     # smoke_*.py 直接调 `mitmdump`；把解释器所在目录前置到 PATH，否则 Windows 上会
     # 命中 AppData\Roaming\Python\...\mitmdump.exe（没装 mitmproxy）而失败。
-    bindir = str(pathlib.Path(python).resolve().parent)
-    env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+    # 虚拟环境中的 python 往往是指向外部 Python 的软链接，必须同时把虚拟环境 bin
+    # 和底层解释器所在目录加入 PATH，避免 resolve 跳出虚拟环境导致工具缺失。
+    py_path = pathlib.Path(python)
+    bindirs = [str(py_path.parent)]
+    resolved_dir = str(py_path.resolve().parent)
+    if resolved_dir not in bindirs:
+        bindirs.append(resolved_dir)
+    env["PATH"] = os.pathsep.join(bindirs) + os.pathsep + env.get("PATH", "")
     # WorkBuddy/CI 注入的 PYTHONPATH 会把 vendor shim 的 sitecustomize 拉进来，
     # 其 safe-delete 守卫会让部分用例在 finally 里 SystemExit。门禁必须干净。
     env.pop("PYTHONPATH", None)

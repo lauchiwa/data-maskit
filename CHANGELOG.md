@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### 新增 / Added
+- 同步上游 v0.6.1–v0.6.2：语义识别单请求预算可配置、超长文本分段识别、Linux amd64/arm64 桌面安装包与本地打包脚本。
+  *Synced upstream v0.6.1–v0.6.2: configurable per-request NER budget, segmented recognition for over-long text, Linux amd64/arm64 desktop packages and local build scripts.*
+
 ### 修复 / Bug Fixes
 - 修正 Windows 发布校验和清单的换行格式，确保每个文件的摘要独占一行。
   *Fix newlines in Windows release checksum manifests so each file digest occupies its own line.*
@@ -80,6 +84,56 @@
 ### 新增 / Added
 - 上游血缘基线元数据 `__upstream_base__`，经 `/api/status` 与诊断导出暴露（字段 `upstream_base`），用于确认运行中的实例基于哪个上游版本；只读，不参与版本比较。
   *Upstream lineage baseline `__upstream_base__`, exposed via `/api/status` and diagnostics export (field `upstream_base`), to identify which upstream version a running instance is based on; read-only, never used in version comparison.*
+
+## [0.6.2] - 2026-09-29
+
+### 新增
+- 桌面端：支持 Linux amd64 与 arm64 架构桌面安装包（`.deb` 与 `.AppImage` 格式）。
+- 脚本：新增 Linux 本地一键打包（`build.sh`）与热更新部署（`scripts/local-dev-deploy.sh`）脚本。
+
+### 优化
+- 发布：更新器元数据生成脚本支持识别 Linux 双架构独立签名与更新直链。
+- 测试：修复门禁脚本与冒烟测试在虚拟环境为符号链接时的工具定位。
+
+---
+
+### Added
+- Desktop: added Linux desktop package support for amd64 and arm64 architectures (`.deb` and `.AppImage` formats).
+- Scripts: added Linux one-click build (`build.sh`) and local hot-update deployment (`scripts/local-dev-deploy.sh`) scripts.
+
+### Changed
+- Release: updater metadata generation script now distinguishes independent signatures and update URLs for both Linux architectures.
+- Tests: fixed tool and binary discovery in verification and smoke tests under symlinked virtual environments.
+
+---
+
+## [0.6.1] - 2026-09-28
+
+### 修复
+- 引擎：语义识别的单请求预算上限由固定 60 秒改为可配置（默认 **10 秒**）—— 冷缓存一轮就能吃满 60 秒，把请求推过客户端 180 秒超时窗口（实测脱敏 58.5s + 上游首包 91.7s ≈ 150s）。
+  ⚠️ **行为变更**：升级后大会话（≳100KB）的语义识别会更容易降级 —— 手机号/邮箱/身份证/密钥等**规则类脱敏不受任何影响**，只有专用模型才能识别的自由文本中文人名/机构/详细地址会漏。需要旧口径请在设置页调大「单请求识别预算」，或设环境变量 `MASKIT_NER_REQ_BUDGET_S`。
+- 引擎：连接异常事件（`resp=0`）补上 `mask=` 与 `upstream_wait=`，一眼区分「卡在脱敏」还是「卡在上游」。
+- 引擎：超长文本不再「整条不做语义识别」，改为按窗口分段识别 —— 长会话里的大段正文不再整段漏码。
+- 面板：日志 tail 通道加长度上限；内存溢出补可归因日志（此前 OOM 只有堆栈、没有端点）。
+
+### 新增
+- 设置页：可配置语义识别单请求预算上限（环境变量 `MASKIT_NER_REQ_BUDGET_S` 可硬盘覆盖）。
+- 引擎：语义识别缓存命中率与超长文本分段计数随 `/api/engine/metrics` 外发，冷热差异不再靠人肉翻事件库。
+
+---
+
+### Bug Fixes
+- Engine: the per-request NER budget cap is now configurable (default **10s**, was a fixed 60s) — a cold cache could burn the full 60s and push the request past the client's 180s timeout (measured: 58.5s masking + 91.7s upstream ≈ 150s).
+  ⚠️ **Behaviour change**: after upgrading, semantic recognition degrades sooner on large sessions (≳100KB). Rule-based masking (phones, emails, ID numbers, secrets) is **unaffected** — only free-text Chinese names, organisations and addresses are affected. To restore the old behaviour, raise “Per-request NER budget” in Settings or set `MASKIT_NER_REQ_BUDGET_S`.
+- Engine: connection-error events (`resp=0`) now carry `mask=` and `upstream_wait=`, so "stuck in masking" and "stuck upstream" are distinguishable at a glance.
+- Engine: over-long text is no longer skipped entirely by semantic recognition; it is now segmented, so big bodies in long sessions are no longer left unmasked.
+- Panel: the log tail channel now has a length cap, and out-of-memory errors log an attributable endpoint (previously a bare traceback).
+
+### Added
+- Settings: the per-request NER budget cap is configurable (env `MASKIT_NER_REQ_BUDGET_S` overrides it).
+- Engine: NER cache hit/miss counters and long-text segmentation counts are exported via `/api/engine/metrics`.
+
+---
 
 ## [0.6.0] - 2026-09-28
 

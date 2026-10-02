@@ -5553,13 +5553,25 @@ class NerEngineGuardrailTests(unittest.TestCase):
     没有长度上限时实测单条 10 万字符要 69 秒，直接把 mitmproxy 的事件循环冻住。
     """
 
-    def test_length_cap_skips_and_is_visible(self):
+    def test_length_cap_segments_instead_of_skipping(self):
+        """超长叶子不再整条跳过，而是分段识别（P1）。
+
+        旧行为是记 `too_long` 后**整条**不做 NER —— 用户真实流量里出现过 6208 字的
+        单条正文，那一段里的人名全明文上行。现在按 `MAX_TEXT_CHARS` 切窗口逐段识别，
+        所以这里断言「分段计数增长」且「不再产生 too_long」。
+
+        与模型文件无关：分段发生在 `extract_entities` 内部，计数累加不依赖推理成功
+        （CI 上 `engine/models/` 是 gitignore 的）。
+        """
         import ner_engine
-        before = ner_engine.status()["skips"].get("too_long", 0)
+        before_split = ner_engine.cache_stats()["long_split_calls"]
+        before_too_long = ner_engine.status()["skips"].get("too_long", 0)
         ents = ner_engine.extract_entities("啊" * (ner_engine.MAX_TEXT_CHARS + 1))
-        self.assertEqual(ents, [])
-        self.assertGreater(ner_engine.status()["skips"].get("too_long", 0), before,
-                           "超长跳过必须计数/留痕，不能静默")
+        self.assertGreater(ner_engine.cache_stats()["long_split_calls"], before_split,
+                           "超长文本没有走分段路径（又整条跳过了？）")
+        self.assertEqual(ner_engine.status()["skips"].get("too_long", 0), before_too_long,
+                         "分段识别之后不应再有 too_long 记账")
+        self.assertIsInstance(ents, list)
 
     def test_exhausted_budget_skips_instead_of_running(self):
         import ner_engine

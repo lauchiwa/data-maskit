@@ -402,12 +402,16 @@ def _s22(ctx):
         return _en("S22", "medium", "Semantic recognition degraded (some text was not recognized)",
                    "; ".join("%s x%d" % (k, v) for k, v in sorted(owned.items())),
                    "global_throttled/sem_timeout: concurrency is too high (rate protection) - lower concurrency or "
-                   "raise MASKIT_NER_BUDGET / MASKIT_NER_WAIT_MS knowingly; too_long/deadline: expected for very long text")
+                   "raise MASKIT_NER_BUDGET / MASKIT_NER_WAIT_MS knowingly; "
+                   "budget_exhausted/deadline: the per-request NER budget ran out (big body or over-long text) - "
+                   "expected degradation; raise ner_req_budget_s only if you accept the added latency")
     return _finding("S22", "medium", "语义识别有降级（部分文本未做识别）",
                     "；".join("%s×%d" % (k, v) for k, v in sorted(owned.items())),
                     "若为 global_throttled/sem_timeout：并发太高，属于限流保护，"
                     "可降并发或（明确知道代价时）调大 MASKIT_NER_BUDGET；"
-                    "若为 too_long/deadline：有超长文本，属预期降级")
+                    "若为 budget_exhausted/deadline：单请求语义识别预算用尽（大 body 或超长文本），"
+                    "属预期降级；确认可接受后再调 ner_req_budget_s，"
+                    "调大等于把脱敏时长推向客户端的解包超时窗口")
 
 
 def _engine_fresh(ctx):
