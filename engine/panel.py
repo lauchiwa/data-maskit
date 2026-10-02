@@ -3770,16 +3770,30 @@ def _regex_backtrack_risk(body):
     return m.group(0)[:40] if m else ""
 
 
+def _project_connection_capabilities(caps):
+    """Bounded metadata only; never export arbitrary adapter objects or errors."""
+    if not isinstance(caps, dict):
+        return {}
+    bool_keys = ("supported", "deadlines", "http1_reuse_policy", "observation", "stream_cancellation")
+    text_keys = ("version", "reason", "observation_reason", "stream_cancellation_reason")
+    return {
+        k: (_scrub_text(v, 160) if isinstance(v, str) else v)
+        for k, v in caps.items()
+        if (k in bool_keys and isinstance(v, bool)) or
+           (k in text_keys and (v is None or isinstance(v, str)))
+    }
+
+
 def _connection_capabilities():
     """Read-only capability report; never imply unsupported controls are active."""
     try:
         from connection_policy import transport_capabilities
-        caps = transport_capabilities()
-        return {k: caps[k] for k in ("supported", "version", "reason", "deadlines",
-                                    "http1_reuse_policy") if k in caps}
-    except ImportError:
+        return _project_connection_capabilities(transport_capabilities())
+    except Exception:
         return {"supported": False, "deadlines": False, "http1_reuse_policy": False,
-                "version": "unknown", "reason": "connection_policy_unavailable"}
+                "version": "unknown", "reason": "connection_policy_unavailable",
+                "observation": False, "observation_reason": "connection_policy_unavailable",
+                "stream_cancellation": False, "stream_cancellation_reason": "connection_policy_unavailable"}
 
 
 def _validate_upstream_connection_policy(raw, http2):
@@ -3791,11 +3805,31 @@ def _validate_upstream_connection_policy(raw, http2):
     return validate_connection_policy(raw, http2=http2)
 
 
-def normalize_config(raw, warnings=None):
+def _preflight_connection_controls(upstreams):
+    """Reject explicit unsupported controls before API reads can migrate a file.
+
+    Only the proposal is available here; HTTP/2 compatibility is checked again
+    against the merged configuration by save_config().
+    """
+    if isinstance(upstreams, list):
+        for upstream in upstreams:
+            if isinstance(upstream, dict) and upstream.get("connection_policy") is not None:
+                _validate_upstream_connection_policy(upstream["connection_policy"], http2=False)
+
+
+_CONNECTION_POLICY_LOAD_WARNING = (
+    "connection_policy 无效或当前不可用：已保留原值且未改写文件，请移除显式策略后保存。 / "
+    "Invalid or unavailable connection_policy: original value and file retained; remove the explicit policy before saving."
+)
+
+
+def normalize_config(raw, warnings=None, *, validate_controls=True):
     """校验并规整配置。
 
     warnings: 传入 list 时，把"被丢弃/被改写"的项写进去。以前这些都是静默发生的，
     用户输入的域名或客户端会凭空消失、端口被悄悄改掉，界面上完全没有解释。
+    validate_controls=False 仅供读盘：保留无法启用的原始策略与警告，不能把整份
+    用户配置回退成默认值，更不能把策略删掉使引擎绕过 fail-closed 校验。
     """
     warn = warnings if isinstance(warnings, list) else []
     if not isinstance(raw, dict):
@@ -4044,8 +4078,17 @@ def normalize_config(raw, warnings=None):
                         "paths": paths_u, "use_proxy": bool(u.get("use_proxy")),
                         "extra_headers": extra_headers}
             if "connection_policy" in u and u["connection_policy"] is not None:
-                upstream["connection_policy"] = _validate_upstream_connection_policy(
-                    u["connection_policy"], http2=bool(raw.get("http2", False)))
+                try:
+                    upstream["connection_policy"] = _validate_upstream_connection_policy(
+                        u["connection_policy"], http2=bool(raw.get("http2", False)))
+                except Exception:
+                    if validate_controls:
+                        raise
+                    upstream["connection_policy"] = copy.deepcopy(u["connection_policy"])
+                    # One fixed warning, independent of policy size, upstream count or
+                    # exception text (which may contain user data).
+                    if _CONNECTION_POLICY_LOAD_WARNING not in warn:
+                        warn.append(_CONNECTION_POLICY_LOAD_WARNING)
             ups.append(upstream)
     if not ups:
         ups = list(DEFAULT_UPSTREAMS)
@@ -4395,21 +4438,30 @@ def _sync_runtime_config(cfg):
             pass
 
 
-def load_config():
+def load_config(warnings=None):
     # 整个「读文件 → normalize → 迁移写回」必须在锁内完成：迁移分支会写盘，
     # 与并发的 /api/config 保存交错会互相覆盖。RLock 允许内部再调 save_config。
     # 内存状态（如 _origin_check_enabled）必须在锁内原子同步，避免读-写交错覆盖刚保存的值。
     with cfg_lock:
-        cfg = _load_config_locked()
+        cfg = _load_config_locked(warnings)
         _sync_runtime_config(cfg)
     return cfg
 
 
-def _load_config_locked():
+def _load_config_locked(warnings=None):
     if CONFIG_PATH.exists():
         try:
             raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            cfg = normalize_config(raw)
+            load_warnings = []
+            cfg = normalize_config(raw, load_warnings, validate_controls=False)
+            if isinstance(warnings, list):
+                warnings.extend(load_warnings)
+            if _CONNECTION_POLICY_LOAD_WARNING in load_warnings:
+                # An invalid/unavailable control is not corrupt JSON. Leave the
+                # original file and migration flags untouched so a targeted reset
+                # can back up and preserve this exact configuration.
+                _emit_log(f"[panel] {_CONNECTION_POLICY_LOAD_WARNING}")
+                return cfg
             # 投毒检测默认开启（强制迁移一次）：老配置（无迁移标记）显式关闭过
             # audit/response_scan，升级后默认改为开启并落标记；之后尊重用户手工选择
             meta = raw.get("meta") or {}
@@ -4601,7 +4653,12 @@ def save_config(cfg, warnings=None, allow_shrink=False):
         old_cfg = _read_config_raw()
         if isinstance(old_cfg, dict):
             if not allow_shrink:
+                normalized_upstreams = cfg.get("upstreams")
                 cfg = _guard_structural_shrink(old_cfg, cfg, warnings)
+                if cfg.get("upstreams") is not normalized_upstreams:
+                    # The shrink guard may restore raw disk policies. Validate
+                    # those too, before a backup or any write can occur.
+                    cfg = normalize_config(cfg, warnings)
             _log_config_delta(old_cfg, cfg)
         # 写前自动备份：任何误写/半写都能从 config.json.bak-* 恢复（保留最近 10 份）。
         # 曾发生单字段 POST /api/config 触发全量替换、用户配置被默认值覆盖的事故，
@@ -4709,7 +4766,8 @@ def _maybe_restart_for_allow_hosts(cfg, allow_before):
 # ========== API ==========
 @app.get("/api/config")
 def api_get_config():
-    cfg = load_config()
+    warnings = []
+    cfg = load_config(warnings)
     # 附带内置规则元数据，供 UI 渲染开关（只读）
     return jsonify({
         **cfg,
@@ -4717,6 +4775,7 @@ def api_get_config():
             "builtin_rule_meta": BUILTIN_RULE_META,
             "version": __version__,
             "transport_capabilities": _connection_capabilities(),
+            "warnings": [_safe_public_text(w, 240) for w in warnings[:20]],
         },
     })
 
@@ -4724,16 +4783,17 @@ def api_get_config():
 @app.post("/api/config")
 def api_set_config():
     warnings = []
-    # 保存前的监听端口集合：用于判断本次改动是否需要重启（见下）
-    try:
-        ports_before = set(_expected_listen_ports())
-    except Exception as e:
-        _emit_log(f"[panel] 读取当前监听端口失败: {_safe_public_text(e, 240)}")
-        ports_before = set()
     try:
         incoming = request.get_json(force=True)
         if not isinstance(incoming, dict):
             return jsonify({"ok": False, "error": "配置必须是 JSON 对象"}), 400
+        _preflight_connection_controls(incoming.get("upstreams"))
+        # 保存前的监听端口集合：必须在控制能力预检之后，读盘可能触发迁移写回。
+        try:
+            ports_before = set(_expected_listen_ports())
+        except Exception as e:
+            _emit_log(f"[panel] 读取当前监听端口失败: {_safe_public_text(e, 240)}")
+            ports_before = set()
         # 保存前的 explicit 模式 --allow-hosts 参数：与端口一样是启动期派生参数，
         # 域名/禁用域名变化后不重启就永远不生效（transparent 热重载只更新路由变量，
         # mitmproxy 的 MITM 范围仍按旧白名单走，新域名流量静默不脱敏）。
@@ -4904,6 +4964,12 @@ def _apply_config_patch(cfg, key, op, path, value, match=None):
             raise ValueError("list_upsert 的条目必须包含非空字符串 name")
         for i, item in enumerate(node):
             if isinstance(item, dict) and item.get("name") == target_name:
+                if (key == "upstreams" and not path and
+                        "connection_policy" in value and value["connection_policy"] is None and
+                        set(value) <= {"name", "connection_policy"}):
+                    # A policy-only reset must not require a stale upstream snapshot
+                    # or drop its address/headers/port when only null was supplied.
+                    value = dict(item, **value)
                 # Older forms replace the whole upstream. Preserve this new field on
                 # omission, including rename; explicit null intentionally resets it.
                 if key == "upstreams" and not path and "connection_policy" not in value and "connection_policy" in item:
@@ -4926,11 +4992,6 @@ def api_patch_config():
     请求体：{"key": "audit", "op": "set", "path": ["signals", "INJECTION"], "value": true}
     响应体与 POST /api/config 完全一致，便于前端复用同一套保存/提示逻辑。
     """
-    try:
-        ports_before = set(_expected_listen_ports())
-    except Exception as e:
-        _emit_log(f"[panel] 读取当前监听端口失败: {_safe_public_text(e, 240)}")
-        ports_before = set()
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return jsonify({"ok": False, "error": "请求体必须是 JSON 对象"}), 400
@@ -4946,6 +5007,14 @@ def api_patch_config():
     warnings = []
     allow_before = None
     try:
+        if key == "upstreams" and not path:
+            proposed = [body["value"]] if op == "list_upsert" else body["value"]
+            _preflight_connection_controls(proposed)
+        try:
+            ports_before = set(_expected_listen_ports())
+        except Exception as e:
+            _emit_log(f"[panel] 读取当前监听端口失败: {_safe_public_text(e, 240)}")
+            ports_before = set()
         with cfg_lock:
             cfg = _load_config_locked()
             allow_before = _allow_hosts_of(cfg)
@@ -8197,14 +8266,7 @@ def _project_engine_metrics(eng):
                             (raw[k] is None or isinstance(raw[k], bool) or
                              (type(raw[k]) in (int, float) and math.isfinite(raw[k])))}
             if section == "transport" and isinstance(raw.get("capabilities"), dict):
-                caps = raw["capabilities"]
-                out[section]["capabilities"] = {
-                    k: (_scrub_text(v, 160) if isinstance(v, str) else v)
-                    for k, v in caps.items()
-                    if k in ("supported", "version", "reason", "deadlines", "http1_reuse_policy",
-                             "observation", "observation_reason") and
-                    (v is None or isinstance(v, (str, bool)))
-                }
+                out[section]["capabilities"] = _project_connection_capabilities(raw["capabilities"])
     ner = eng.get("ner") if isinstance(eng.get("ner"), dict) else {}
     out["ner"] = {
         "enabled": bool(ner.get("enabled")),

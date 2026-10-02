@@ -56,7 +56,7 @@ class AuxLifecycleTests(unittest.TestCase):
             task = asyncio.create_task(tr.response(flow))
             await self.started(entered)
             await task
-            token = flow.metadata["shield_aux_reservation"]
+            token = tr._aux_token(flow)
             self.assertFalse(token.released)
             self.assertEqual(flow.response.status_code, 503)
             self.assertNotIn("retry-after", flow.response.headers)
@@ -98,7 +98,7 @@ class AuxLifecycleTests(unittest.TestCase):
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
-            self.assertFalse(flow.metadata["shield_aux_reservation"].released)
+            self.assertFalse(tr._aux_token(flow).released)
             release.set()
 
         with mock.patch.object(tr, "_response_offload", blocked):
@@ -107,7 +107,7 @@ class AuxLifecycleTests(unittest.TestCase):
             finally:
                 release.set()
                 self.assertTrue(tr.aux_drain())
-        self.assertTrue(flow.metadata["shield_aux_reservation"].released)
+        self.assertTrue(tr._aux_token(flow).released)
         self.assertFalse(any(kind == "RESTORE" for kind, _ in self.events))
 
     def test_cancelled_queue_entries_keep_budget_until_dequeued(self):
@@ -161,7 +161,7 @@ class AuxLifecycleTests(unittest.TestCase):
              mock.patch.object(tr, "_stream_finish_offload") as worker:
             callback(b"")
         worker.assert_not_called()
-        self.assertTrue(flow.metadata["shield_aux_reservation"].released)
+        self.assertTrue(tr._aux_token(flow).released)
         self.assertTrue(any(kw.get("reason") == "stream_finish_failed" for _, kw in self.events))
         self.assertTrue(tr.aux_drain())
 
@@ -203,7 +203,7 @@ class AuxLifecycleTests(unittest.TestCase):
     def test_completed_token_does_not_retain_future_or_session(self):
         flow = self.flow("aux-no-retain")
         asyncio.run(tr.response(flow))
-        token = flow.metadata["shield_aux_reservation"]
+        token = tr._aux_token(flow)
         self.assertTrue(token.released)
         self.assertIsNone(token.future)
         self.assertIsNone(token.session_ref)
@@ -216,7 +216,7 @@ class AuxLifecycleTests(unittest.TestCase):
         flow.response.content = original
         loop_thread = threading.get_ident()
         calls, preparations = [], []
-        decode = encoding.decode
+        decode = tr.decode_body
         prepare = tr._emit_restore_summary
         def checked_decode(raw, kind, *args, **kwargs):
             if kind == "gzip":
@@ -228,7 +228,7 @@ class AuxLifecycleTests(unittest.TestCase):
             self.assertTrue(kwargs.get("prepare_only"))
             self.assertNotEqual(preparations[-1], loop_thread)
             return prepare(*args, **kwargs)
-        with mock.patch.object(encoding, "decode", checked_decode), \
+        with mock.patch.object(tr, "decode_body", checked_decode), \
              mock.patch.object(tr, "_emit_restore_summary", checked_prepare):
             asyncio.run(tr.response(flow))
         self.assertEqual(len(calls), 1)

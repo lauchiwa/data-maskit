@@ -42,6 +42,7 @@ hiddenimports = (
         # 且三处调用点都包在 try 里 —— 万一打包态缺它，表现是“点了自检没反应”
         # 而不是报错（分析器的运气不能当保证）。tests/test_engine_packaging.py 锁这条。
         'selfcheck',
+        'body_buffer',
         'onnxruntime',
         'tokenizers',
         # mitmdump 命令行入口：安装包不含 mitmdump.exe，引擎要自己当 mitmdump 跑
@@ -64,6 +65,18 @@ elif sys.platform == "darwin":
 else:
     bundle_icon = None
 
+def _model_resources(engine_dir):
+    model_dir = engine_dir / 'models' / 'ner_mini_zh'
+    required = ('model_quantized.onnx', 'tokenizer.json', 'config.json')
+    if not any((model_dir / name).exists() for name in required):
+        return []
+    missing = [name for name in required
+               if not (model_dir / name).is_file() or (model_dir / name).stat().st_size == 0]
+    if missing:
+        raise SystemExit('Incomplete NER model bundle: ' + ', '.join(missing))
+    return [(str(model_dir), 'models/ner_mini_zh')]
+
+
 datas = (
     mitmproxy_data
     # 这几个必须以**明文源文件**随包分发：transparent.py 是被 mitmdump 当脚本加载的，
@@ -71,6 +84,7 @@ datas = (
     # 打进 PYZ 它够不着。代价是引擎规则对用户可见——这是架构决定的，改不了。
     + [(str(ENGINE_DIR / 'transparent.py'), '.')
        , (str(ENGINE_DIR / 'connection_policy.py'), '.')
+       , (str(ENGINE_DIR / 'body_buffer.py'), '.')
        , (str(ENGINE_DIR / 'mitm_transport_adapter.py'), '.')
        , (str(ENGINE_DIR / 'shield_defaults.py'), '.')
        , (str(ENGINE_DIR / 'event_store.py'), '.')
@@ -82,8 +96,7 @@ datas = (
     # 该目录被 .gitignore 排除（98MB 二进制不入库），CI/干净克隆上根本不存在——
     # 无条件写进 datas 会让 PyInstaller 直接 SystemExit，把整个发版构建搞挂。
     # 缺模型时引擎照常工作，只是语义实体识别不可用（UI 与 /api/health 会明确报出）。
-    + ([(str(ENGINE_DIR / 'models' / 'ner_mini_zh'), 'models/ner_mini_zh')]
-       if (ENGINE_DIR / 'models' / 'ner_mini_zh' / 'model_quantized.onnx').exists() else [])
+    + _model_resources(ENGINE_DIR)
     # 打包前端静态构建产物（若存在），支持在浏览器直接访问引擎端口展现 WebUI/登录页
     + ([(str(ROOT_DIR / 'frontend' / 'dist'), 'web_dist')] if (ROOT_DIR / 'frontend' / 'dist').exists() else [])
 )

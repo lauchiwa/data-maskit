@@ -276,11 +276,7 @@ Write-Host "引擎 sidecar 打包（3.13）..." -ForegroundColor Cyan
 $py313 = $pyTest
 & $py313 -c "import PyInstaller" 2>$null
 if ($LASTEXITCODE -ne 0) { Restore-Version; Write-Error "打包解释器缺少 PyInstaller: $py313（pip install -r requirements-dev.txt）"; exit 1 }
-# 打包前清掉 engine/ 下的运行时产物：事件库/配置/token 是开发者本机数据，绝不能随 sidecar 分发
-# ⚠️ 必须排除 engine/models 子树：-Include 通配里的 "config.json" 会连
-# models/ner_mini_zh/config.json 一起删掉，而该目录被 .gitignore 排除、git 里没有
-# 副本——删掉就是不可恢复（模型直接报废）。清理的意图只是本机运行时数据。
-Get-ChildItem -Path "engine" -Include "*.sqlite3*", "*.jsonl", "config.json", "config.json.bak-*", "proxy_token", "*.log", "shield.pid", "shield-env-backup.json", "model_prices_cache.json", "diagnostics-*.json" -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notlike "*\engine\models\*" } | Remove-Item -Force
+# spec 只收集显式资源白名单；打包不删除源码态配置、凭据或事件库。
 # 打包前自检：模型三件套缺失时 NER 在正式包里不可用，而源码态仍然正常——
 # 这是最难排查的一类「打包态漂移」。只告警不终止：不带模型打包是合法选项。
 $nerMissing = @("model_quantized.onnx", "tokenizer.json", "config.json") | Where-Object { -not (Test-Path (Join-Path "engine\models\ner_mini_zh" $_)) }
@@ -307,6 +303,12 @@ if ($pyiExit -ne 0) { Restore-Version; Write-Error "引擎打包失败（exit $p
 if (-not (Test-Path "dist_engine\MaskitEngine\MaskitEngine.exe")) {
     Restore-Version; Write-Error "引擎产物缺失"; exit 1
 }
+
+# 在独立数据目录与随机端口验证真正的 frozen 产物，不触碰已安装客户端。
+$frozenSmokeArgs = @("tests\smoke_transport.py", "--engine", "dist_engine\MaskitEngine\MaskitEngine.exe")
+if ($nerMissing.Count -eq 0) { $frozenSmokeArgs += "--ner" }
+& $py313 @frozenSmokeArgs
+if ($LASTEXITCODE -ne 0) { Restore-Version; Write-Error "打包态流式/连接/NER 冒烟失败"; exit 1 }
 
 # 5.5 把新引擎同步到 Tauri 打包源目录（必须在 tauri build 之前！）
 # tauri.conf.json 的 bundle.resources 指向 src-tauri/resources/engine/，

@@ -35,6 +35,7 @@ import uuid
 from pathlib import Path
 from mitmproxy import http, ctx, exceptions
 from connection_policy import ConnectionGovernance, validate_connection_policy
+from body_buffer import decode_body
 from urllib.parse import urlparse
 from shield_defaults import (
     DEFAULT_DOMAINS,
@@ -5734,7 +5735,7 @@ def error(flow):
         cancel_event.set()
     _transport_event("error", flow)
     flow.metadata["transport"] = _safe_transport_snapshot(flow)
-    token = flow.metadata.get("shield_aux_reservation")
+    token = _aux_token(flow)
     owned_session = token.session_ref if token is not None else None
     _aux_abandon(flow)
     sid = flow.metadata.get("session_id")
@@ -5804,7 +5805,7 @@ def error(flow):
     except Exception:
         pass
     if sid and not flow.metadata.get("shield_mask_pending"):
-        token = flow.metadata.get("shield_aux_reservation")
+        token = _aux_token(flow)
         if token is None:
             _drop(sid)
         elif not token.submitted and owned_session is not None:
@@ -6256,14 +6257,20 @@ def _aux_pool_width():
 _AUX_MAX_INFLIGHT = _aux_pool_width()
 # Reservations cover upstream-inflight, queued AND running jobs. 1 MiB is the
 # worst-case UTF-8 retained SSE window, not a speculative 32 MiB per response.
-# Whole responses upgrade to their actual decoded byte length before submission.
-# This bounds retained job inputs, NOT mitmproxy's receive buffers, decompressor,
-# Python parse-tree expansion or session/reuse tables (separate limits).
+# Queued jobs charge actual wire bytes; the worker atomically charges decoded
+# bytes before retaining them. A separate SINGLE decode workspace permits bounded
+# expansion before that charge: <=2 * admitted request/response ceiling + 32 MiB
+# codec window + 64 KiB Brotli chunk slack. Request ceiling is its already-charged
+# masked size (which may exceed the 32 MiB incoming/response cap).
+# Parse-tree expansion and session/reuse tables have separate limits.
 _AUX_MAX_JOBS = 64
 _AUX_MAX_BYTES = 128 * 1024 * 1024
 _AUX_RESPONSE_MAX = 32 * 1024 * 1024
 _AUX_BASE_BYTES = 4 * _SSE_KEEP_MAX
-_AUX_BUDGET_LOCK = threading.Lock()
+# Allocations inside admission may run cyclic finalizers that release an older
+# token. Reentrancy is required even though ordinary callers are serialized.
+_AUX_BUDGET_LOCK = threading.RLock()
+_AUX_DECODE_LOCK = threading.Lock()
 _AUX_JOBS = 0
 _AUX_BYTES = 0
 _AUX_SESSION = threading.local()
@@ -6287,22 +6294,26 @@ def _aux_session(sid, session_ref):
 
 
 class _AuxReservation:
-    def __init__(self, size):
+    def __init__(self, size, owner_id=None):
         self.size = size
+        self.owner_id = owner_id
+        self.request_size = 0
         self.submitted = False
-        self.released = False
+        # Uncharged construction is safe even if GC runs or allocation fails.
+        self.released = True
         self.future = None
         self.abandoned = False
         self.session_ref = None
 
     def __deepcopy__(self, memo):
-        # Flow copies must not duplicate a capacity owner.
+        # A generic Python copy may copy runtime attrs too. _aux_token's owner
+        # check prevents that copy from consuming or releasing this owner's quota.
         return self
 
     def __del__(self):
-        # An upstream-inflight flow can be discarded without an error callback.
-        # Submitted jobs retain this token themselves until their done callback.
-        if not self.submitted:
+        # Submitted jobs retain their owner until actual completion. Avoid even
+        # acquiring the lock for the common already-released finalizer case.
+        if not self.released and not self.submitted:
             self.release()
 
     def release(self):
@@ -6313,10 +6324,25 @@ class _AuxReservation:
             self.released = True
             _AUX_JOBS -= 1
             _AUX_BYTES -= self.size
-        # A completed flow must not retain a Future's restored plaintext/result
-        # or the retired session via this metadata token.
-        self.future = None
-        self.session_ref = None
+            self.future = None
+            self.session_ref = None
+
+    def retain_response(self, size):
+        """Charge actual wire + decoded bytes before they leave decode workspace."""
+        global _AUX_BYTES
+        with _AUX_BUDGET_LOCK:
+            desired = self.request_size + max(_AUX_BASE_BYTES, size)
+            extra = max(0, desired - self.size)
+            if self.released or _AUX_BYTES + extra > _AUX_MAX_BYTES:
+                raise RuntimeError("aux decoded byte budget exceeded")
+            _AUX_BYTES += extra
+            self.size += extra
+
+
+def _aux_token(flow):
+    """Runtime-only ownership: never serialized by Flow.get_state/copy/FlowWriter."""
+    token = getattr(flow, "_shield_aux_reservation", None)
+    return token if token is not None and token.owner_id == id(flow) else None
 
 
 def _message_bytes(message):
@@ -6328,33 +6354,66 @@ def _message_bytes(message):
 
 class _AuxBody:
     """Immutable wire input; decode at most once, only after entering the worker."""
-    def __init__(self, message, *, request=False):
+    def __init__(self, message, *, request=False, limit=None, token=None):
         self.raw_content = _message_bytes(message)
         headers = getattr(message, "headers", {})
         self.headers = ({"content-encoding": headers.get("content-encoding", "identity")}
                         if request else copy.deepcopy(headers))
         self.status_code = getattr(message, "status_code", 0)
         self._content = None
+        self._decode_error = False
+        self._limit = _AUX_RESPONSE_MAX if limit is None else limit
+        self._token = token if not request else None
 
     @property
     def content(self):
         if self._content is None:
-            from mitmproxy.net import encoding
-            self._content = encoding.decode(self.raw_content, self.headers.get("content-encoding", "identity"))
-            if len(self._content) > _AUX_RESPONSE_MAX:
-                self._content = None
-                raise ValueError("aux decoded body limit exceeded")
+            if self._decode_error:
+                raise ValueError("aux body decoding previously failed")
+            # Only one bounded, not-yet-charged decoding workspace may exist.
+            # No decompression or large body copying runs on the event loop.
+            with _AUX_DECODE_LOCK:
+                content = None
+                try:
+                    content = decode_body(self.raw_content,
+                                          self.headers.get("content-encoding") or "identity",
+                                          self._limit)
+                    if self._token is not None:
+                        retained = len(self.raw_content)
+                        if content is not self.raw_content:
+                            retained += len(content)
+                        self._token.retain_response(retained)
+                    self._content = content
+                    self._token = None
+                except Exception as exc:
+                    # A failed Future retains exception tracebacks. Do not let
+                    # them retain an uncharged decode workspace after this lock.
+                    content = None
+                    self._decode_error = True
+                    self._token = None
+                    exc.__traceback__ = exc.__cause__ = exc.__context__ = None
+                    raise exc from None
         return self._content
+
+
+def _aux_request_size(flow):
+    request = getattr(flow, "request", None)
+    wire = len(_message_bytes(request))
+    decoded = flow.metadata.get("shield_request_decoded_bytes", wire)
+    kind = ((getattr(request, "headers", {}).get("content-encoding") or "identity").lower())
+    return (max(wire, decoded) if kind in ("identity", "none") else wire + decoded), decoded
 
 
 def _aux_reserve(flow, response_bytes=None):
     global _AUX_JOBS, _AUX_BYTES
-    token = flow.metadata.get("shield_aux_reservation")
-    request_size = flow.metadata.get("shield_request_decoded_bytes", len(_message_bytes(getattr(flow, "request", None))))
+    token = _aux_token(flow)
+    request_size, _ = _aux_request_size(flow)
     size = request_size + max(_AUX_BASE_BYTES, response_bytes or 0)
     with _AUX_BUDGET_LOCK:
-        if token is not None and (token.released or token.submitted):
-            return None
+        if token is not None and token.released:
+            token = None  # A completed in-place replay obtains a fresh owner.
+        if token is not None and token.submitted:
+            return None  # Never steal capacity from a live job on replay/reset.
         extra = size - token.size if token else size
         if ((not token and _AUX_JOBS >= _AUX_MAX_JOBS) or
                 _AUX_BYTES + extra > _AUX_MAX_BYTES or
@@ -6362,19 +6421,21 @@ def _aux_reserve(flow, response_bytes=None):
             _aux_stat_add("rejected")
             return None
         if token is None:
-            token = _AuxReservation(size)
+            token = _AuxReservation(size, id(flow))
             token.session_ref = _session_get(flow.metadata.get("session_id"))
             _AUX_JOBS += 1
-            flow.metadata["shield_aux_reservation"] = token
+            token.released = False
+            flow._shield_aux_reservation = token
         else:
             token.size = size
+        token.request_size = request_size
         _AUX_BYTES += extra
     return token
 
 
 def _aux_abandon(flow):
     """Loop-owned abort: a running job retains its reservation until completion."""
-    token = flow.metadata.get("shield_aux_reservation")
+    token = _aux_token(flow)
     if token is not None:
         if not token.submitted:
             token.release()
@@ -6389,9 +6450,12 @@ def _aux_snapshot(flow):
     # No mutable live flow, response, headers or metadata reach a worker. Immutable
     # bytes are shared safely; metadata excludes the lifecycle token.
     resp = getattr(flow, "response", None)
+    token = _aux_token(flow)
+    _, request_limit = _aux_request_size(flow)
     return SimpleNamespace(
-        request=_AuxBody(getattr(flow, "request", None), request=True),
-        response=_AuxBody(resp) if resp else None,
+        request=_AuxBody(getattr(flow, "request", None), request=True,
+                         limit=request_limit),
+        response=_AuxBody(resp, token=token) if resp else None,
         metadata=copy.deepcopy({k: flow.metadata[k] for k in (
             "session_id", "shield_model", "shield_upstream", "probe_id",
             "audit_canaries", "shield_reasoning_effort", "shield_stream_degraded",
@@ -6414,15 +6478,21 @@ def _aux_submit(token, sid, session_ref, fn, *args):
             return fn(*args)
 
     def done(future):
+        nonlocal session_ref, args, fn
         try:
             if not future.cancelled():
                 future.exception()
         finally:
-            if session_ref is not None:
-                _drop(sid, expect=session_ref)
-            token.release()
-            with _AUX_PENDING_LOCK:
-                _AUX_PENDING[0] -= 1
+            try:
+                if session_ref is not None:
+                    _drop(sid, expect=session_ref)
+            finally:
+                # Futures retain done callbacks after execution. Clear closure
+                # cells too, not merely token fields; GC/refcount timing is irrelevant.
+                session_ref, args, fn = None, (), None
+                token.release()
+                with _AUX_PENDING_LOCK:
+                    _AUX_PENDING[0] -= 1
 
     try:
         future = _AUX_POOL.submit(run)
@@ -6722,7 +6792,7 @@ async def request(flow: http.HTTPFlow):
         await _request_impl(flow)
         if cancel_event.is_set() and getattr(flow, "response", None) is None:
             raise asyncio.CancelledError()
-        if (getattr(flow, "response", None) is None and flow.metadata.get("shield_aux_reservation") is not None
+        if (getattr(flow, "response", None) is None and _aux_token(flow) is not None
                 and _aux_reserve(flow) is None):
             # Masking can expand the request body. Account for the actual retained
             # bytes before upstream send, without reserving 32 MiB for every job.
@@ -6741,7 +6811,7 @@ async def request(flow: http.HTTPFlow):
             if not pending:
                 _MASK_CANCEL_BY_CLIENT.pop(client_id, None)
         if not completed or getattr(flow, "response", None) is not None:
-            token = flow.metadata.get("shield_aux_reservation")
+            token = _aux_token(flow)
             owned_session = token.session_ref if token is not None else None
             if getattr(flow, "response", None) is not None:
                 flow.metadata["shield_local_response"] = True
@@ -7340,6 +7410,7 @@ def _stream_finish_offload(flow, sid, host, method, emit_path, source, restored_
     _waited0 = time.perf_counter()
     # 流式收尾是"投递即返回"，事件循环侧看不到任何等待 —— 这里是唯一能证明
     # "响应慢在池排队"的位置：排队时长 = 投递时刻 → 真正开跑的时刻。
+    _queued_ms = 0.0
     if enqueued_at:
         _queued_ms = (_waited0 - enqueued_at) * 1000.0
         if _queued_ms >= _AUX_WAIT_TRACE_MS[0]:
@@ -7350,7 +7421,7 @@ def _stream_finish_offload(flow, sid, host, method, emit_path, source, restored_
                       _queued_ms, _AUX_POOL._max_workers),
                   reason="stream_finish_wait", aux_wait_ms=round(_queued_ms, 1), **source)
     try:
-        _aux_stat_add("wait_ms_total", (time.perf_counter() - _waited0) * 1000)
+        _aux_stat_add("wait_ms_total", _queued_ms)
         _aux_stat_add("stream_finish")
         # `apply_block=False`：流式响应此刻已逐块下发到客户端，**再写 flow.response
         # 既拦不住也已经晚了**；而且这里是 aux 线程，`flow.response = ...` 是 mitmproxy
@@ -7439,7 +7510,7 @@ def _response_offload_locked(flow, sid, host, method, emit_path, ct, source):
             ok=True, streamed_text=text, prepare_only=True)
     if new_content is not None:
         from mitmproxy.net import encoding
-        new_content = encoding.encode(new_content, flow.response.headers.get("content-encoding", "identity"))
+        new_content = encoding.encode(new_content, flow.response.headers.get("content-encoding") or "identity")
     _aux_stat_add("completed")
     return (new_content, ok, err, block, debug_text)
 
@@ -7479,8 +7550,8 @@ async def response(flow: http.HTTPFlow):
     ct = (flow.response.headers.get("content-type", "") or "").lower().strip()
     _touch(sid)
     _sweep()
-    admission = flow.metadata.get("shield_aux_reservation")
-    s_cur = admission.session_ref if admission is not None else _session_get(sid)
+    admission = _aux_token(flow)
+    s_cur = admission.session_ref if admission is not None and not admission.released else _session_get(sid)
     source = (s_cur or {}).get("source", {})
     # 响应到达时间：整包路径在此刻记（首字节=响应完成）；流式在 _stream 首 chunk 记
     if s_cur is not None and s_cur.get("resp_ts") is None:
@@ -7491,9 +7562,9 @@ async def response(flow: http.HTTPFlow):
     future = None
     try:
         raw_size = len(_message_bytes(flow.response))
-        encoded = flow.response.headers.get("content-encoding", "identity").lower() not in ("", "identity")
-        # Compressed bodies reserve the maximum decode allowance, not just wire bytes.
-        token = _aux_reserve(flow, max(raw_size, _AUX_RESPONSE_MAX) if encoded else raw_size)
+        # Queue only immutable wire inputs. Output-limited decoding and the
+        # atomic actual-retained-byte upgrade happen inside the worker.
+        token = _aux_reserve(flow, raw_size)
         if token is None:
             raise RuntimeError("aux response byte budget exceeded")
         snapshot = _aux_snapshot(flow)
@@ -7525,7 +7596,7 @@ async def response(flow: http.HTTPFlow):
             503, json.dumps({"error": {"code": "shield_offload_timeout" if
                 isinstance(exc, asyncio.TimeoutError) else "shield_offload_failed",
                 "upstream_may_have_executed": True}}).encode(),
-            {"Content-Type": "application/json"})
+            {"Content-Type": "application/json", "x-should-retry": "false"})
         if future is None and s_cur is not None:
             _drop(sid, expect=s_cur)
         return
@@ -8351,8 +8422,8 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
     Cohere v2）与 `ndjson`（换行分隔的 JSON 行，Ollama）。两种格式的占位符跨 TCP 块
     分裂问题靠同一套「只在帧完整时处理」解决。
     """
-    admission = flow.metadata.get("shield_aux_reservation")
-    session_ref = admission.session_ref if admission is not None else _session_get(sid)
+    admission = _aux_token(flow)
+    session_ref = admission.session_ref if admission is not None and not admission.released else _session_get(sid)
     state = {
         "decoder": codecs.getincrementaldecoder("utf-8")(errors="replace"),
         "buf": "",
@@ -8405,7 +8476,7 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
         # `_drop(sid)` 也交给它（见 _stream_finish_offload 的注释）。
         _session_ref = _session_get(sid)
         try:
-            token = flow.metadata.get("shield_aux_reservation") or _aux_reserve(flow)
+            token = _aux_token(flow) or _aux_reserve(flow)
             snapshot = _aux_snapshot(flow)
             _aux_submit(token, sid, _session_ref, _stream_finish_offload,
                         snapshot, sid, host, method, emit_path, dict(source),
@@ -8420,8 +8491,17 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
                 _drop(sid, expect=_session_ref)
 
     def _stream(data: bytes):
-        with _aux_session(sid, session_ref):
-            return _stream_owned(data)
+        nonlocal session_ref
+        try:
+            with _aux_session(sid, session_ref):
+                return _stream_owned(data)
+        finally:
+            if state["done"]:
+                # mitmproxy may retain the stream callback on a completed flow.
+                # The submitted job now owns its session, or failure retired it.
+                session_ref = None
+                state["text"] = []
+                state["buf"] = ""
 
     def _stream_owned(data: bytes):
         if state["done"]:

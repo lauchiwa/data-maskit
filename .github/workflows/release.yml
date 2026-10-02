@@ -109,7 +109,9 @@ jobs:
           curl -sSL https://github.com/xiaYuTian11/maskit/releases/download/v0.3.0/ner_mini_zh.zip -o ner_mini_zh.zip
           unzip -q -o ner_mini_zh.zip -d engine/models/ner_mini_zh
           rm -f ner_mini_zh.zip
-          test -f engine/models/ner_mini_zh/model_quantized.onnx
+          for model_file in model_quantized.onnx tokenizer.json config.json; do
+            test -s "engine/models/ner_mini_zh/$model_file"
+          done
       - name: Build and push
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
@@ -203,7 +205,9 @@ jobs:
           curl -sSL https://github.com/xiaYuTian11/maskit/releases/download/v0.3.0/ner_mini_zh.zip -o ner_mini_zh.zip
           unzip -q -o ner_mini_zh.zip -d engine/models/ner_mini_zh
           rm -f ner_mini_zh.zip
-          test -f engine/models/ner_mini_zh/model_quantized.onnx
+          for model_file in model_quantized.onnx tokenizer.json config.json; do
+            test -s "engine/models/ner_mini_zh/$model_file"
+          done
 
       - name: Build PyInstaller sidecar (Windows)
         if: runner.os == 'Windows'
@@ -219,6 +223,8 @@ jobs:
           Copy-Item dist_engine\MaskitEngine\MaskitEngine.exe "$target\MaskitEngine.exe"
           $count = (Get-ChildItem "$target\_internal" -Recurse -File | Measure-Object).Count
           if (-not (Test-Path "$target\MaskitEngine.exe") -or $count -lt 100) { throw "sidecar incomplete ($count files)" }
+          python tests/smoke_transport.py --engine "$target\MaskitEngine.exe" --ner
+          if ($LASTEXITCODE -ne 0) { throw "frozen sidecar smoke failed" }
 
       - name: Build PyInstaller sidecar (Unix)
         if: runner.os != 'Windows'
@@ -233,6 +239,7 @@ jobs:
           chmod +x src-tauri/resources/engine/MaskitEngine
           test -x src-tauri/resources/engine/MaskitEngine
           test "$(find src-tauri/resources/engine/_internal -type f | wc -l)" -ge 100
+          python3 tests/smoke_transport.py --engine src-tauri/resources/engine/MaskitEngine --ner
 
       - name: Select updater mode (Windows)
         if: runner.os == 'Windows'

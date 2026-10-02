@@ -56,7 +56,7 @@ while [[ $# -gt 0 ]]; do
       echo "选项:"
       echo "  --bundles <list>   打包格式，默认 deb,appimage"
       echo "  --version <ver>    指定版本号（如 0.6.2）"
-      echo "  --release-only     仅打包，不进行本地替换与自测"
+      echo "  --release-only     独立暂存目录构建，不替换源码态或已安装的引擎"
       echo "  --no-gates         跳过全量门禁检查"
       exit 0
       ;;
@@ -142,13 +142,19 @@ fi
 # 5. 版本设置（若指定）
 if [ -n "$TARGET_VERSION" ]; then
   info "同步指定版本号: $TARGET_VERSION..."
-  $PYTHON_BIN scripts/bump-version.py "$TARGET_VERSION"
+  "$PYTHON_BIN" scripts/bump-version.py "$TARGET_VERSION"
 fi
 
-# 6. 全量门禁校验
+# 6. 门禁前准备依赖；npm ci 失败必须中止，不回退到改写锁文件的 install。
+if [ ! -d "frontend/node_modules" ]; then
+  npm --prefix frontend ci
+fi
+mkdir -p src-tauri/resources/engine
+
+# 全量门禁校验
 if [ "$SKIP_GATES" = false ]; then
   info "执行全量门禁检查 (scripts/verify-all.py)..."
-  if ! $PYTHON_BIN scripts/verify-all.py --python "$PYTHON_BIN"; then
+  if ! "$PYTHON_BIN" scripts/verify-all.py --python "$PYTHON_BIN"; then
     error "全量门禁未通过，终止打包。若确需跳过可用 --no-gates 参数。"
     exit 1
   fi
@@ -157,87 +163,79 @@ else
   warn "已跳过全量门禁检查 (--no-gates)"
 fi
 
-# 7. 清理 engine/ 运行时产物（绝对保护 models/ 子目录）
-info "清理引擎开发态运行时数据..."
-find engine -maxdepth 1 -type f \( \
-  -name "*.sqlite3*" -o \
-  -name "*.jsonl" -o \
-  -name "config.json" -o \
-  -name "config.json.bak-*" -o \
-  -name "proxy_token" -o \
-  -name "*.log" -o \
-  -name "shield.pid" -o \
-  -name "shield-env-backup.json" -o \
-  -name "model_prices_cache.json" -o \
-  -name "diagnostics-*.json" \
-\) -delete || true
-
-# 检查本地 NER 模型状态
+# 7. 构建只按 spec 白名单收集资源，绝不删除源码态配置、凭据或事件库。
 NER_MODEL_DIR="engine/models/ner_mini_zh"
-if [ -f "$NER_MODEL_DIR/model_quantized.onnx" ] && [ -f "$NER_MODEL_DIR/tokenizer.json" ]; then
+NER_READY=true
+for model_file in model_quantized.onnx tokenizer.json config.json; do
+  if [ ! -s "$NER_MODEL_DIR/$model_file" ]; then NER_READY=false; fi
+done
+if [ "$NER_READY" = true ]; then
   success "NER 本地语义模型已就绪，将构建【全功能一体包】"
 else
-  warn "未检测到完整 NER 语义模型（缺 model_quantized.onnx），将构建【轻量规则包】"
+  warn "本地语义模型不完整；spec 会拒绝半套模型，完全缺失时才构建轻量规则包"
 fi
 
 # 8. 前端构建
 info "构建前端静态资源..."
-if [ ! -d "frontend/node_modules" ]; then
-  npm --prefix frontend ci || npm --prefix frontend install
-fi
 npm --prefix frontend run build
 success "前端构建产物就绪 (frontend/dist)"
 
-# 9. 引擎 Sidecar 打包 (PyInstaller)
+# 9. --release-only 使用新目录，不覆盖可能被源码态客户端使用的旧引擎。
+ENGINE_DIST="$ROOT_DIR/dist_engine"
+ENGINE_WORK="$ROOT_DIR/build_engine"
+if [ "$RELEASE_ONLY" = true ]; then
+  BUILD_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/maskit-build.XXXXXX")
+  ENGINE_DIST="$BUILD_STAGE/dist_engine"
+  ENGINE_WORK="$BUILD_STAGE/build_engine"
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$BUILD_STAGE/tauri-target}"
+  info "独立打包目录: $BUILD_STAGE"
+fi
 info "使用 PyInstaller 打包 Python 引擎 sidecar..."
-rm -rf dist_engine build_engine
-$PYTHON_BIN -m PyInstaller engine/maskit-engine.spec --noconfirm --distpath dist_engine --workpath build_engine
+"$PYTHON_BIN" -m PyInstaller engine/maskit-engine.spec --noconfirm --distpath "$ENGINE_DIST" --workpath "$ENGINE_WORK"
 
-if [ ! -f "dist_engine/MaskitEngine/MaskitEngine" ]; then
-  error "PyInstaller 引擎产物缺失: dist_engine/MaskitEngine/MaskitEngine"
+SRC_ENGINE="$ENGINE_DIST/MaskitEngine"
+if [ ! -x "$SRC_ENGINE/MaskitEngine" ]; then
+  error "PyInstaller 引擎产物缺失: $SRC_ENGINE/MaskitEngine"
   exit 1
 fi
 
-# 10. 同步引擎到 Tauri resources 目录
-info "同步引擎至 Tauri 打包源目录 (src-tauri/resources/engine)..."
-SRC_ENGINE="src-tauri/resources/engine"
-rm -rf "$SRC_ENGINE"
-mkdir -p "$SRC_ENGINE"
+# 10. 验证实际打包产物；不安装、不调用生产面板、不依赖源码 PYTHONPATH。
+SMOKE_ARGS=(--engine "$SRC_ENGINE/MaskitEngine")
+if [ "$NER_READY" = true ]; then SMOKE_ARGS+=(--ner); fi
+"$PYTHON_BIN" tests/smoke_transport.py "${SMOKE_ARGS[@]}"
 
-cp -a dist_engine/MaskitEngine/_internal "$SRC_ENGINE/_internal"
-cp dist_engine/MaskitEngine/MaskitEngine "$SRC_ENGINE/MaskitEngine"
-chmod +x "$SRC_ENGINE/MaskitEngine"
-
-ENGINE_FILES_COUNT=$(find "$SRC_ENGINE/_internal" -type f | wc -l)
-if [ "$ENGINE_FILES_COUNT" -lt 100 ]; then
-  error "打包源目录引擎同步异常（仅 $ENGINE_FILES_COUNT 个文件）"
-  exit 1
-fi
-success "打包源目录引擎已同步就绪 ($ENGINE_FILES_COUNT 个文件)"
-
-# 11. Tauri 打包
+# 11. 通过资源映射打包，不替换源码态或已安装的 resources/engine。
 info "执行 Tauri 构建 (bundles: $BUNDLES)..."
-CONFIG_ARGS=()
-if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ] && [ -z "${MASKIT_UPDATER_PRIVATE_KEY:-}" ]; then
-  info "未检测到更新签名密钥，以未签名模式 (unsigned) 构建..."
-  printf '%s\n' '{"bundle":{"createUpdaterArtifacts":false}}' > src-tauri/tauri.unsigned.json
-  CONFIG_ARGS=(--config src-tauri/tauri.unsigned.json)
+if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ] && [ -n "${MASKIT_UPDATER_PRIVATE_KEY:-}" ]; then
+  export TAURI_SIGNING_PRIVATE_KEY="$MASKIT_UPDATER_PRIVATE_KEY"
 fi
-
-node frontend/node_modules/@tauri-apps/cli/tauri.js build --bundles "$BUNDLES" "${CONFIG_ARGS[@]}"
+UNSIGNED=false
+if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+  info "未检测到更新签名密钥，以未签名模式 (unsigned) 构建..."
+  UNSIGNED=true
+fi
+CONFIG_JSON=$("$PYTHON_BIN" - "$SRC_ENGINE" "$UNSIGNED" <<'PY'
+import json, pathlib, sys
+bundle = {"resources": {str(pathlib.Path(sys.argv[1]).resolve()) + "/": "resources/engine/"}}
+if sys.argv[2] == "true":
+    bundle["createUpdaterArtifacts"] = False
+print(json.dumps({"build": {"beforeBuildCommand": None}, "bundle": bundle}))
+PY
+)
+node frontend/node_modules/@tauri-apps/cli/tauri.js build --bundles "$BUNDLES" --config "$CONFIG_JSON" -- --locked
 
 # 12. 产物校验与总结
 info "校验打包产物..."
-BUNDLE_DIR="src-tauri/target/release/bundle"
+BUNDLE_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/src-tauri/target}/release/bundle"
 OUTPUTS=()
 
-if [ -d "$BUNDLE_DIR/deb" ]; then
+if [[ ",$BUNDLES," == *,deb,* ]] && [ -d "$BUNDLE_DIR/deb" ]; then
   while IFS= read -r f; do
     OUTPUTS+=("$f")
   done < <(find "$BUNDLE_DIR/deb" -type f -name "*.deb")
 fi
 
-if [ -d "$BUNDLE_DIR/appimage" ]; then
+if [[ ",$BUNDLES," == *,appimage,* ]] && [ -d "$BUNDLE_DIR/appimage" ]; then
   while IFS= read -r f; do
     OUTPUTS+=("$f")
   done < <(find "$BUNDLE_DIR/appimage" -type f -name "*.AppImage")
@@ -259,6 +257,6 @@ for out in "${OUTPUTS[@]}"; do
 done
 echo ""
 echo "安装使用建议:"
-echo "  • Debian/Ubuntu (.deb): sudo dpkg -i src-tauri/target/release/bundle/deb/*.deb"
-echo "  • 通用独立运行 (.AppImage): chmod +x src-tauri/target/release/bundle/appimage/*.AppImage && ./src-tauri/target/release/bundle/appimage/*.AppImage"
+echo "  • Debian/Ubuntu: 对上面列出的 .deb 文件执行 sudo dpkg -i <文件>"
+echo "  • AppImage: 对上面列出的文件赋予执行权限后启动；本脚本不会自动安装或启动"
 echo ""

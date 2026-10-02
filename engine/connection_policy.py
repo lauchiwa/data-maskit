@@ -8,6 +8,7 @@ on the original value, before persisting configuration or stopping a live proxy.
 from __future__ import annotations
 
 from collections import OrderedDict
+from types import MappingProxyType
 import math
 import time
 import uuid
@@ -62,8 +63,13 @@ class ConnectionGovernance:
     snapshots live on that flow, not in a global history. Public hooks alone cannot
     prove selection; the compatible adapter supplies pending and selected events.
     """
-    def __init__(self, *, max_connections=2048, max_flows=4096, clock=time.monotonic):
+    def __init__(self, *, max_connections=2048, max_flows=4096, clock=time.monotonic,
+                 on_cancel=None):
         self._clock = clock
+        # Synchronous event-loop callback (public HTTPFlow, bounded reason).
+        # It may signal worker/wakeup events, but must not cancel the hook task:
+        # mitmproxy still needs its normal HookCompleted event to drain the queue.
+        self.on_cancel = on_cancel
         self._max_connections = max(1, int(max_connections))
         self._max_flows = max(1, int(max_flows))
         self._connections = OrderedDict()
@@ -73,8 +79,10 @@ class ConnectionGovernance:
         self._evictions = 0
         self._finished = 0
         self._installed = False
+        self._capabilities = None
 
     def running(self):
+        self._capabilities = MappingProxyType(transport_capabilities())
         self._installed = adapter.install(self)
         return self._installed
 
@@ -83,6 +91,8 @@ class ConnectionGovernance:
         self._installed = False
         self._connections.clear()
         self._flows.clear()
+        # Invalidate flow-local callback markers from the previous installation.
+        self._generation = uuid.uuid4().hex[:12]
 
     def _state(self, conn):
         key = str(conn.id)
@@ -116,6 +126,12 @@ class ConnectionGovernance:
             "via_proxy": None,
         }
         flow.metadata.pop("_maskit_transport", None)
+        # Lifetime follows the flow, not the bounded connection-evidence table.
+        # A response hook may finish evidence while its AUX jobs still need the
+        # cancellation signal. Separate observer generations coexist on a flow.
+        flow.metadata.setdefault("_maskit_cancel_observers", {})[self._generation] = {
+            "reason": None, "phase": None,
+        }
 
     def connection_pending(self, flow, conn):
         record = self._flows.get(flow)
@@ -227,14 +243,52 @@ class ConnectionGovernance:
         if record is None:
             return
         evidence = self.snapshot(flow)
+        marker = flow.metadata.get("_maskit_cancel_observers", {}).get(self._generation)
+        if marker is not None:
+            marker["phase"] = evidence["phase"]
+            marker["conn"] = record["conn"]
         if failed:
             evidence["reason"] = evidence["reason"] or "request_failed"
         else:
             evidence["phase"] = "complete"
         flow.metadata["_maskit_transport"] = evidence
-        self._release(record)
+        self._release(record, idle=not (marker and marker["reason"]))
         del self._flows[flow]
         self._finished += 1
+
+    def flow_cancelled(self, flow, reason):
+        """Signal application abandonment once, even after ``response_complete``.
+
+        Adapter calls this before a client protocol error enters Layer's paused
+        queue. Public-hook fallbacks may call it too, but cannot provide that
+        timing guarantee on unsupported versions. Only this governance's tracked
+        flows are eligible; arbitrary messages are mapped to a bounded reason.
+        No flow.kill(), task cancellation, connection closure or AUX quota release
+        occurs here. The owner of AUX jobs must keep charging running workers until
+        they actually exit, and wake/return normally from a cancelled request hook.
+        """
+        marker = flow.metadata.get("_maskit_cancel_observers", {}).get(self._generation)
+        if marker is None or marker["reason"] is not None:
+            return
+        if not isinstance(reason, str) or reason not in adapter.CANCELLATION_REASONS:
+            reason = "client_protocol_error"
+        marker["reason"] = reason
+        if flow in self._flows:
+            self._flows[flow]["reason"] = reason
+            self._finish(flow, True)
+        else:
+            evidence = self.snapshot(flow)
+            evidence.update(reason=reason, phase=marker["phase"] or evidence["phase"])
+            flow.metadata["_maskit_transport"] = evidence
+            state = self._connections.get(marker.get("conn"))
+            if state is not None:
+                state["idle_since"] = None
+                state["activity_incomplete"] = True
+        if self.on_cancel is not None:
+            try:
+                self.on_cancel(flow, reason)
+            except Exception:
+                self.observation_errors += 1
 
     def response_complete(self, flow):
         self._finish(flow, False)
@@ -257,7 +311,8 @@ class ConnectionGovernance:
             result.update(connect_ms=state["connect_ms"], tls_ms=state["tls_ms"])
             if not record["selected"]:
                 result["phase"] = state["phase"]
-            result["reason"] = state["reason"] or result["reason"]
+            result["reason"] = (record["reason"] if record["reason"] in adapter.CANCELLATION_REASONS
+                                else state["reason"] or result["reason"])
         result["evidence_complete"] = bool(record["selected"] and state is not None and record["reused"] is not None)
         return result
 
@@ -269,10 +324,14 @@ class ConnectionGovernance:
                 "request_written": None}
 
     def stats(self) -> dict:
+        # Polling stats must not rescan package metadata/signatures every time.
+        # Refresh on running(); callers get a copy, not the immutable cached map.
+        if self._capabilities is None:
+            self._capabilities = MappingProxyType(transport_capabilities())
         now = self._clock()
         oldest = max((now - r["started"] for r in self._flows.values()), default=0)
         return {"connections": len(self._connections), "inflight": len(self._flows),
                 "finished": self._finished, "evictions": self._evictions,
                 "observation_errors": self.observation_errors, "timers": 0,
                 "oldest_request_age_s": max(0, oldest),
-                "observation_installed": self._installed, "capabilities": transport_capabilities()}
+                "observation_installed": self._installed, "capabilities": dict(self._capabilities)}

@@ -13,7 +13,7 @@ from mitmproxy import connection, options
 from mitmproxy.proxy import commands, events
 from mitmproxy.proxy.context import Context
 from mitmproxy.proxy.layers.http import (
-    HttpLayer, HTTPMode, GetHttpConnection, GetHttpConnectionCompleted,
+    HttpLayer, HttpStream, HTTPMode, GetHttpConnection, GetHttpConnectionCompleted,
 )
 from mitmproxy.proxy.server import ConnectionHandler, ConnectionIO
 from mitmproxy.proxy import server_hooks
@@ -38,6 +38,8 @@ class AdapterTests(unittest.TestCase):
         self.g = ConnectionGovernance()
         self.original_get = HttpLayer.get_connection
         self.original_child = HttpLayer.event_to_child
+        self.original_stream = HttpStream.handle_event
+        self.original_stream_local = HttpStream.__dict__.get("handle_event")
         self.assertTrue(self.g.running())
         client = connection.Client(peername=("127.0.0.1", 1), sockname=("127.0.0.1", 2))
         self.context = Context(client, options.Options())
@@ -120,16 +122,92 @@ class AdapterTests(unittest.TestCase):
 
     def test_multiobserver_idempotence_and_uninstall(self):
         wrapped = HttpLayer.get_connection
+        stream_wrapper = HttpStream.handle_event
         self.g.running()
         other = ConnectionGovernance()
         other.running()
         self.assertIs(HttpLayer.get_connection, wrapped)
         self.g.done()
         self.assertIs(HttpLayer.get_connection, wrapped)
+        self.assertIs(HttpStream.handle_event, stream_wrapper)
         other.done()
         other.done()
         self.assertIs(HttpLayer.get_connection, self.original_get)
         self.assertIs(HttpLayer.event_to_child, self.original_child)
+        self.assertIs(HttpStream.handle_event, self.original_stream)
+        self.assertIs(HttpStream.__dict__.get("handle_event"), self.original_stream_local)
+
+    def test_foreign_instrumentation_survives_uninstall_and_reinstall(self):
+        from tests.test_stream_cancellation import HTTPDriver
+        old_get, old_child, old_stream = HttpLayer.get_connection, HttpLayer.event_to_child, HttpStream.handle_event
+
+        def foreign_get(self, event, *, reuse=True):
+            return (yield from old_get(self, event, reuse=reuse))
+
+        def foreign_child(self, child, event):
+            return (yield from old_child(self, child, event))
+
+        def foreign_stream(self, event):
+            return (yield from old_stream(self, event))
+
+        with patch.object(HttpLayer, "get_connection", foreign_get), \
+                patch.object(HttpLayer, "event_to_child", foreign_child), \
+                patch.object(HttpStream, "handle_event", foreign_stream):
+            self.g.done()
+            self.assertIs(HttpLayer.get_connection, foreign_get)
+            self.assertIs(HttpLayer.event_to_child, foreign_child)
+            self.assertIs(HttpStream.handle_event, foreign_stream)
+            self.g.running()
+            driver = HTTPDriver()
+            hook = driver.request()
+            self.g.request_started(hook.flow)
+            with patch.object(self.g, "flow_cancelled", wraps=self.g.flow_cancelled) as signal:
+                driver.disconnect()
+            self.assertEqual(signal.call_count, 1)  # dormant old wrapper cannot double-notify
+            self.g.done()
+            self.assertIs(HttpLayer.get_connection, foreign_get)
+            self.assertIs(HttpLayer.event_to_child, foreign_child)
+            self.assertIs(HttpStream.handle_event, foreign_stream)
+        # patch restores the original adapter wrappers; restore the pre-test methods.
+        HttpLayer.get_connection = self.original_get
+        HttpLayer.event_to_child = self.original_child
+        if self.original_stream_local is None:
+            del HttpStream.handle_event
+        else:
+            HttpStream.handle_event = self.original_stream_local
+
+    def test_stream_wrapper_send_throw_close_return(self):
+        self.g.done()
+        final = []
+
+        def source(self, event):
+            try:
+                value = yield event
+                try:
+                    yield value
+                except ValueError:
+                    yield "caught"
+                return 42
+            finally:
+                final.append(True)
+
+        with patch.object(HttpStream, "handle_event", source):
+            self.g.running()
+            try:
+                event = events.Start()
+                generator = HttpStream.handle_event(object(), event)
+                self.assertIs(next(generator), event)
+                self.assertEqual(generator.send("sent"), "sent")
+                self.assertEqual(generator.throw(ValueError("test")), "caught")
+                with self.assertRaises(StopIteration) as stopped:
+                    next(generator)
+                self.assertEqual(stopped.exception.value, 42)
+                second = HttpStream.handle_event(object(), event)
+                next(second)
+                second.close()
+                self.assertEqual(final, [True, True])
+            finally:
+                self.g.done()
 
     def test_observer_failure_cannot_change_command_stream(self):
         conn = connection.Server(address=("private", 80))
@@ -171,11 +249,31 @@ class AdapterTests(unittest.TestCase):
                             self.g._generation + ":" + str(direct.id))
         self.assertTrue(self.g.snapshot(flow)["via_proxy"])
 
+    def test_unknown_stream_interface_disables_only_cancellation_bridge(self):
+        self.g.done()
+
+        def unknown_interface(self, event, extra=None):
+            yield from ()
+
+        with patch.object(HttpStream, "handle_event", unknown_interface):
+            try:
+                self.assertTrue(self.g.running())
+                self.assertIs(HttpStream.handle_event, unknown_interface)
+                self.assertFalse(self.g.stats()["capabilities"]["stream_cancellation"])
+                self.assertIn("incomplete", self.g.stats()["capabilities"]["stream_cancellation_reason"])
+            finally:
+                self.g.done()
+            self.assertIs(HttpStream.handle_event, unknown_interface)
+
     def test_unknown_version_no_global_patch(self):
         self.g.done()
         with patch.object(adapter, "version", return_value="999.0"):
             self.assertFalse(self.g.running())
             self.assertIs(HttpLayer.get_connection, self.original_get)
+            self.assertIs(HttpStream.handle_event, self.original_stream)
+            capabilities = self.g.stats()["capabilities"]
+            self.assertFalse(capabilities["stream_cancellation"])
+            self.assertIn("public hooks alone are incomplete", capabilities["stream_cancellation_reason"])
             conn = connection.Server(address=("private", 80))
             self.g.server_connect(SimpleNamespace(server=conn))
             self.assertEqual(self.g.stats()["connections"], 1)

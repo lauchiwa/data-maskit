@@ -2,6 +2,7 @@ import gc
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from mitmproxy import connection, http
 from engine.connection_policy import (
@@ -172,6 +173,100 @@ class EvidenceTests(unittest.TestCase):
         self.g.connection_selected(flow, self.conn)
         self.assertTrue(self.g.snapshot(flow)["reused"])
         self.assertIsNone(self.g.snapshot(flow)["idle_s"])
+
+    def test_cancel_signal_once_after_evidence_completion_and_bounded_reason(self):
+        seen = []
+        self.g.on_cancel = lambda flow, reason: seen.append((flow, reason))
+        flow = flow_for(self.conn)
+        self.g.request_started(flow)
+        self.g.connection_selected(flow, self.conn)
+        flow.response = http.Response.make(200)
+        self.g.responseheaders(flow)
+        self.g.response_complete(flow)
+        self.g.flow_cancelled(flow, "sensitive.example sk-test-000000")
+        self.g.flow_cancelled(flow, "client_cancelled")
+        self.g.error(flow)
+        self.g.response_complete(flow)
+        self.assertEqual(seen, [(flow, "client_protocol_error")])
+        snapshot = self.g.snapshot(flow)
+        self.assertEqual(snapshot["phase"], "response_stream")
+        self.assertEqual(snapshot["reason"], "client_protocol_error")
+        self.assertEqual(self.g.stats()["finished"], 1)
+        self.assertNotIn("sensitive", json.dumps(flow.metadata))
+
+    def test_cancel_active_flow_keeps_stage_and_does_not_invent_idle(self):
+        first, second = flow_for(self.conn), flow_for(self.conn)
+        self.g.request_started(first)
+        self.g.connection_pending(first, self.conn)
+        self.g.tls_start_server(self.data)
+        self.g.flow_cancelled(first, "client_cancelled")
+        self.assertEqual(self.g.snapshot(first)["phase"], "tls_handshake")
+        self.assertEqual(self.g.snapshot(first)["reason"], "client_cancelled")
+        self.g.request_started(second)
+        self.g.connection_selected(second, self.conn)
+        self.g.flow_cancelled(second, "client_cancelled")
+        state = self.g._connections[str(self.conn.id)]
+        self.assertFalse(state["active"])
+        self.assertIsNone(state["idle_since"])
+        self.assertTrue(state["activity_incomplete"])
+
+    def test_signal_scoped_to_observer_survives_evidence_eviction(self):
+        seen = []
+        self.g.on_cancel = lambda flow, reason: seen.append(flow)
+        flow = flow_for(self.conn)
+        self.g.flow_cancelled(flow, "client_cancelled")
+        self.assertEqual(seen, [])
+        self.g.request_started(flow)
+        others = [flow_for(self.conn) for _ in range(5)]
+        for other in others:
+            self.g.request_started(other)
+        self.assertNotIn(flow, self.g._flows)
+        self.g.flow_cancelled(flow, "client_cancelled")
+        self.assertEqual(seen, [flow])
+        self.g.done()
+        self.g.flow_cancelled(others[-1], "client_cancelled")
+        self.assertEqual(seen, [flow])
+
+    def test_multiple_observers_each_receive_same_flow_once(self):
+        seen = []
+        other = ConnectionGovernance(on_cancel=lambda flow, reason: seen.append("other"))
+        self.g.on_cancel = lambda flow, reason: seen.append("first")
+        flow = flow_for(self.conn)
+        try:
+            for g in (self.g, other):
+                g.request_started(flow)
+            for g in (self.g, other, self.g, other):
+                g.flow_cancelled(flow, "client_cancelled")
+            self.assertEqual(seen, ["first", "other"])
+        finally:
+            other.done()
+
+    def test_capability_snapshot_cached_but_counters_and_installation_live(self):
+        with patch("engine.connection_policy.transport_capabilities", wraps=transport_capabilities) as detect:
+            first = self.g.stats()
+            first["capabilities"]["version"] = "caller mutation"
+            self.g.stats()
+            self.assertEqual(detect.call_count, 1)
+            self.g.running()
+            self.assertEqual(detect.call_count, 2)
+            self.g.server_connect(self.data)
+            self.g.observation_errors += 1
+            current = self.g.stats()
+            self.assertEqual(detect.call_count, 2)
+            self.assertNotEqual(current["capabilities"]["version"], "caller mutation")
+            self.assertEqual(current["connections"], 1)
+            self.assertEqual(current["observation_errors"], 1)
+            self.assertEqual(current["observation_installed"], current["capabilities"]["observation"])
+            self.g.done()
+            self.assertFalse(self.g.stats()["observation_installed"])
+            self.assertEqual(self.g.stats()["connections"], 0)
+            self.assertEqual(detect.call_count, 2)
+        with patch("engine.mitm_transport_adapter.version", return_value="999.0"):
+            self.assertFalse(self.g.running())
+        cached = self.g.stats()["capabilities"]
+        self.assertEqual(cached["version"], "999.0")
+        self.assertFalse(cached["stream_cancellation"])
+        self.assertIn("incomplete", cached["stream_cancellation_reason"])
 
     def test_connection_eviction_does_not_invent_freshness(self):
         flow = flow_for(self.conn)

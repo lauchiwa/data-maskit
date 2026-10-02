@@ -4,6 +4,7 @@ Uses one persistent downstream connection to exercise real upstream reuse and
 retirement, plus a silent TLS peer. No credentials, installed ports, or public
 upstreams are used. This tests observation, not unavailable transport controls.
 """
+import argparse
 import concurrent.futures
 import http.client
 import json
@@ -21,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parents[1]
 SECRET = "MASKIT_SYNTHETIC_ENTITY"
+SEMANTIC_TEXT = "请让陈阿明联系。"
 
 
 class Upstream(ThreadingHTTPServer):
@@ -95,7 +97,7 @@ def free_port():
 
 def chat(conn, path="/v1/chat/completions"):
     body = ('{ "model": "local-test", "messages": [{"role": "user", '
-            '"content": "' + SECRET + '"}], "stream": ' +
+            '"content": "' + SECRET + '，' + SEMANTIC_TEXT + '"}], "stream": ' +
             ("true" if path.endswith("/stream") else "false") + ' }').encode()
     conn.request("POST", path, body, {"Content-Type": "application/json"})
     response = conn.getresponse()
@@ -114,6 +116,22 @@ def events(data):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--engine", type=Path, help="Test a frozen MaskitEngine instead of source mitmdump")
+    parser.add_argument("--ner", action="store_true", help="Require real local model initialization and inference")
+    options = parser.parse_args()
+    if options.engine:
+        options.engine = options.engine.resolve()
+        script = options.engine.parent / "_internal" / "transparent.py"
+        if not options.engine.is_file() or not script.is_file():
+            parser.error("--engine must point to a complete onedir MaskitEngine bundle")
+        command = [str(options.engine), "--mitmdump"]
+    else:
+        mitmdump = shutil.which("mitmdump")
+        if not mitmdump:
+            parser.error("mitmdump is required")
+        command = [mitmdump]
+        script = ROOT / "engine/transparent.py"
     upstream = Upstream()
     silent = socketserver.ThreadingTCPServer(("127.0.0.1", 0), SilentTLS)
     silent.daemon_threads = True
@@ -130,7 +148,7 @@ def main():
         with tempfile.TemporaryDirectory(prefix="maskit-transport-smoke-") as temp:
             data = Path(temp)
             config = {
-                "capture_mode": "reverse", "http2": False, "ner_enabled": False,
+                "capture_mode": "reverse", "http2": False, "ner_enabled": options.ner,
                 "sensitive": {"TEST": [SECRET]}, "filter_enabled": True,
                 "stream_response": True, "response_scan": False, "debug": False,
                 "audit": {"enabled": False},
@@ -145,19 +163,26 @@ def main():
             env = {k: v for k, v in os.environ.items()
                    if not k.upper().endswith("_PROXY")
                    and not k.startswith(("LLM_SHIELD_", "MASKIT_"))}
-            env.update(LLM_SHIELD_DATA_DIR=temp, PYTHONPATH=str(ROOT / "engine"),
-                       PYTHONIOENCODING="utf-8")
-            mitmdump = shutil.which("mitmdump")
-            if not mitmdump:
-                raise RuntimeError("mitmdump is required")
-            args = [mitmdump, "-s", str(ROOT / "engine/transparent.py"),
+            env.update(LLM_SHIELD_DATA_DIR=temp, PYTHONIOENCODING="utf-8")
+            for var, subdir in (("HOME", "home"), ("XDG_DATA_HOME", "xdg-data"),
+                                ("XDG_CONFIG_HOME", "xdg-config"), ("XDG_CACHE_HOME", "xdg-cache")):
+                directory = data / subdir
+                directory.mkdir()
+                env[var] = str(directory)
+            if options.engine:
+                env.pop("PYTHONPATH", None)
+                cwd = data
+            else:
+                env["PYTHONPATH"] = str(ROOT / "engine")
+                cwd = ROOT / "engine"
+            args = command + ["-s", str(script),
                     "--set", f"confdir={temp}", "--set", "connection_strategy=lazy",
                     "--set", "http2=false", "--set", "flow_detail=0",
                     "--set", "termlog_verbosity=warn"]
             for port in ports:
                 args += ["--mode", f"regular@127.0.0.1:{port}"]
             unsafe = subprocess.run(args + ["--set", "stream_large_bodies=1m"],
-                                    cwd=ROOT / "engine", env=env, capture_output=True,
+                                    cwd=cwd, env=env, capture_output=True,
                                     text=True, timeout=8)
             assert unsafe.returncode != 0, "unsafe automatic request streaming was accepted"
             assert "Maskit requires stream_large_bodies" in unsafe.stdout + unsafe.stderr
@@ -165,7 +190,7 @@ def main():
             print("PASS: automatic request streaming rejected before serving traffic")
             log_path = data / "proxy.log"
             with log_path.open("w", encoding="utf-8") as log:
-                process = subprocess.Popen(args, cwd=ROOT / "engine", env=env,
+                process = subprocess.Popen(args, cwd=cwd, env=env,
                                            stdout=log, stderr=subprocess.STDOUT)
                 deadline = time.monotonic() + 20
                 while True:
@@ -182,6 +207,7 @@ def main():
                 for _ in range(2):
                     status, body = chat(client)
                     assert status == 200 and SECRET.encode() in body
+                    assert SEMANTIC_TEXT in json.loads(body)["choices"][0]["message"]["content"]
                 with upstream.guard:
                     assert upstream.accepts == 1, "test did not exercise an actual reused connection"
                     assert len(upstream.requests) == 2
@@ -243,6 +269,11 @@ def main():
                         pass
                     time.sleep(.1)
                 assert idle, "idle heartbeat did not refresh or resources did not return"
+                assert metrics.get("transport", {}).get("observation_installed") is True
+                if options.ner:
+                    assert metrics.get("ner", {}).get("initialized") is True, "local NER model did not initialize"
+                    assert any(e.get("ner_windows", 0) > 0 for e in rows), "NER smoke did not run an inference window"
+                    print("PASS: local packaged/source NER initialized and performed inference")
                 print("PASS: idle heartbeat refreshes and in-flight reservations return to zero")
                 process.terminate()
                 process.wait(timeout=5)
