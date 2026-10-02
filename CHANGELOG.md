@@ -2,7 +2,10 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
-## [Unreleased]
+## [0.104.0] - 2026-10-02
+
+基于上游 v0.7.0（`xiaYuTian11/maskit`）。
+*Based on upstream v0.7.0 (`xiaYuTian11/maskit`).*
 
 ### 新增 / Added
 - 同步上游 v0.7.0：真实流取消与响应配额修复、连接策略诊断、词表 `re:` 单词失效修复、无汉字窗口跳过语义模型（识别耗时 -74%）、分段粒度收紧至 4000 字、事件库死空间回收、`linux-<arch>-deb` 更新载体独立签名。
