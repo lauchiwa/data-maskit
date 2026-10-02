@@ -340,6 +340,41 @@ jobs:
             find src-tauri/target/release/bundle/appimage -mindepth 1 ! -name '*.AppImage*' -exec rm -rf {} + || true
           fi
 
+      - name: Assert packaged engine contents (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 断言的是「产物里面有没有引擎」，不是「构建目录里有没有」。resources 映射失效时
+          # Tauri 照样出一个上百 MB、能正常安装的 deb，用户点开只有「引擎缺失」四个字，
+          # 而这一步之前整条流水线全绿。dpkg-deb -c 是唯一能看见包内真实路径的便宜手段。
+          required=(
+            resources/engine/MaskitEngine
+            resources/engine/_internal/transparent.py
+            resources/engine/_internal/models/ner_mini_zh/model_quantized.onnx
+          )
+          listing="$RUNNER_TEMP/package-listing.txt"
+          found=0
+          for deb in src-tauri/target/release/bundle/deb/*.deb; do
+            [ -e "$deb" ] || continue
+            found=1
+            dpkg-deb -c "$deb" > "$listing"
+            missing=()
+            for entry in "${required[@]}"; do
+              grep -q "/${entry}\$" "$listing" || missing+=("$entry")
+            done
+            if [ ${#missing[@]} -gt 0 ]; then
+              echo "$(basename "$deb") is missing: ${missing[*]}" >&2
+              echo 'installer ships without a complete engine; aborting release' >&2
+              exit 1
+            fi
+            echo "ok: $(basename "$deb") ships the frozen engine and the NER model"
+          done
+          if [ "$found" -eq 0 ]; then
+            echo 'no .deb was produced' >&2
+            exit 1
+          fi
+
       - name: Generate SHA-256 checksums (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

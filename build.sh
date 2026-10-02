@@ -180,15 +180,37 @@ info "构建前端静态资源..."
 npm --prefix frontend run build
 success "前端构建产物就绪 (frontend/dist)"
 
-# 9. --release-only 使用新目录，不覆盖可能被源码态客户端使用的旧引擎。
+# 9. --release-only 在仓库外的固定暂存根构建：不碰源码态，也复用 cargo 增量缓存。
 ENGINE_DIST="$ROOT_DIR/dist_engine"
 ENGINE_WORK="$ROOT_DIR/build_engine"
 if [ "$RELEASE_ONLY" = true ]; then
-  BUILD_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/maskit-build.XXXXXX")
+  STAGE_EXPLICIT=true
+  BUILD_STAGE="${MASKIT_BUILD_STAGE:-}"
+  if [ -z "$BUILD_STAGE" ]; then
+    STAGE_EXPLICIT=false
+    BUILD_STAGE="${XDG_CACHE_HOME:-$HOME/.cache}/maskit-build"
+  fi
+  mkdir -p "$BUILD_STAGE"
+  # 为什么不用 mktemp / ${TMPDIR:-/tmp}：实测本机 /tmp 是 tmpfs 16G，一次 release
+  # 构建就在里面留下 8.9G（cargo release target + 103MB 模型），且脚本不清理，两个
+  # 泄漏目录把 tmpfs 用到 68%——再来一次就是 ENOSPC，而且占的是内存。
+  # 固定路径同时让 cargo 增量缓存跨构建复用（原先每次全新编译 20 分钟起）。
+  STAGE_FS="$(findmnt -no FSTYPE -T "$BUILD_STAGE" 2>/dev/null || true)"
+  if [ "$STAGE_FS" = "tmpfs" ] || [ "$STAGE_FS" = "ramfs" ]; then
+    if [ "$STAGE_EXPLICIT" = true ]; then
+      warn "暂存目录 $BUILD_STAGE 在内存文件系统（$STAGE_FS）上，构建产物会占用 RAM。"
+    else
+      error "默认暂存目录 $BUILD_STAGE 位于内存文件系统（$STAGE_FS），release 构建会耗尽 tmpfs/RAM。"
+      echo "请用 MASKIT_BUILD_STAGE=<磁盘目录> 指定暂存根（不要放在 /tmp）。"
+      exit 1
+    fi
+  fi
   ENGINE_DIST="$BUILD_STAGE/dist_engine"
   ENGINE_WORK="$BUILD_STAGE/build_engine"
-  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$BUILD_STAGE/tauri-target}"
-  info "独立打包目录: $BUILD_STAGE"
+  # 不用 ${CARGO_TARGET_DIR:-...}：继承来的值会把本次产物写进**上一次**的暂存根
+  # （实测过：dist_engine 在新目录、.deb 落在旧目录），清理与取证都会踩空。
+  export CARGO_TARGET_DIR="$BUILD_STAGE/tauri-target"
+  info "独立打包目录: $BUILD_STAGE (cargo target: $CARGO_TARGET_DIR)"
 fi
 info "使用 PyInstaller 打包 Python 引擎 sidecar..."
 "$PYTHON_BIN" -m PyInstaller engine/maskit-engine.spec --noconfirm --distpath "$ENGINE_DIST" --workpath "$ENGINE_WORK"
@@ -208,6 +230,13 @@ if [ "$NER_READY" = true ]; then PANEL_SMOKE_ARGS+=(--expect-ner); fi
 "$PYTHON_BIN" tests/smoke_packaged_panel.py "${PANEL_SMOKE_ARGS[@]}"
 
 # 11. 通过资源映射打包，不替换源码态或已安装的 resources/engine。
+# src-tauri/resources/engine 现在只被 `tauri dev` 与 local-dev-deploy.sh --restore 读取；
+# 本脚本走 bundle.resources 映射，不写它。但工作区里可能残留别的平台的引擎
+# （实测见过 245MB 的 Windows MaskitEngine.exe 躺在 Linux 工作区，restore 会照抄）。
+if [ -f "src-tauri/resources/engine/MaskitEngine.exe" ]; then
+  warn "src-tauri/resources/engine 里是 Windows 引擎，Linux 的 tauri dev / --restore 会读到它。"
+  warn "打包不受影响（走 bundle.resources 映射）；本地开发调试前请自行清理该目录。"
+fi
 info "执行 Tauri 构建 (bundles: $BUNDLES)..."
 if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ] && [ -n "${MASKIT_UPDATER_PRIVATE_KEY:-}" ]; then
   export TAURI_SIGNING_PRIVATE_KEY="$MASKIT_UPDATER_PRIVATE_KEY"
@@ -248,6 +277,60 @@ if [ ${#OUTPUTS[@]} -eq 0 ]; then
   error "未找到任何生成的打包产物 (.deb / .AppImage)！"
   exit 1
 fi
+
+# 只查「产物存在 + 体积」是不够的：bundle.resources 一旦不生效，包照样生成、体积
+# 照样上百 MB，用户侧表现是启动即「引擎缺失」（src-tauri/src/lib.rs 那句报错），
+# 而这一步之前完全静默。所以逐个产物把内容列出来，按路径断言引擎与模型在包里。
+REQUIRED_ENTRIES=("resources/engine/MaskitEngine" "resources/engine/_internal/transparent.py")
+if [ "$NER_READY" = true ]; then
+  REQUIRED_ENTRIES+=("resources/engine/_internal/models/ner_mini_zh/model_quantized.onnx")
+fi
+
+verify_bundle_contents() {  # $1 = 产物路径
+  local listing="$ENGINE_WORK/bundle-listing.txt"
+  case "$1" in
+    *.deb)
+      if ! command -v dpkg-deb >/dev/null 2>&1; then
+        warn "缺少 dpkg-deb，无法校验 $(basename "$1") 的内容"
+        return 0
+      fi
+      dpkg-deb -c "$1" > "$listing"
+      ;;
+    *.AppImage)
+      local extract_dir="$ENGINE_WORK/appimage-check"
+      rm -rf "$extract_dir"; mkdir -p "$extract_dir"
+      if ! ( cd "$extract_dir" && APPIMAGE_EXTRACT_AND_RUN=1 "$1" --appimage-extract >/dev/null 2>&1 ); then
+        warn "$(basename "$1") 无法自解包，跳过内容校验"
+        rm -rf "$extract_dir"
+        return 0
+      fi
+      ( cd "$extract_dir" && find squashfs-root -mindepth 1 ) > "$listing"
+      rm -rf "$extract_dir"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+  local missing=()
+  for entry in "${REQUIRED_ENTRIES[@]}"; do
+    grep -q "/${entry}\$" "$listing" || missing+=("$entry")
+  done
+  rm -f "$listing"
+  if [ ${#missing[@]} -gt 0 ]; then
+    error "$(basename "$1") 内缺少：${missing[*]}"
+    error "安装包不含完整引擎，用户启动会直接报「引擎缺失」，终止发布。"
+    return 1
+  fi
+  if [ "$NER_READY" = true ]; then
+    success "$(basename "$1") 内容校验通过（引擎 + NER 模型）"
+  else
+    success "$(basename "$1") 内容校验通过（引擎，轻量规则包）"
+  fi
+}
+
+for out in "${OUTPUTS[@]}"; do
+  verify_bundle_contents "$out" || exit 1
+done
 
 echo ""
 echo -e "${GREEN}================================================================${NC}"

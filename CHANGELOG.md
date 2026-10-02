@@ -2,12 +2,13 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
-## [Unreleased]
+## [0.7.0] - 2026-10-02
 
 ### 修复
 - 引擎：NER 请求预算过期不再续期，取消与等待不再额外开启推理窗口。
 - 引擎：修复真实流取消、垃圾回收重入与压缩响应配额，避免迟到回复、假 503 和响应漏审计。
 - 构建：隔离发布构建并验收真实 frozen 引擎，保留本机运行数据，拒绝不完整模型包。
+- 构建：`--release-only` 暂存根改到磁盘固定路径（拒绝默认落在 tmpfs 吃内存），发布前逐个断言产物内确实含引擎与 NER 模型，并把 `zstandard` 显式写进 requirements。
 - 面板：未知连接策略不再使整份配置回退；桌面控制面请求不再经过环境代理。
 - 面板：统一 HTTP/2 缺省为关闭，保留用户明确选择，避免模板与运行配置口径不一致。
 - 引擎：自定义词表里的 `re:` 词不再能拖垮整张词表（一个词编译失败曾让自定义词与内置词组一起静默失效）。
@@ -29,6 +30,7 @@
 - Engine: expired NER request budgets no longer renew, and cancellation or waiting cannot grant extra inference windows.
 - Engine: fixed native stream cancellation, GC reentrancy and compressed-response admission to prevent late replies, spurious 503s and skipped audits.
 - Build: isolate release builds and verify the actual frozen engine, preserving local runtime data and rejecting incomplete model bundles.
+- Build: `--release-only` now stages on a fixed on-disk path (refusing a tmpfs default that ate RAM), every artifact is asserted to actually contain the engine and NER model before release, and `zstandard` is declared explicitly in requirements.
 - Panel: unknown connection policies no longer reset the entire configuration; desktop control-plane requests bypass environment proxies.
 - Panel: default HTTP/2 consistently to off while preserving explicit choices, avoiding drift between templates and runtime configuration.
 - Engine: one broken `re:` word can no longer take down the whole word table (a single bad pattern silently disabled custom and built-in groups together).
