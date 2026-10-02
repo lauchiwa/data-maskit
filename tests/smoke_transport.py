@@ -145,7 +145,12 @@ def main():
     process = None
     client = None
     try:
-        with tempfile.TemporaryDirectory(prefix="maskit-transport-smoke-") as temp:
+        # ignore_cleanup_errors：Windows 上删临时目录会撞上还没释放的
+        # shield-events.sqlite3 句柄（发版 CI 实测：断言全 PASS、TRANSPORT SMOKE OK
+        # 已打印，退场时 WinError 32 把整条 Windows 打包线打红）。断言才是这里的信号，
+        # runner 是一次性的，留个空临时目录不值得让发版失败。
+        with tempfile.TemporaryDirectory(prefix="maskit-transport-smoke-",
+                                         ignore_cleanup_errors=True) as temp:
             data = Path(temp)
             config = {
                 "capture_mode": "reverse", "http2": False, "ner_enabled": options.ner,
