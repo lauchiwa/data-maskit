@@ -45,6 +45,11 @@ class AuditBudgetTests(unittest.TestCase):
         self.captured = []
         self._enq = tr.enqueue_audit_event
         tr.enqueue_audit_event = lambda rec: self.captured.append(rec)
+        # 体积闸/缓存契约不能依赖扫描是否在真实 250ms 内完成；慢机或调度抢占会
+        # 提前走 after_scan，根本碰不到待测解析分支。仅替换本模块的计时引用，
+        # 保留真实扫描器与生产预算；预算耗尽用例显式推进时钟。
+        self.clock = self.enterContext(mock.patch.object(tr, "time", wraps=tr.time))
+        self.clock.perf_counter.return_value = 1000.0
 
     def tearDown(self):
         tr.enqueue_audit_event = self._enq
@@ -181,6 +186,28 @@ class AuditBudgetTests(unittest.TestCase):
         self.assertEqual(len(tr._AUDIT_FINDINGS_CACHE), 0, "截断结果不得进缓存")
         self.assertGreaterEqual(tr._AUDIT_RUNTIME["truncated"], 1, "截断必须计数")
 
+    def test_scan_exhausting_budget_keeps_findings_but_skips_parse_and_cache(self):
+        """扫描耗尽预算后仍留痕，但不解析、不缓存残缺结果；不用 sleep 碰运气。"""
+        finding = {"signal": "response_poison", "severity": tr._audit.HIGH,
+                   "evidence": "synthetic finding", "kind": "test"}
+
+        def exhaust_budget(*_args, **_kwargs):
+            self.clock.perf_counter.return_value += tr.AUDIT_TIME_BUDGET_S + 1.0
+            return [finding]
+
+        with (mock.patch.object(tr._audit, "scan_response_poison", side_effect=exhaust_budget) as scan,
+              mock.patch.object(tr, "_parse_response_payload") as parse):
+            tr._audit_response(_flow(b'{"a":1}'), "budget-sid", "api.openai.com", "POST",
+                               "/v1/chat/completions", {})
+        scan.assert_called_once()
+        parse.assert_not_called()
+        self.assertEqual(tr._AUDIT_RUNTIME["truncated"], 1)
+        self.assertEqual(tr._AUDIT_RUNTIME["parse_skipped"], 0,
+                         "时间预算截断不能冒充体积闸跳过解析")
+        self.assertEqual(len(tr._AUDIT_FINDINGS_CACHE), 0, "截断结果不得进缓存")
+        self.assertEqual(len(self.captured), 1, "截断前发现的信号仍须留痕")
+        self.assertTrue(self.captured[0]["audit_scan_truncated"])
+
     def test_audit_exception_is_swallowed_and_warned_once(self):
         """审计坏了不能影响流量，但也不能完全静默（抽函数时踩过 NameError 被吞）。"""
         def boom(*a, **k):
@@ -302,6 +329,9 @@ class AuditOversizeDecodeTests(unittest.TestCase):
     def setUp(self):
         self._enabled = tr.AUDIT_ENABLED
         tr.AUDIT_ENABLED = True
+        # 这里锁住解码/解析的体积边界，不把真实扫描耗时混成另一条截断路径。
+        clock = self.enterContext(mock.patch.object(tr, "time", wraps=tr.time))
+        clock.perf_counter.return_value = 1000.0
 
     def tearDown(self):
         tr.AUDIT_ENABLED = self._enabled
