@@ -2,7 +2,7 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
-## [Unreleased]
+## [0.105.0] - 2026-10-07
 
 基于上游 v0.8.0（`xiaYuTian11/maskit`）。
 *Based on upstream v0.8.0 (`xiaYuTian11/maskit`).*
