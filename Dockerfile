@@ -1,7 +1,7 @@
 # ==========================================
 # 阶段 1: 前端静态资源构建（在原生构建架构上执行，避免 QEMU 模拟导致死锁或极度降频）
 # ==========================================
-FROM --platform=$BUILDPLATFORM node:20-alpine AS frontend-builder
+FROM --platform=$BUILDPLATFORM node:24-alpine AS frontend-builder
 WORKDIR /build/frontend
 
 COPY frontend/package*.json ./
@@ -34,7 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     net-tools \
     procps \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --create-home --home-dir /home/maskit maskit \
+    && useradd --system --uid 1001 --create-home --home-dir /home/maskit maskit \
     && mkdir -p /data && chown maskit:maskit /data
 
 # 安装 Python 核心依赖
@@ -43,6 +43,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 拷贝核心引擎文件（.dockerignore 已排除本机事件库 / token / 配置备份）
 COPY engine/ ./
+
+# 占位符 Skill 包：`GET /api/skill/bundle` 的数据源（源码态在 engine/ 的上一级，
+# 容器里 engine/ 已拷成 /app/*，所以包落在 /app/agent-bundle/maskit-placeholders）。
+# 漏了这行不影响启动、不影响脱敏，只让容器部署的“下载 Skill 包”恒 500 ——
+# 属于“只有用户点了才知道”的缺口，由 tests/test_placeholder_skill.py 静态钉住。
+COPY agent-bundle/ ./agent-bundle/
 
 # 从阶段 1 拷贝构建好的前端静态页面到 web_dist
 COPY --from=frontend-builder /build/frontend/dist /app/web_dist

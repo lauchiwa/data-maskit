@@ -7573,24 +7573,33 @@ class MaskOffloadTests(unittest.TestCase):
             ner_engine._CACHE_CHARS = 0
             ner_engine._CACHE_MAX, ner_engine._CACHE_MAX_CHARS = max_n, max_chars
 
+        def put(key):
+            # §G1：键是进程密钥摘要，值是 (start,end,type) 三元组；字符记账记的是
+            # 「所代表的文本长度」（`len(key)`），不是实际保留的字节。
+            ner_engine._cache_put(ner_engine._cache_fingerprint(key), [], len(key))
+
         try:
             # 条数上限生效
             reset(4, 10 ** 9)
             for i in range(10):
-                ner_engine._cache_put("t%d" % i, [])
+                put("t%d" % i)
             self.assertEqual(len(ner_engine._CACHE), 4)
             # 同键覆盖不能把字符计数一直涨上去（否则缓存会被自己的计数挤空）
             reset(4096, 10 ** 9)
             for _ in range(50):
-                ner_engine._cache_put("same", [])
+                put("same")
             self.assertEqual(ner_engine._CACHE_CHARS, len("same"))
             # 字符总量上限生效，且计数与实际内容始终一致
             reset(4096, 30)
             for i in range(10):
-                ner_engine._cache_put("k%05d" % i, [])
+                put("k%05d" % i)
             self.assertLessEqual(ner_engine._CACHE_CHARS, 30)
             self.assertEqual(ner_engine._CACHE_CHARS,
-                             sum(len(k) for k in ner_engine._CACHE))
+                             sum(int(v[0]) for v in ner_engine._CACHE.values()))
+            # 键不得是原文（§G1）：否则缓存会延长原文在内存里的保留窗口
+            for k in ner_engine._CACHE:
+                self.assertNotEqual(k, "same")
+                self.assertEqual(len(k), 64, "缓存键必须是摘要")
         finally:
             ner_engine._CACHE.clear()
             ner_engine._CACHE.update(saved)
@@ -7995,14 +8004,19 @@ class NerCacheStatsTests(unittest.TestCase):
     def test_hit_and_miss_are_counted(self):
         import ner_engine
         text = "缓存命中计数专用文本甲乙丙丁"
+        # 写一条负缓存（空结果）再查：命中路径不依赖模型，CI 无模型时也成立。
+        # 【bug fix 2026-10-05】上一版传了原文而非 fingerprint 作为 key，导致在无模型时 miss（
+        # 本机有模型时碰巧走"真实推理的内部缓存条目"才过，是假绿；CI 无模型直接暴露根因）。
+        # _fp 是 fingerprint，同 _cache_put 的调用约定（key = fingerprint，值 = 三元组列表，text_len = 原文长度）。
+        _fp = ner_engine._cache_fingerprint(text)
         with ner_engine._CACHE_LOCK:
-            ner_engine._CACHE.pop(text, None)
+            ner_engine._CACHE.pop(_fp, None)  # 清除可能残留
         base = ner_engine.cache_stats()
-        ner_engine.extract_entities(text)              # 首次：未命中
+        ner_engine.extract_entities(text)            # 首次：未命中（无模型也走缓存统计段）
         mid = ner_engine.cache_stats()
         self.assertEqual(mid["miss"] - base["miss"], 1, "未命中未计数")
-        # 写一条负缓存（空结果）再查：命中路径不依赖模型，CI 无模型时也成立
-        ner_engine._cache_put(text, [])
+        # 手动写负缓存，key 必须是 fingerprint（不能是原文）
+        ner_engine._cache_put(_fp, [], len(text))
         ner_engine.extract_entities(text)              # 二次：命中
         after = ner_engine.cache_stats()
         self.assertEqual(after["hit"] - mid["hit"], 1, "命中未计数")
@@ -8167,7 +8181,8 @@ class NerCacheConcurrencyTests(unittest.TestCase):
             def work(tid):
                 try:
                     for i in range(200):
-                        ner_engine._cache_put("t%d-%d" % (tid, i), [])
+                        key = "t%d-%d" % (tid, i)
+                        ner_engine._cache_put(ner_engine._cache_fingerprint(key), [], len(key))
                 except Exception as e:  # pragma: no cover - 命中即回归
                     errs.append("%s: %s" % (type(e).__name__, e))
 
@@ -8180,7 +8195,7 @@ class NerCacheConcurrencyTests(unittest.TestCase):
             self.assertEqual(errs, [])
             self.assertLessEqual(len(ner_engine._CACHE), ner_engine._CACHE_MAX)
             self.assertEqual(ner_engine._CACHE_CHARS,
-                             sum(len(k) for k in ner_engine._CACHE),
+                             sum(int(v[0]) for v in ner_engine._CACHE.values()),
                              "字符计数与实际内容不一致：淘汰判据已失真")
         finally:
             ner_engine._CACHE.clear()
