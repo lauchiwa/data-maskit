@@ -328,7 +328,11 @@ def main():
                     print("PASS: local packaged/source NER initialized and performed inference")
                 print("PASS: idle heartbeat refreshes and in-flight reservations return to zero")
                 process.terminate()
-                process.wait(timeout=5)
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
             print("TRANSPORT SMOKE OK")
     finally:
         if client is not None:

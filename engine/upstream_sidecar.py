@@ -55,15 +55,37 @@ _USE_PROXY_HEADER = "x-maskit-use-proxy"
 _INTERNAL_HEADERS = frozenset({_UPSTREAM_HEADER, _UPSTREAM_NAME_HEADER, _USE_PROXY_HEADER})
 
 # ─── 超时 ──────────────────────────────────────────────────────────────────
-_CONNECT_TIMEOUT_S = 10.0
-_READ_TIMEOUT_S = 120.0
+# 直连跨国边缘节点（如 Cloudflare）握手通常需 3~7s，抖动时偶发突破 10s；给 20s 避免误杀慢握手
+_CONNECT_TIMEOUT_S = 20.0
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        val = os.environ.get(name)
+        if val is not None and val.strip():
+            return float(val.strip())
+    except Exception:
+        pass
+    return default
+
+
+# 与 transparent._ENGINE_DEADLINE_S 保持一致，sidecar 每层超时必须在端到端预算之内（§2.4）
+_READ_TIMEOUT_S = max(5.0, _env_float("MASKIT_ENGINE_DEADLINE_S", 120.0))
 _WRITE_TIMEOUT_S = 30.0
 _POOL_TIMEOUT_S = 5.0
 
 # ─── 连接池 ─────────────────────────────────────────────────────────────────
 _MAX_CONNECTIONS = 64
 _MAX_KEEPALIVE_CONNECTIONS = 16
-_KEEPALIVE_EXPIRY_S = 30.0
+# 空闲保留预算不能短于「停顿之后第一次回车」的那个停顿，否则接管省下的握手又回来了：
+# 同一请求节奏下 30 s 预算要新建 6 条上游连接、35-90 s 停顿后的请求各多付约 400 ms
+# （850/864/805/870 vs 431/436/462/492）；提到 120 s 后同节奏只剩 2 条连接。
+# 上限不由我们定：上游在 20/60/130/240 s 空闲后仍在**同一条** socket 上回 200 并带
+# `Connection: keep-alive`，所以窗口内拿到的是活连接而不是尸体；过期也只是剔除重连
+# （见 TestSidecarKeepaliveExpiry），对端 FIN/RST 由 TestSidecarStaleConnection 钉住。
+# 不取更长：「既不回也不关」的黑洞连接被复用后只能以 `_READ_TIMEOUT_S`（120 s）暴露，
+# 本机链路会硬断，空闲连接握得越久这类命中越多。
+_KEEPALIVE_EXPIRY_S = 120.0
 
 # ─── 32 MiB 上限（与 transparent._DEFAULT_MAX_REQUEST_BODY 一致）────────────
 _MAX_REQUEST_BODY = 32 * 1024 * 1024
@@ -213,6 +235,12 @@ class UpstreamSidecar:
                     "max_keepalive": getattr(pool_obj, "_max_keepalive_connections", _MAX_KEEPALIVE_CONNECTIONS),
                     "keepalive_expiry": getattr(pool_obj, "_keepalive_expiry", _KEEPALIVE_EXPIRY_S),
                 }
+                conns = getattr(pool_obj, "_connections", None)
+                if conns is not None:
+                    try:
+                        pool_info["live_connections"] = len(conns)
+                    except Exception:
+                        pass
         return {
             "enabled": self.is_running,
             "port": self._port,
@@ -439,15 +467,15 @@ class UpstreamSidecar:
                 self._stats["requests"] += 1
                 url = origin + path
                 t0 = time.monotonic()
-                resp = await self._forward_with_retry(
+                resp, err_status, err_code = await self._forward_with_retry(
                     active_client, method, url, fwd_headers, body,
                 )
 
                 if resp is None:
                     # 重试后仍失败 → fail-closed
                     self._stats["errors"] += 1
-                    await self._send_error(conn, writer, 502,
-                        b'{"error":"upstream_connect_failed"}')
+                    err_body = ('{"error":"%s"}' % err_code).encode("utf-8")
+                    await self._send_error(conn, writer, err_status, err_body)
                     if not self._cycle_done(conn): break
                     continue
 
@@ -556,8 +584,13 @@ class UpstreamSidecar:
     async def _forward_with_retry(
         self, client: httpx.AsyncClient, method: str, url: str,
         headers: list[tuple[str, str]], body: bytes,
-    ) -> httpx.Response | None:
-        """用 httpx 池转发，连接失败时重试一次（请求未发出字节时安全）。"""
+    ) -> tuple[httpx.Response | None, int, str]:
+        """用 httpx 池转发，连接失败时重试一次（请求未发出字节时安全）。
+
+        返回 (resp, http_status, error_name)：
+        - 成功: (resp, 200, "")
+        - 失败: (None, http_status, error_name)
+        """
         req_headers = dict(headers)
         content = body if body else None
 
@@ -567,7 +600,7 @@ class UpstreamSidecar:
                     client.build_request(method, url, headers=req_headers, content=content),
                     stream=True,
                 )
-                return resp
+                return resp, 200, ""
             except httpx.ConnectError as e:
                 # 连接失败 = 请求未发出任何字节 → 安全重试
                 if attempt < _MAX_RETRIES:
@@ -577,28 +610,28 @@ class UpstreamSidecar:
                     continue
                 logger.error("sidecar connect failed after %d attempts: %s",
                              attempt + 1, e)
-                return None
+                return None, 502, "upstream_connect_failed"
             except httpx.ConnectTimeout as e:
                 if attempt < _MAX_RETRIES:
                     self._stats["retries"] += 1
                     logger.warning("sidecar connect timeout (attempt %d), retrying: %s",
                                    attempt + 1, e)
                     continue
-                return None
-            except (httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
-                # 这两类可能发生在请求已发出之后 → 不重试（重试有重复计费风险）。
-                # 别把这里当成「连接池腐烂」的缺口：对端 FIN/RST 时 httpcore 在取用
-                # 连接前就能识别并另开一条，根本走不到这个分支（实测见
-                # tests/test_upstream_sidecar.py 的 TestSidecarStaleConnection，它把
-                # 该行为钉死了）。真走到这里的是「请求已发出、响应中途断」，交给调用方
-                # 重试才是正确归因。
-                logger.error("sidecar non-retryable error: %s", e)
-                return None
+                logger.error("sidecar connect timeout after %d attempts: %s",
+                             attempt + 1, e)
+                return None, 504, "upstream_connect_timeout"
+            except httpx.ReadTimeout as e:
+                # 这类发生在请求已发出之后 → 不重试（重试有重复计费风险）。
+                logger.error("sidecar read timeout: %s", e)
+                return None, 504, "upstream_read_timeout"
+            except httpx.RemoteProtocolError as e:
+                logger.error("sidecar remote protocol error: %s", e)
+                return None, 502, "upstream_protocol_error"
             except Exception as e:
                 # TLS 验证异常 → fail-closed，不重试
                 logger.error("sidecar TLS/error (fail-closed): %s", e)
-                return None
-        return None
+                return None, 502, "upstream_tls_failed"
+        return None, 502, "upstream_connect_failed"
 
     # ─── h11 响应编码 ──────────────────────────────────────────────────────
 

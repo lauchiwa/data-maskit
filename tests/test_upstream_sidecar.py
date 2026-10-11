@@ -2,7 +2,7 @@
 
 用本地 mock HTTP server 做端到端验证，不依赖外部网络。
 覆盖：基本转发 / POST body / 流式响应 / 内部头剥离 / 凭据头透传 /
-TLS fail-closed / 32 MiB 上限 / 连接池复用 / 出口代理双客户端 / metrics / 有界关停 /
+TLS fail-closed / 32 MiB 上限 / 连接池复用 / 空闲保留预算 / 出口代理双客户端 / metrics / 有界关停 /
 目标白名单 / 请求体残缺 / 压缩响应字节保真 / 无体响应封帧 / 调用方空闲预算。
 """
 import asyncio
@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "engine"))
 
@@ -285,8 +286,19 @@ class TestUpstreamSidecar(unittest.IsolatedAsyncioTestCase):
             headers={"X-Maskit-Upstream": "https://nonexistent-host-12345.invalid"},
         )
         self.assertEqual(resp.status_code, 502)
+        self.assertEqual(resp.json().get("error"), "upstream_connect_failed")
         stats = self.sidecar.metrics()["stats"]
         self.assertGreaterEqual(stats["retries"], 1)
+
+    async def test_read_timeout_returns_504_gateway_timeout(self):
+        """上游读取超时（如大模型思考首包过慢） → 504 upstream_read_timeout。"""
+        with mock.patch.object(self.sidecar._client, "send", side_effect=httpx.ReadTimeout("read timeout")):
+            resp = await self.test_client.get(
+                self._sidecar_url("/get"),
+                headers=self._upstream_headers(),
+            )
+            self.assertEqual(resp.status_code, 504)
+            self.assertEqual(resp.json().get("error"), "upstream_read_timeout")
 
     async def test_metrics(self):
         """metrics 正确暴露 sidecar 状态。"""
@@ -992,6 +1004,89 @@ class TestSidecarStaleConnection(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(resp.status_code, 200,
                              "第 %d 次被池里的死连接打成 %d" % (i + 1, resp.status_code))
         self.assertEqual(self.sidecar.metrics()["stats"]["errors"], 0)
+
+
+class TestSidecarKeepaliveExpiry(unittest.IsolatedAsyncioTestCase):
+    """空闲保留预算的三件事：值真的进了池子、窗口内真的复用、过期只是剔除不是报错。
+
+    单独立一类的原因是这仓库有过「`connection_policy.py` 声明了 15 s 连接超时，但
+    从来没传给 transport」的事故——**常量定义了不等于生效了**，所以生效判据要自己钉。
+    预算取 120 s 的实测依据：同一请求节奏下 30 s 预算要新建 6 条上游连接、每次停顿后
+    多付约 400 ms，而 120 s 只需 2 条；上游本身在 240 s 空闲后仍在同一条 socket 上回
+    200（所以窗口内拿到的是活连接，不是尸体）。
+    """
+
+    async def asyncSetUp(self):
+        self.mock = MockUpstream()
+        await self.mock.start()
+        self.client = httpx.AsyncClient(timeout=10.0, trust_env=False)
+        self._sidecars = []
+
+    async def asyncTearDown(self):
+        # 顺序有讲究：sidecar 攥着池里的上游连接，先关 mock 的话 mock 的 handler
+        # 永远等不到 EOF，而 Python 3.12+ 的 Server.wait_closed() 要等 handler 退出。
+        for sidecar in self._sidecars:
+            await sidecar.stop()
+        await self.client.aclose()
+        await self.mock.stop()
+
+    async def _start_sidecar(self, expiry=None):
+        """按指定预算启动 sidecar。
+
+        ``start()`` 读的是模块全局，所以 patch 必须覆盖到 ``start()`` 之内；一旦连接
+        池建好，退出 patch 不影响该实例——这正是「值有被烘焙进池子」的证据。
+        """
+        cfg = {"upstreams": [{"name": "mock", "target": self.mock.url}]}
+        if expiry is None:
+            sidecar = UpstreamSidecar(config=cfg)
+            await sidecar.start()
+        else:
+            with mock.patch.object(c1mod, "_KEEPALIVE_EXPIRY_S", expiry):
+                sidecar = UpstreamSidecar(config=cfg)
+                await sidecar.start()
+        self._sidecars.append(sidecar)
+        return sidecar
+
+    async def _get(self, sidecar, path="/get"):
+        resp = await self.client.get(
+            "http://127.0.0.1:%d%s" % (sidecar.port, path),
+            headers={"X-Maskit-Upstream": self.mock.url})
+        return resp.status_code
+
+    async def test_shipped_expiry_reaches_the_pool_and_covers_a_pause(self):
+        """现网预算值必须真的落到 httpcore 池上，且足以跨过「停顿后第一次回车」。"""
+        sidecar = await self._start_sidecar()
+        self.assertGreaterEqual(c1mod._KEEPALIVE_EXPIRY_S, 60.0,
+                                "预算低于 60 s 会把每个停顿后的首请求打回全新握手")
+        pool_obj = sidecar._client._transport._pool
+        # metrics() 用 getattr(..., 常量) 兜底，属性名写错时它会「报对」——所以这里
+        # 直接验池子上真有这个值，而不是只比 metrics() 的输出。
+        self.assertTrue(hasattr(pool_obj, "_keepalive_expiry"),
+                        "httpcore 池上找不到 keepalive 预算，指标在自证清白")
+        self.assertEqual(pool_obj._keepalive_expiry, c1mod._KEEPALIVE_EXPIRY_S,
+                         "常量没传进连接池——takeover 会退化成每请求重连")
+        self.assertEqual(sidecar.metrics()["pool"]["keepalive_expiry"],
+                         c1mod._KEEPALIVE_EXPIRY_S)
+
+    async def test_gap_inside_expiry_reuses_the_upstream_connection(self):
+        """预算内的停顿之后，第二条请求必须复用同一条上游连接。"""
+        sidecar = await self._start_sidecar(expiry=300.0)
+        self.assertEqual(await self._get(sidecar), 200)
+        await asyncio.sleep(1.5)
+        self.assertEqual(await self._get(sidecar), 200)
+        self.assertEqual(self.mock.connection_count, 1,
+                         "预算内的空闲把连接丢了（accepted=%d）"
+                         % self.mock.connection_count)
+
+    async def test_gap_beyond_expiry_reconnects_without_error(self):
+        """超出预算只是剔除过期连接：重连、两条都 200，errors 计数保持 0。"""
+        sidecar = await self._start_sidecar(expiry=0.3)
+        self.assertEqual(await self._get(sidecar), 200)
+        await asyncio.sleep(1.0)
+        self.assertEqual(await self._get(sidecar), 200)
+        self.assertEqual(self.mock.connection_count, 2,
+                         "过期连接没被剔除，空闲预算形同虚设")
+        self.assertEqual(sidecar.metrics()["stats"]["errors"], 0)
 
 
 if __name__ == "__main__":

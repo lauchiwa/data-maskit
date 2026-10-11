@@ -650,6 +650,7 @@ def _c1_apply_takeover(flow, up, path):
         # 告诉 sidecar 是否走出口代理（sidecar 自己管，避免 mitmproxy 把本地连接也代理了）
         if is_true(up.get("use_proxy")):
             flow.request.headers["X-Maskit-Use-Proxy"] = "true"
+            flow.metadata["shield_via_proxy"] = True
         # 真实上游域名留给下游判据（见 `_upstream_host_of`）
         flow.metadata["shield_upstream_host"] = host
         flow.metadata["shield_takeover"] = True

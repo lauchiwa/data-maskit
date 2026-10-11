@@ -15,7 +15,7 @@ Data Maskit 控制面板 - 本地 Flask 服务
 # 本程序基于「希望有用」的目的分发，但不附带任何担保；亦无对适销性或特定用途
 # 适用性的默示担保。详见 GNU Affero 通用公共许可证。
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
-__version__ = '0.9.0'
+__version__ = '0.10.0'
 import json
 import codecs
 import copy
@@ -6285,7 +6285,11 @@ def api_logs():
                         _e.get("model") or "",
                         _usage.get("prompt_tokens") or 0,
                         _usage.get("completion_tokens") or 0,
-                        _overrides2, _price_cache2)
+                        _overrides2,
+                        price_catalog=_price_cache2,
+                        cache_read_tokens=_usage.get("cache_read_tokens") or 0,
+                        cache_write_tokens=_usage.get("cache_write_tokens") or 0,
+                    )
                     _e["cost_usd"] = round(_cost, 4)
     except Exception:
         pass
@@ -6554,7 +6558,15 @@ def api_stats_models():
         models = stats_models(days=days)
         out = []
         for m in models:
-            cost, price = estimate_cost(m["model"], m["prompt"], m["completion"], overrides, cache_prices)
+            cost, price = estimate_cost(
+                m["model"],
+                m["prompt"],
+                m["completion"],
+                overrides,
+                price_catalog=cache_prices,
+                cache_read_tokens=m.get("cache_read") or 0,
+                cache_write_tokens=m.get("cache_write") or 0,
+            )
             m["cost_usd"] = cost
             m["priced"] = price is not None
             out.append(m)

@@ -2,6 +2,22 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.10.0] - 2026-10-11
+
+### 新增
+- 统计：支持各大模型 Token 缓存采集与日摘要聚合，费用估算按厂商口径支持缓存折扣。
+
+### Added
+- Stats: support token cache extraction and daily aggregation, with vendor-specific discount support in cost estimation.
+
+### 优化
+- 引擎：接管连接池空闲保留由 30 秒提到 120 秒，建连超时放宽至 20 秒并细化 502/504 错误归因，减少冷握手超时与假报错。
+- 脱敏：默认凭据前缀安全扩充常见供应商识别（仅对未自行配置过的用户生效，已自定义保存过的请手动添加）。
+
+### Improvements
+- Engine: takeover pool keepalive budget extended to 120s, connect timeout relaxed to 20s with refined 502/504 attribution to reduce false connect failures.
+- Masking: expanded default credential prefixes for common providers (applies only when not customized; manual addition needed for existing custom configs).
+
 ## [0.9.0] - 2026-10-10
 
 ### 修复

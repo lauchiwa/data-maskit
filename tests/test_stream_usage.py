@@ -210,3 +210,60 @@ class WholeBodyRestoreUsageTests(unittest.TestCase):
             captured = self._capture(body, streamed_text="y", stream_actual="stream_error",
                                      stream_usage={"prompt_tokens": 3})
         self.assertEqual((captured.get("usage") or {}).get("prompt_tokens"), 3)
+
+    def test_cache_and_reasoning_tokens_extraction(self):
+        """测试各大厂商的缓存与思考 token 采集。"""
+        # 1. OpenAI 格式（含 prompt_tokens_details.cached_tokens 与 reasoning_tokens）
+        openai_payload = {
+            "usage": {
+                "prompt_tokens": 79741,
+                "completion_tokens": 25,
+                "total_tokens": 79766,
+                "prompt_tokens_details": {
+                    "audio_tokens": 0,
+                    "cached_tokens": 77254,
+                },
+                "completion_tokens_details": {
+                    "reasoning_tokens": 15,
+                },
+            }
+        }
+        res = defaults.extract_usage(json.dumps(openai_payload))
+        self.assertEqual(res.get("prompt_tokens"), 79741)
+        self.assertEqual(res.get("completion_tokens"), 25)
+        self.assertEqual(res.get("cache_read_tokens"), 77254)
+        self.assertEqual(res.get("reasoning_tokens"), 15)
+        self.assertNotIn("cache_write_tokens", res)
+
+        # 2. Anthropic 格式（含 cache_read_input_tokens 与 cache_creation_input_tokens）
+        anthropic_payload = {
+            "type": "message_start",
+            "message": {
+                "usage": {
+                    "input_tokens": 2095,
+                    "output_tokens": 503,
+                    "cache_read_input_tokens": 2000,
+                    "cache_creation_input_tokens": 1000,
+                }
+            }
+        }
+        res_anthropic = defaults.extract_usage(event(anthropic_payload))
+        self.assertEqual(res_anthropic.get("prompt_tokens"), 2095)
+        self.assertEqual(res_anthropic.get("completion_tokens"), 503)
+        self.assertEqual(res_anthropic.get("cache_read_tokens"), 2000)
+        self.assertEqual(res_anthropic.get("cache_write_tokens"), 1000)
+
+        # 3. DeepSeek 格式（含 prompt_cache_hit_tokens）
+        deepseek_payload = {
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 200,
+                "prompt_cache_hit_tokens": 800,
+                "prompt_cache_miss_tokens": 200,
+            }
+        }
+        res_deepseek = defaults.extract_usage(json.dumps(deepseek_payload))
+        self.assertEqual(res_deepseek.get("prompt_tokens"), 1000)
+        self.assertEqual(res_deepseek.get("completion_tokens"), 200)
+        self.assertEqual(res_deepseek.get("cache_read_tokens"), 800)
+

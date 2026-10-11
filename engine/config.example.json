@@ -47,7 +47,14 @@
   },
   "secret_prefixes": [
     "sk-",
-    "ah-"
+    "ah-",
+    "ghp_",
+    "glpat-",
+    "xoxb-",
+    "xoxp-",
+    "pypi-",
+    "npm_",
+    "dify-"
   ],
   "debug": false,
   "ner_enabled": false,
