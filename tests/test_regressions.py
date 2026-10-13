@@ -1087,6 +1087,76 @@ class CredentialRedactionTests(unittest.TestCase):
         self.assertNotIn("sk-1234567890abcdefghijklmnopqrst", restore.get("dialog") or "")
         self.assertNotIn("sk-1234567890abcdefghijklmnopqrst", restore.get("resp_preview") or "")
 
+    def test_restore_event_carries_signed_blocks_skipped(self):
+        """响应侧契约豁免（签名思考块不还原）必须计数进 RESTORE 事件。
+
+        与 MASK 侧的 `signed_blocks_skipped` 对称：豁免是漏还原路径，
+        屏幕上可见（块内保留原样）而统计为零，用户就无从判断它是否被处理过。
+        """
+        def run():
+            flow = self._flow("api.openai.com", "/v1/chat/completions",
+                              {"messages": [{"role": "user", "content": "key=sk-1234567890abcdefghijklmnopqrst"}]})
+            _drive_request(flow)
+            masked = json.loads(flow.request.content)["messages"][0]["content"]
+            flow.response = SimpleNamespace(
+                headers={"content-type": "application/json"},
+                status_code=200,
+                content=json.dumps({"choices": [{"message": {
+                    "content": "收到",
+                    "thinking_blocks": [
+                        {"type": "thinking", "thinking": masked, "signature": "Aq" + masked + "=="},
+                        {"type": "redacted_thinking", "data": "Bx" + masked},
+                    ],
+                }}]}, ensure_ascii=False).encode("utf-8"),
+            )
+            asyncio.run(tr.response(flow))
+        captured = self._capture(run)
+        restore = [kw for typ, kw in captured if typ == "RESTORE"][0]
+        self.assertEqual(restore.get("signed_blocks_skipped"), 2,
+                         "两块契约豁免必须计数进 RESTORE 事件")
+
+    def test_restore_items_distinguish_echoed_from_not_echoed(self):
+        """items 三态：已还原 / 回显但未还原 / 模型没提。
+
+        「模型没回显」此前与「回显了但映射丢了」共用同一个 `restored=false`，
+        用户很容易把前者误读成「又没还原」——其实它什么都没错。
+        """
+        p1 = "139" + "0000" + "0001"
+        p2 = "139" + "0000" + "0002"
+        seen = {}
+
+        def run():
+            flow = self._flow("api.openai.com", "/v1/chat/completions",
+                              {"messages": [{"role": "user",
+                                             "content": "电话%s 备用%s" % (p1, p2)}]})
+            _drive_request(flow)
+            masked = json.loads(flow.request.content)["messages"][0]["content"]
+            seen["toks"] = re.findall(r"\{\{PHONE_[a-z0-9]+\}\}", masked)
+            self.assertEqual(len(seen["toks"]), 2, "两个号码都应被签发占位符")
+            # 模拟映射丢失（复用表淘汰 / 引擎重启后未预热）：只打掉第一个 token
+            sid = next(iter(tr.sessions))
+            tr.sessions[sid]["rev"].pop(seen["toks"][0], None)
+            tr._tables().rev.pop(seen["toks"][0], None)
+            # 响应只回显第一个（映射已丢）→ 应标「回显但未还原」；第二个模型没提
+            flow.response = SimpleNamespace(
+                headers={"content-type": "application/json"},
+                status_code=200,
+                content=json.dumps({"choices": [{"message": {
+                    "content": "配置完成：" + seen["toks"][0]}}]},
+                    ensure_ascii=False).encode("utf-8"),
+            )
+            asyncio.run(tr.response(flow))
+
+        captured = self._capture(run)
+        restore = [kw for typ, kw in captured if typ == "RESTORE"][0]
+        by_tok = {it["tok"]: it for it in restore["items"]}
+        echoed = by_tok[seen["toks"][0]]
+        self.assertFalse(echoed["restored"], "映射已丢，不可能是已还原")
+        self.assertTrue(echoed.get("unresolved"), "回显但未还原必须带 unresolved 标记")
+        not_echoed = by_tok[seen["toks"][1]]
+        self.assertFalse(not_echoed["restored"], "模型没提该实体")
+        self.assertNotIn("unresolved", not_echoed, "模型没提不得被标成未还原")
+
     def test_restore_scrubs_cross_session_restored_credential_plaintext_from_dialog(self):
         """跨请求经 _RECENT_REV 还原的历史凭据，若模型复述了凭据明文，也必须在 dialog/resp_preview 中被精确清洗。"""
         # 请求 1：脱敏连接串密码并签发占位符
@@ -4327,12 +4397,35 @@ class LoosePlaceholderRestoreTests(_RuleTestBase):
         self.assertEqual(s["degraded"], 0)
 
     def test_unknown_lookalikes_are_never_touched(self):
-        """没发过的 token 一律原样放过——这是兜底不误伤的唯一保证。"""
-        tr._new_session("loose-fp")
+        """没发过的 token 一律原样放过——这是兜底不误伤的唯一保证。
+
+        再加一层反向锁：**裸形态的存量 hex6 后缀不再污染 unresolved**。
+        2026-10-13 真机事件库实测：`desktop-backup-20261013_171839`、
+        `262Z_01a11b` 这类自然文本会被宽松正则的无花括号分支整段吃下，
+        查表必然失败 → 当天十余条「未还原」全是误报（屏幕上本来就是正常日期）。
+        """
+        sid = "loose-fp"
+        tr._new_session(sid)
         for text in ["版本 ABC_123456", "变量 MAX_a1b2c3", "日志 ERROR_ff00aa 出现",
-                     "{{FAKE_abcdef}}", "路径 /var/LOG_012345"]:
+                     "路径 /var/LOG_012345", "备份目录 desktop-backup-20261013_171839 已创建"]:
             with self.subTest(text=text):
-                self.assertEqual(tr.restore_final(text, "loose-fp"), text)
+                self.assertEqual(tr.restore_final(text, sid), text)
+        self.assertEqual(int(tr.sessions[sid].get("unresolved") or 0), 0,
+                         "裸 hex6 形态的自然文本不得计成未还原")
+
+    def test_braced_and_consonant_lookalikes_still_counted(self):
+        """收紧计数的反向锁：带花括号形态与纯辅音后缀查不到时必须计数。
+
+        它们命中即「真·占位符形态没还原」，藏起来等于静默漏报。
+        """
+        sid = "loose-fp-count"
+        tr._new_session(sid)
+        for text in ["{{FAKE_abcdef}}", "{{FAKE_bcdfgh}}", "前缀 {{FAKE_bcdfgh",
+                     "变量 MAX_bcdfgh 出现"]:
+            with self.subTest(text=text):
+                self.assertEqual(tr.restore_final(text, sid), text)
+        self.assertEqual(int(tr.sessions[sid].get("unresolved") or 0), 4,
+                         "带花括号与纯辅音后缀的查不到必须计数")
 
     def test_degraded_is_reported_separately_from_restored(self):
         """用户要能在日志里看出「这次是靠兜底救回来的」，而不是一切正常。"""
@@ -6501,6 +6594,57 @@ class EscapedAndRewrittenPlaceholderTests(_RuleTestBase):
                                      f"{name} 在切点 {i} 漏了残渣（前缀 {text[:i]!r}）")
             # 收尾：同一形态整包还原也必须干净
             self.assertEqual(self._restore(sid, text)[0], expected, f"{name} 整包还原失败")
+
+    def test_streaming_matches_whole_for_any_split(self):
+        """属性测试：多 token 多形态混排时，任意切分点的流式拼接 == 整段还原。
+
+        只测「单 token 五种形态切两半」不够——真实流式是多种形态混在正文里，
+        切点可能落在 token 中间、反斜杠与花括号之间、普通文本中间。这里升级为
+        属性测试：先枚举**所有单切点**，再用固定种子跑 40 组随机多切点，
+        每组的拼接输出必须与 `restore_final` 的整段输出逐字一致。
+
+        不纳入等价集合的形态：**裸 token**（花括号被完全剥掉）。裸形态的残片
+        不会被 `_PARTIAL_RX` 扣留（那要求以 `{`/反斜杠结尾，否则会把任意普通
+        文本都扣住），所以它跨 chunk 本就不保证还原——这是设计取舍，
+        见 `_PARTIAL_RX` 的注释，单块/整段路径另有用例覆盖。
+        """
+        import random
+        sid, tok, _ = self._mint("esc-prop")
+        body = tok[2:-2]
+        lower = body.lower()
+        esc = self.BS + "{" + self.BS + "{" + body + self.BS + "}" + self.BS + "}"
+        text = (
+            "部署 " + tok + "\n"
+            "小写 {{" + lower + "}}\n"
+            "转义 " + esc + "\n"
+            "路径 C:" + self.BS + "Users" + self.BS + "me" + self.BS + "file.txt\n"
+            "时间 20261013_171839 结束"
+        )
+        expected = tr.restore_final(text, sid)
+        self.assertIn(self.IP, expected, "前置：至少有一个形态必须还原成功")
+        self.assertNotIn("{{", expected, "前置：整段还原不得留下占位符形态")
+
+        def feed(cuts):
+            tr.sessions[sid]["pending"].clear()
+            out = ""
+            prev = 0
+            for cp in cuts:
+                out += tr.restore(text[prev:cp], sid)
+                prev = cp
+            out += tr.restore(text[prev:], sid, final=True)
+            return out
+
+        # 1) 所有单切点
+        for i in range(1, len(text)):
+            with self.subTest(模式="单切点", 切点=i):
+                self.assertEqual(feed([i]), expected, f"单切点 {i} 不等价")
+        # 2) 固定种子的随机多切点（2~5 段），保证 CI 可复现
+        rnd = random.Random(20261013)
+        for n in range(40):
+            k = rnd.randint(2, 5)
+            cuts = sorted(rnd.sample(range(1, len(text)), min(k, len(text) - 1)))
+            with self.subTest(模式="随机多切点", 组=n, 切点=cuts):
+                self.assertEqual(feed(cuts), expected, f"切点 {cuts} 不等价")
 
     def test_backslash_ending_chunk_is_delayed_not_dropped(self):
         """已知代价的边界：行尾裸反斜杠会被多扣一个 chunk，但内容不许丢。

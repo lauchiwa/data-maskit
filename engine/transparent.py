@@ -4043,7 +4043,9 @@ _BRACED_PLACEHOLDER_RX = re.compile(
 # 严格正则匹配不到 → 整个还原被跳过 → 用户拿到一个假 token 去执行。
 #
 # 这条只做兜底修复，且**只替换我们自己发过的 token**（必须能在会话/复用表里查到），
-# 所以不存在误伤：LABEL_后缀 这种组合（6 位纯辅音或存量 hex6）正常文本里不会自然出现，何况还要求查得到。
+# 所以替换面上不存在误伤。但「LABEL_后缀 正常文本不会自然出现」只对**带花括号**形态成立：
+# 无花括号的裸 hex6 形态会被日期串/短哈希命中（2026-10-13 真机实测），
+# 替换查不到时原样放行，**计数**面上裸 hex6 已单独收紧（判据见 `_loose_sub`）。
 _LOOSE_PLACEHOLDER_RX = re.compile(
     r"\{{1,2}\s*([A-Za-z0-9_]{1,12}_" + _SUFFIX_PAT + r")\s*\}{0,2}|([A-Z0-9]{1,12}_" + _SUFFIX_PAT + r")"
 )
@@ -5217,6 +5219,7 @@ def restore(text, sid, channel="", escape=False, final=False):
             with _STATE_LOCK:      # B-1a ②
                 s["unresolved"] = s.get("unresolved", 0) + 1
                 _record_unresolved_sample(s, whole)
+                _note_unresolved_echo(s, suffix)
             return whole
         with _STATE_LOCK:          # B-1a ②：计数 + 集合去重追加必须一起进锁
             s["restored"] = s.get("restored", 0) + 1
@@ -5255,6 +5258,7 @@ def restore(text, sid, channel="", escape=False, final=False):
                     with _STATE_LOCK:      # B-1a ②
                         s["unresolved"] = s.get("unresolved", 0) + 1
                         _record_unresolved_sample(s, whole)
+                        _note_unresolved_echo(s, m.group(2))
                 return whole
             with _STATE_LOCK:              # B-1a ②
                 s["restored"] = s.get("restored", 0) + 1
@@ -5288,22 +5292,42 @@ def restore(text, sid, channel="", escape=False, final=False):
                 if real is not None:
                     orig = _lookup(real, sid)
             if orig is None:
-                # 这一遍的形态判据（`_LOOSE_PLACEHOLDER_RX`）本身就要求
-                # `LABEL_` + 6 位 hex 或 6 位纯辅音后缀——注释里已论证过
-                # 「这种组合正常文本里不会自然出现」，与替换判据同源，
-                # 所以查不到时同样计数，不会因为「怕是残片」就把漏还原藏起来。
+                # 这一遍的形态判据（`_LOOSE_PLACEHOLDER_RX`）要求
+                # `LABEL_` + 6 位 hex 或 6 位纯辅音后缀。原注释断言
+                # 「这种组合正常文本里不会自然出现」——**已被真机事件库证伪**
+                # （2026-10-13）：`desktop-backup-20261013_171839` 这类备份目录名、
+                # `262Z_01a11b` 这类标识片段，都能被**不带花括号的第二分支**整段
+                # 吃下，查表必然失败，于是每次都被计成 unresolved（当天十余条
+                # 「未还原」全是这种误报，屏幕上本来就是完全正常的日期文本）。
                 #
-                # ⚠️ 唯一例外：前一字符是反斜杠 → 这是 `\{\{X\}\}` 的**内部片段**
+                # 计数判据因此收紧（**只改计数，替换判据不动**——查得到原文的
+                # 仍照常还原，见函数头）：
+                #   · 裸形态（无任何花括号）且后缀全是存量 hex 字符 → 不计数。
+                #     日期/时间戳/短哈希天然是 hex6，自然文本的误报面全在这里；
+                #   · 带或半带花括号（`{{X}}` / `{{X`）→ 仍计数：形态本身就说明
+                #     模型在写占位符，漏还原必须可见；
+                #   · 纯辅音后缀（新格式）→ 仍计数：辅音表不含 aeiou 与数字，
+                #     自然文本几乎不出现，命中即真。
+                # 漏计面：模型剥花括号 + 映射丢失 + 存量 hex6 三者同时成立时不再
+                # 计数（极罕见；且原样放行不猜的行为不变）——方向保守，优先消除误报。
+                #
+                # ⚠️ 另一个例外：前一字符是反斜杠 → 这是 `\{\{X\}\}` 的**内部片段**
                 # （本遍的 `\{{1,2}` 会从转义块的第 2 个 `{` 开始匹配），上一遍已
                 # 处理并计数过；不排除就会把转义形态计两次（实测报成 2，样本里
                 # 同时留下 `\{\{X\}\}` 与 `{X}` 两条）。
                 # **只能在计数上排除，不能提前 return**：提前 return 会连
                 # 「该片段其实查得到原文、本该被还原」的情况一起跳过——
                 # 实测这一版直接把 test_t7 打红（响应里该有的还原没了）。
-                if not (m.start() > 0 and m.string[m.start() - 1] == "\\"):
+                bare_legacy = (
+                    m.group(2) is not None
+                    and all(ch in "0123456789abcdef" for ch in tok_body.rsplit("_", 1)[-1])
+                )
+                if (not (m.start() > 0 and m.string[m.start() - 1] == "\\")
+                        and not bare_legacy):
                     with _STATE_LOCK:      # B-1a ②
                         s["unresolved"] = s.get("unresolved", 0) + 1
                         _record_unresolved_sample(s, whole)
+                        _note_unresolved_echo(s, tok_body.rsplit("_", 1)[-1])
                 return whole
             with _STATE_LOCK:              # B-1a ②
                 s["restored"] = s.get("restored", 0) + 1
@@ -5700,6 +5724,27 @@ _JSON_STR_KEYS = {"arguments", "partial_json"}
 _RESTORE_MAX_DEPTH = 24
 
 
+def _note_restore_signed_skip(sid):
+    """记一次「响应侧按协议契约不还原的块」。
+
+    与请求侧的 `_note_signed_block_skip` 对称：那边记「该块没扫描」，这边记
+    「该块没还原」。两者都是**显式豁免的漏检/漏还原路径**，静默就等于用户以为
+    处理过了（请求侧踩过同一个坑：豁免无计数时，屏幕上可见与统计完全脱节）。
+
+    计数按「块」而非「增量事件」：完整块（非流式）与块起始快照（SSE 的
+    `content_block_start`）各计 1，`thinking_delta` 这类块内增量不重复计——
+    否则一个几千字的思考块会报出几百次。OpenRouter 流式把 `reasoning.text` /
+    `reasoning.encrypted` 直接作为增量数组元素下发（元素自身看不出是增量），
+    那里会按元素计，口径同样是「跳过的对象数」，不追求跨协议完全一致的块粒度。
+
+    只累加在会话上、由 RESTORE 事件读取；取不到会话时不记
+    （探测/单测路径不能因此抛异常）。
+    """
+    s = _session_get(sid)
+    if isinstance(s, dict):
+        s["restore_signed_skipped"] = int(s.get("restore_signed_skipped") or 0) + 1
+
+
 def _count_unresolved(sid, n=1):
     """会话级 unresolved 计数（与 restore() 维护同一字段，只用于诊断展示）。"""
     s = _session_get(sid)
@@ -5735,6 +5780,35 @@ def _record_unresolved_sample(s, tok):
             lst = s["unresolved_samples"] = []
         if len(lst) < _UNRESOLVED_SAMPLES_MAX and tok not in lst:
             lst.append(tok)
+    except Exception:
+        pass
+
+
+# 「回显但未还原」的后缀集合上限。
+# 只用于 RESTORE 明细的三态展示：item 最多 30 条，200 足够；
+# 封顶是为了不让超长响应把会话内存撑大（模型可以自造大量后缀）。
+_UNRESOLVED_ECHO_MAX = 200
+
+
+def _note_unresolved_echo(s, suffix):
+    """记录「模型回显了但没还原」的占位符后缀（仅用于诊断展示）。
+
+    为什么需要它：RESTORE 明细里每个签发过的占位符只有二元标记 `restored`，
+    「模型压根没提」（正常）与「模型回显了但映射丢失」（要排查）在前端看起来
+    完全一样——用户以为「又没还原」，实际多数只是模型没用上那个实体。
+    后缀集合让前端能分出第三个状态（见 EventDetailDialog 的 unresolvedEcho）。
+
+    只做诊断、不参与任何还原决策；集合大小封顶，异常一律吞掉。
+    调用点必须在 `_STATE_LOCK` 内（与 unresolved 计数同一临界区）。
+    """
+    try:
+        if not suffix:
+            return
+        cur = s.get("unresolved_suffixes")
+        if not isinstance(cur, set):
+            cur = s["unresolved_suffixes"] = set()
+        if len(cur) < _UNRESOLVED_ECHO_MAX:
+            cur.add(str(suffix).lower())
     except Exception:
         pass
 
@@ -5830,6 +5904,11 @@ def _restore_tree(obj, sid, key=None, depth=0):
         # 整包/回退（`_restore_json_body`）与 NDJSON 同样靠这里。
         # 注意：挡的是**块**，不是字段名——同名业务字段仍照常还原。
         if obj.get("type") in _RESTORE_SKIP_BLOCK_TYPES:
+            # 契约豁免必须计数（与请求侧 `signed_blocks_skipped` 对称、同一理由：
+            # 静默豁免等于用户以为还原管线处理过了）。块内增量不重复计，
+            # 判据与理由见 `_note_restore_signed_skip`。
+            if not str(obj.get("type") or "").endswith("_delta"):
+                _note_restore_signed_skip(sid)
             return obj
         return {k: _restore_tree(v, sid, k, depth + 1) for k, v in obj.items()}
     return obj
@@ -10345,6 +10424,7 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
     restored_unique = len(s.get("restored_tokens", set()) or set())
     unresolved = int(s.get("unresolved", 0) or 0)
     degraded = int(s.get("degraded", 0) or 0)
+    restore_signed_skipped = int(s.get("restore_signed_skipped") or 0)
     if masked_count == 0:
         restore_status = "no_sensitive_data"
     elif unresolved > 0:
@@ -10404,6 +10484,10 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
     items = []
     try:
         restored_tokens = s.get("restored_tokens") or set()
+        # 「模型回显了但没还原」的后缀集合：让前端把这一项与「模型压根没提」分开显示。
+        # 不做这一层区分时，两者都是 `restored=false`，用户把“模型没用上这个实体”（正常）
+        # 误读成“又没还原”（要排查）。
+        unresolved_suffixes = set(s.get("unresolved_suffixes") or ())
         seen_toks = set()
         for orig, tok in list(s.get("fwd", {}).items())[:30]:
             seen_toks.add(tok)
@@ -10417,6 +10501,8 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
                 "length": len(orig),
                 "preview": _preview(orig, lbl),
                 "restored": tok in restored_tokens,
+                **({"unresolved": True}
+                   if (m and (m.group(2) or "").lower() in unresolved_suffixes) else {}),
             }
             # 凭据类不明文落库（与 MASK 口径一致），详情弹窗只显示打码预览
             if is_cred:
@@ -10499,6 +10585,10 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
         # RESTORE 事件，让用户看得见」，实际 _emit 参数里没有它，于是
         # 「靠兜底修回来的」这件事永远查不到。0.1.14 补上。
         degraded=degraded,
+        # 响应侧契约豁免计数（与 MASK 侧同名，语义按事件方向区分：
+        # MASK = 请求里未扫描的块数，RESTORE = 响应里未还原的块数）。
+        # 缺省不带字段，避免常态噪声（与请求侧同一做法）。
+        **({"signed_blocks_skipped": restore_signed_skipped} if restore_signed_skipped else {}),
         success=bool(ok) and unresolved == 0,
         msg=hint,
         # status 兼容 SQLite 已有列/历史数据；restore_status 是前端统一读取的键

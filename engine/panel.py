@@ -7505,6 +7505,11 @@ def api_ext_restore():
                 # 未还原占位符样本：只用于定位「到底是哪些 token 没还原、什么形态」。
                 # 存的是占位符本身（不含任何明文），落库安全。取不到就是空列表。
                 unresolved_samples = [str(x) for x in (s.get("unresolved_samples") or [])][:5]
+                # 「回显但未还原」的后缀集合与响应侧契约豁免块数：与代理链路同源读取。
+                # 前者区分「模型没提」与「回显了但映射丢了」，后者让签名思考块豁免
+                # 在扩展链路的详情页也可见（与 MASK 侧 signed_blocks_skipped 对称）。
+                unresolved_suffixes = set(s.get("unresolved_suffixes") or ())
+                restore_signed_skipped = int(s.get("restore_signed_skipped") or 0)
                 # 会话不存在时 restore() **只数不还原**（安全门：放行会让自造 sid 借
                 # 全局复用表还原占位符），计数落在兜底表里，这里并进本次事件——
                 # 否则「重启引擎后打开历史对话，页面上满屏 {{...}}」在事件页是 0。
@@ -7529,6 +7534,10 @@ def api_ext_restore():
                             "length": len(orig),
                             "preview": tr._preview(orig, lbl),
                             "restored": tok in restored_tokens,
+                            # 模型回显了该占位符但未能还原（后缀命中未还原集合）——
+                            # 与「模型压根没提」是两回事，前端据此分两个章展示。
+                            **({"unresolved": True}
+                               if (m and (m.group(2) or "").lower() in unresolved_suffixes) else {}),
                         }
                         if is_cred:
                             item["cred"] = True
@@ -7585,6 +7594,9 @@ def api_ext_restore():
                 tr._emit("RESTORE", ingress="ext", sid=sid,
                          restored=restored, unresolved=unresolved, degraded=degraded,
                          unresolved_samples=unresolved_samples,
+                         # 响应侧契约豁免计数（与 MASK 侧同名；缺省不带，避免噪声）
+                         **({"signed_blocks_skipped": restore_signed_skipped}
+                            if restore_signed_skipped else {}),
                          items=items,
                          resp_preview=_out_text[:800],
                          dialog=_out_text[:4000],

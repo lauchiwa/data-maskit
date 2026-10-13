@@ -190,6 +190,13 @@ export interface EventItem extends SlimItem {
   tok?: string
   sha256?: string
   length?: number
+  /** RESTORE：本轮回复里是否还原出了该占位符。 */
+  restored?: boolean
+  /**
+   * RESTORE：模型回显了该占位符但未能还原（引擎查不到原文映射）。
+   * 与 `restored=false` 且无此标记的「模型压根没提」是两回事。
+   */
+  unresolved?: boolean
 }
 
 export interface ShieldEvent {
@@ -247,7 +254,11 @@ export interface ShieldEvent {
   completeness?: 'complete' | 'partial' | 'failed' | 'not_applicable' | 'unknown'
   /** 原因码计数（NER 降级 / 协议契约豁免 / 阻断原因），键见 EventDetailDialog 的标签表。 */
   reason_codes?: Record<string, number>
-  /** 签名思考块整块未扫描的块数（协议契约豁免，属漏检路径故必须可见）。 */
+  /**
+   * 协议契约豁免的块数。方向按事件类型区分：
+   * MASK = 请求里未扫描的块数；RESTORE = 响应里未还原的块数
+   * （签名/密文思考块，改写会让上游逐字校验失败）。属漏检/漏还原路径，故必须可见。
+   */
   signed_blocks_skipped?: number
   items: SlimItem[] | EventItem[]
   dialog?: string

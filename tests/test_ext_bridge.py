@@ -1275,6 +1275,31 @@ class ExtEventFieldParityTests(ExtBridgeTestCase):
                          "unresolved 必须进事件，否则日志页的「未还原」告警对扩展流量永不触发")
         self.assertEqual(ev.get("degraded"), 0, "degraded 需要有心跳值（0 也是值）")
 
+    def test_restore_items_distinguish_echoed_from_not_echoed(self):
+        """ext 链路同样区分「回显但未还原」与「模型没提」（与代理链路同源）。
+
+        只有 `restored=false` 单个标记时，模型没用上某个实体（正常）会被读成
+        「又没还原」（要排查）——两个链路的 items 都必须给出第三态。
+        """
+        j = self._mask('{"c":"电话%s 备用%s"}' % ("139" + "0000" + "0001",
+                                                  "139" + "0000" + "0002")).get_json()
+        toks = re.findall(r"\{\{PHONE_[a-z0-9]+\}\}", j["masked_text"])
+        self.assertEqual(len(toks), 2, "两个号码都应被签发占位符")
+        sid = j["sid"]
+        # 模拟映射丢失（复用表淘汰 / 引擎重启后未预热）：只打掉第一个 token
+        tr.sessions[sid]["rev"].pop(toks[0], None)
+        tr._tables().rev.pop(toks[0], None)
+        # 只回显第一个（映射已丢）→ 「回显但未还原」；第二个模型没提
+        self._restore(toks[0], sid, stream_id="items-echo", final=True, escape=True)
+
+        ev = self._newest_ext_event("RESTORE")
+        by_tok = {it["tok"]: it for it in ev.get("items") or []}
+        echoed = by_tok[toks[0]]
+        self.assertFalse(echoed["restored"], "映射已丢，不可能是已还原")
+        self.assertTrue(echoed.get("unresolved"), "回显但未还原必须带 unresolved 标记")
+        not_echoed = by_tok[toks[1]]
+        self.assertNotIn("unresolved", not_echoed, "模型没提不得被标成未还原")
+
     def test_restore_event_must_not_feed_proxy_only_aggregates(self):
         j = self._mask('{"c":"13812345678 zhang@example.com"}').get_json()
         self._restore(j["masked_text"], j["sid"], stream_id="parity2", final=True, escape=True)

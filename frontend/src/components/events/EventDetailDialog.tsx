@@ -572,6 +572,15 @@ export function EventDetailDialog({
               </div>
             )}
 
+            {/* 响应侧契约豁免计数：签名/密文思考块按协议不还原（改写会让上游逐字校验失败）。
+                没有它时，屏幕上能看见块里保留的占位符形态、统计里却是零，
+                用户无从判断它到底被处理过了还是被漏掉了。与 MASK 侧同名计数对称。 */}
+            {event.type === 'RESTORE' && (event.signed_blocks_skipped ?? 0) > 0 && (
+              <div className="rounded-lg border bg-muted/30 p-2.5 text-xs leading-relaxed text-muted-foreground">
+                {tf('detail.signedBlocksKept', { n: String(event.signed_blocks_skipped) })}
+              </div>
+            )}
+
             {/* 脱敏/还原项目对照（明文 → 占位符 / 占位符 → 明文） */}
             {event.items && event.items.length > 0 ? (
               <div>
@@ -581,12 +590,16 @@ export function EventDetailDialog({
                     : tf(event.type === 'RESTORE' ? 'detail.restoreItems' : 'detail.maskItems', { n: event.items.length })}
                 </h3>
                 <div className="space-y-2">
-                  {(event.items as { label: string; original?: string; preview?: string; tok?: string; hash?: string; length?: number; restored?: boolean; from_history?: boolean }[]).map(
+                  {(event.items as { label: string; original?: string; preview?: string; tok?: string; hash?: string; length?: number; restored?: boolean; unresolved?: boolean; from_history?: boolean }[]).map(
                     (item, idx) => {
                       const isRestored = (event.type === 'RESTORE' && item.restored !== false) || item.restored === true
                       const notRestored = event.type === 'RESTORE' && item.restored === false
+                      // 「回显但未还原」= 模型复述了该占位符，但引擎查不到原文映射
+                      // （映射过期 / 引擎重启 / 复用表淘汰）。与「模型压根没提」
+                      // （notRestored 且无此标记）处置完全不同：前者要查映射，后者本来正常。
+                      const unresolvedEcho = notRestored && item.unresolved === true
                       return (
-                        <div key={item.label + idx} className={cn("rounded-lg border bg-card p-3", isRestored && "border-emerald-500/30 bg-emerald-500/5")}>
+                        <div key={item.label + idx} className={cn("rounded-lg border bg-card p-3", isRestored && "border-emerald-500/30 bg-emerald-500/5", unresolvedEcho && "border-amber-500/30 bg-amber-500/5")}>
                           <div className="flex items-center justify-between gap-2">
                             <div className="flex items-center gap-2">
                               {isRestored && (
@@ -595,10 +608,16 @@ export function EventDetailDialog({
                                   <span>{t('detail.itemRestored')}</span>
                                 </span>
                               )}
-                              {notRestored && (
+                              {notRestored && !unresolvedEcho && (
                                 <span className="flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground" title={t('detail.itemNotRestored')}>
                                   <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/50" />
                                   <span>{t('detail.itemNotRestored')}</span>
+                                </span>
+                              )}
+                              {unresolvedEcho && (
+                                <span className="flex items-center gap-1 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400" title={t('detail.itemUnresolvedEchoHint')}>
+                                  <span className="h-1.5 w-1.5 rounded-full bg-amber-500/70" />
+                                  <span>{t('detail.itemUnresolvedEcho')}</span>
                                 </span>
                               )}
                               <Badge variant="outline" className="font-mono text-[11px]">
