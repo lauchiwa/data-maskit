@@ -335,6 +335,45 @@ class StreamConcludedMarkerTests(unittest.TestCase):
         self.assertNotEqual(flow.metadata.get("shield_response_concluded"), "stream_done")
         tr.sessions.pop(sid, None)
 
+    def test_terminal_event_concludes_without_body_end(self):
+        """上游宣告结束后必须当场收尾，不能死等 body 结束。
+
+        实测（2026-10-13 生产 + 本地复现）：上游发完 `data: [DONE]` 后不发 chunked
+        终止块、连接一直挂着，mitmproxy 永远等不到 body 结束 → 末块回调不执行；
+        而客户端见到 DONE 就关连接。结果是不写 RESTORE（还原统计/费用/会话链路
+        整段缺失），还把正常收尾记成 `client_disconnected` 取消。
+        """
+        sid = "cancel-terminal-event"
+        flow, stream = self._open_stream(sid)
+        stream(b"data: [DONE]\n\n")   # 终止事件：此后不会再有末块回调
+
+        self.assertEqual(flow.metadata.get("shield_response_concluded"), "stream_done",
+                         "上游已宣告结束，收尾必须当场完成")
+        self.assertTrue([t for t, _ in self.events if t == "RESTORE"],
+                        "缺还原记录：面板上这条请求就只剩脱敏耗时、没有成功/失败")
+        tr.aux_drain(5.0)
+
+    def test_partial_chunk_does_not_conclude(self):
+        """对照组：普通内容块绝不能触发收尾（否则一条流会被自己的正文腰斩）。"""
+        sid = "cancel-partial"
+        flow, stream = self._open_stream(sid)
+        stream(b'data: {"choices":[{"delta":{"content":"still going"}}]}\n\n')
+        self.assertNotEqual(flow.metadata.get("shield_response_concluded"), "stream_done")
+        tr.sessions.pop(sid, None)
+
+    def test_single_choice_finish_reason_is_not_stream_level(self):
+        """单个 choice 的 finish_reason 只结束那个通道，不是流级终止。
+
+        多 choice（n>1）场景下另一个 choice 可能还在吐字；把部分通道的终态当整条流
+        的终态，会提前收尾并切断仍在生成的通道——比丢一条记录严重。流级终止只认
+        `[DONE]` 与显式终止事件类型（见 `_sse_terminal_prefixes` 的 `None` 语义）。
+        """
+        sid = "cancel-partial-choice"
+        flow, stream = self._open_stream(sid)
+        stream(b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n')
+        self.assertNotEqual(flow.metadata.get("shield_response_concluded"), "stream_done")
+        tr.sessions.pop(sid, None)
+
     def test_stream_stamps_the_last_upstream_byte(self):
         """数据块到达时刻必须由流回调落盘。
 

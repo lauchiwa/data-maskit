@@ -582,13 +582,37 @@ def _c1_stop():
     _C1_SIDECAR_FAILED = False
 
 
+def _c1_expected_origins():
+    """当前路由表声明的上游 origin 集合（= sidecar 白名单应有的内容）。
+
+    与 sidecar 同源（共用 `upstream_sidecar.allowed_origins_for`），读的是热重载后刚
+    发布的 `UPSTREAMS`——与 `_c1_any_takeover_enabled()` 同一份表，避免“按 A 判要不要
+    接管、按 B 判白名单”这种判据分裂。模块缺失时返回 None：那时 sidecar 也起不来，
+    属于另一条已归因的失败路径（`_c1_ensure_started` 会记日志）。
+    """
+    try:
+        from upstream_sidecar import allowed_origins_for
+    except Exception:
+        return None
+    try:
+        return allowed_origins_for(UPSTREAMS)
+    except Exception:
+        return None
+
+
 def _c1_reconcile(settings):
     """配置热重载后让 sidecar 与配置对齐。
 
-    不处理就会留下两种「面板说了不算」的状态（2026-10-10 审计）：
+    不处理就会留下三种「面板说了不算」的状态（②见 2026-10-10 审计，③见 2026-10-13）：
     ① 用户把 takeover 全关掉——监听与连接池照旧在跑，面板开关和真实数据路径解耦；
     ② 用户改了出口代理——sidecar 在**构造时**就把 egress 读进了 httpx 客户端，
-       热重载不重读，等于「改了代理但转发照旧」，且没有任何提示。
+       热重载不重读，等于「改了代理但转发照旧」，且没有任何提示；
+    ③ 用户改了上游 target——白名单同样是构造时定型的：热重载不重算，新 origin 就
+       不在白名单里，而 sidecar 对白名单外的 origin 是 **403 拒转**，不是「启动失败」
+       那条会退回直连的路径，于是没有任何回退、也没有提示，用户只看到「开关开着、
+       请求全挂」。比对用**全量 target** 而不是「仅接管中的 target」：白名单本来就是
+       全量构建的，而且用户可能先改 target、随后才给该上游开 takeover——只比接管
+       子集的话，后一步不会触发换代，新 origin 照样 403。
     这里只负责「摘下来交给循环去关」；重建由下一条请求的 `_c1_ensure_started()`
     按新配置惰性完成（`_C1_SIDECAR_FAILED` 一并清零，好让此前失败的配置改完能重试）。
     """
@@ -596,15 +620,24 @@ def _c1_reconcile(settings):
     if _C1_SIDECAR is None:
         _C1_SIDECAR_FAILED = False
         return
-    stale = (not _c1_any_takeover_enabled()
-             or _c1_egress_proxy_url(settings) != _C1_SIDECAR.egress_url)
-    if not stale:
+    # 三条判据各自独立归因：只写「配置已变更」的话，用户拿不到「为什么这次要换代」。
+    why = []
+    if not _c1_any_takeover_enabled():
+        why.append("接管已全部关闭")
+    if _c1_egress_proxy_url(settings) != _C1_SIDECAR.egress_url:
+        why.append("出口代理 %s -> %s" % (_C1_SIDECAR.egress_url or "off",
+                                          _c1_egress_proxy_url(settings) or "off"))
+    expected = _c1_expected_origins()
+    if expected is not None and expected != _C1_SIDECAR.allowed_origins:
+        why.append("上游白名单 +[%s] -[%s]" % (
+            ",".join(sorted(expected - _C1_SIDECAR.allowed_origins)[:3]) or "-",
+            ",".join(sorted(_C1_SIDECAR.allowed_origins - expected)[:3]) or "-"))
+    if not why:
         return
     old, _C1_SIDECAR = _C1_SIDECAR, None
     _C1_SIDECAR_TASK = None
     _C1_SIDECAR_FAILED = False
-    _log("[C1] 配置已变更（接管=%s / 出口代理=%s）：停用旧连接池，下一条请求按新配置重建"
-         % (_c1_any_takeover_enabled(), _c1_egress_proxy_url(settings) or "off"))
+    _log("[C1] 配置已变更（%s）：停用旧连接池，下一条请求按新配置重建" % "；".join(why))
     _retire_sidecar(old)
 
 
@@ -9777,11 +9810,15 @@ def _restore_ndjson_body(raw_bytes, sid):
     return "\n".join(out).encode("utf-8")
 
 
-def _restore_sse_event(block, sid, final=False):
+def _restore_sse_event(block, sid, final=False, terminal=None):
     """还原一个 SSE 事件块（可能含多行）。返回还原后的文本块。
 
     按事件粒度处理是流式透传的前提：一个事件到手立刻还原、立刻下发，
     首字延迟才不会等于整段生成时长。
+
+    `terminal` 非 None 时作为**出参**：本块宣告整条流结束就追加一项。判据只此一处
+    ——上游发完终止事件就不再发正文，客户端常据此立刻关连接，所以收尾必须能在
+    这里被认出来，而不是死等 body 结束（见 `_stream_owned` 的收尾分支）。
     """
     out_lines = []
     for line in block.split("\n"):
@@ -9790,6 +9827,8 @@ def _restore_sse_event(block, sid, final=False):
         if stripped.startswith("data:"):
             payload = stripped[5:].lstrip(" ")
             if payload.strip() == "[DONE]":
+                if terminal is not None:
+                    terminal.append("done")
                 tail = _flush_pending(sid)  # [DONE] 之前必须把缓冲吐净，客户端见到 DONE 就不再收了
                 if tail:
                     # tail 是完整 SSE 事件块（自带 \n\n），作为独立段插入，
@@ -9812,6 +9851,12 @@ def _restore_sse_event(block, sid, final=False):
                 out_lines.append(line)
                 continue
             ending = _sse_terminal_prefixes(data)
+            # `None` = 该事件类型本身宣告**整条流**结束（message_stop / message_delta /
+            # response.completed 等），可据此收尾；非空元组只宣告**部分通道**结束
+            # （多 choice 时另一个 choice 可能还在吐），绝不能当流级终止——那会把还在
+            # 生成的通道提前切断，比丢记录更严重。
+            if ending is None and terminal is not None:
+                terminal.append("event")
             # A terminal chunk can contain the final text fragment. Restore it
             # before flushing, and leave other choices' partial tokens buffered.
             _restore_sse_data(data, sid, final=final, final_prefixes=ending)
@@ -10164,12 +10209,17 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
                     _touch(sid)
             else:
                 # SSE 事件以空行分隔；只处理已完整到达的事件，半个事件留在缓冲里
+                terminal = []   # 出参：本块是否宣告整条流结束（见 `_restore_sse_event`）
                 while True:
                     idx = state["buf"].find("\n\n")
                     if idx < 0:
                         break
                     block, state["buf"] = state["buf"][:idx], state["buf"][idx + 2:]
-                    out.append(_restore_sse_event(block, sid, final=False) + "\n\n")
+                    del terminal[:]
+                    out.append(_restore_sse_event(block, sid, final=False,
+                                                  terminal=terminal) + "\n\n")
+                    if terminal:
+                        state["stream_terminal"] = True
                 # 异常上游防御：上游持续推送只有单换行（无 \n\n 双空行）或无换行的巨型数据，
                 # 导致 buf 无限累积超过 _SSE_BUF_MAX。优先在最后一个换行符切分以保留完整
                 # data: 行（避免破坏合法 JSON），无换行时整段强制还原清空。
@@ -10197,8 +10247,18 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
                 # 「我们卡在半个事件里」（buf 一直非空、out 恒为空）。
                 _log(f"[stream:dbg] {host} cb#{state['calls']} in={len(data)}B "
                      f"out={len(text)}B buf={len(state['buf'])} last={last}")
-            if last:
+            # 收尾有两条触发路径，缺一不可：
+            # ① `last`——body 正常结束（末块回调）；
+            # ② 上游在流里宣告了结束（`[DONE]` / message_stop 等）。
+            # ② 的必要性有实测（2026-10-13 生产 + 本地复现）：上游发完 `data: [DONE]`
+            # 后**不按 HTTP 规范发 chunked 终止块**并保持连接打开，body 永远等不到
+            # "结束"，末块回调也就永远不来；而客户端见到 DONE 就关连接——于是既不写
+            # RESTORE（还原统计/费用/会话链路整段缺失），还把正常收尾记成
+            # `client_disconnected` 取消（面板上只剩一行只有脱敏耗时的孤儿行）。
+            # 判据必须落在「上游已宣告结束」，而不是「body 字节流已关闭」。
+            if last or state.get("stream_terminal"):
                 _finish()
+            if last:
                 # 末块走 mitmproxy 的 ResponseEndOfMessage 分支，那里对 b"" 有
                 # 专门过滤（chunks == b"" -> []），返回 bytes 安全。
                 return text.encode("utf-8")

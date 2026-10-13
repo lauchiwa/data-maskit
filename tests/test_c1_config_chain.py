@@ -130,32 +130,86 @@ class TestC1Reconcile(unittest.TestCase):
         tr._C1_SIDECAR_FAILED = self._old_failed
         tr.UPSTREAMS = self._old_upstreams
 
-    def _fake_sidecar(self, egress_url):
+    # 夹具里的上游一律带 target：白名单是全量 target 算出来的，不带 target 的上游
+    # 会命中「规范化失败」告警，那是真实配置里不该出现的形状。
+    _TARGET = "https://a.example.com"
+    _ORIGINS = frozenset({"https://a.example.com:443"})
+
+    def _upstreams(self, takeover=True, target=None):
+        return [{"name": "a", "takeover": takeover,
+                 "target": target or self._TARGET}]
+
+    def _fake_sidecar(self, egress_url, origins=frozenset()):
+        """假 sidecar：`egress_url` 与 `allowed_origins` 都按真属性形状给。
+
+        `allowed_origins` 必须是真 frozenset——换代判据比的是集合内容，拿 MagicMock
+        当它会让「配置没变」误判成「白名单变了」，把该保持旧池的那几条测试变成假绿。
+        """
         fake = mock.MagicMock()
         fake.egress_url = egress_url
+        fake.allowed_origins = frozenset(origins)
         return fake
 
     def test_takeover_all_off_retires_sidecar(self):
         """全部上游关掉接管 → 旧连接池必须被摘掉（监听不该继续存在）。"""
-        tr.UPSTREAMS = [{"name": "a", "takeover": False}]
-        tr._C1_SIDECAR = self._fake_sidecar(None)
+        tr.UPSTREAMS = self._upstreams(takeover=False)
+        tr._C1_SIDECAR = self._fake_sidecar(None, self._ORIGINS)
         tr._c1_reconcile({"egress_proxy": None})
         self.assertIsNone(tr._C1_SIDECAR)
 
     def test_egress_change_retires_sidecar(self):
         """改了出口代理 → 旧池停用，下一条请求按新配置重建（代理变更不当没发生）。"""
-        tr.UPSTREAMS = [{"name": "a", "takeover": True}]
-        tr._C1_SIDECAR = self._fake_sidecar("http://127.0.0.1:7890")
+        tr.UPSTREAMS = self._upstreams()
+        tr._C1_SIDECAR = self._fake_sidecar("http://127.0.0.1:7890", self._ORIGINS)
         tr._c1_reconcile({"egress_proxy": parse_egress_proxy("http://127.0.0.1:7891")})
         self.assertIsNone(tr._C1_SIDECAR)
 
     def test_unchanged_config_keeps_sidecar(self):
         """配置没变就不要动连接池——重建等于把跨客户端复用的池子白白扔掉。"""
-        tr.UPSTREAMS = [{"name": "a", "takeover": True}]
-        fake = self._fake_sidecar("http://127.0.0.1:7890")
+        tr.UPSTREAMS = self._upstreams()
+        fake = self._fake_sidecar("http://127.0.0.1:7890", self._ORIGINS)
         tr._C1_SIDECAR = fake
         tr._c1_reconcile({"egress_proxy": parse_egress_proxy("http://127.0.0.1:7890")})
         self.assertIs(tr._C1_SIDECAR, fake)
+
+    def test_target_change_retires_sidecar(self):
+        """改了上游 target → 白名单里的 origin 变了，旧池必须退役。
+
+        旧池的白名单是**构造时**定型的。不换代的话新 origin 会被 403 拒转——而那是
+        「拒转」不是「启动失败」，没有退回直连的那条路，用户只看到开关开着、请求全挂。
+        """
+        tr.UPSTREAMS = [{"name": "a", "takeover": True,
+                         "target": "https://new.example.com"}]
+        tr._C1_SIDECAR = self._fake_sidecar(None, {"https://old.example.com:443"})
+        tr._c1_reconcile({"egress_proxy": None})
+        self.assertIsNone(tr._C1_SIDECAR)
+
+    def test_target_path_change_keeps_sidecar(self):
+        """只改路径/查询串不算白名单变化——白名单只认 origin，不该为它换代。
+
+        路径属于转发时拼接的部分（另有热重载路径），换代只会白白拆掉连接池。
+        """
+        tr.UPSTREAMS = [{"name": "a", "takeover": True,
+                         "target": "https://x.example.com/v1?api-version=2"}]
+        fake = self._fake_sidecar(None, {"https://x.example.com:443"})
+        tr._C1_SIDECAR = fake
+        tr._c1_reconcile({"egress_proxy": None})
+        self.assertIs(tr._C1_SIDECAR, fake)
+
+    def test_non_takeover_target_change_retires_sidecar(self):
+        """未开 takeover 的上游改了 target 也要换代。
+
+        白名单是**全量** target 构建的：只比「接管中的子集」会漏掉
+        「先改 target、随后才给这个上游开 takeover」这一步——那一步不触发换代，
+        新 origin 照样 403。
+        """
+        tr.UPSTREAMS = [{"name": "keep", "takeover": True,
+                         "target": "https://keep.example.com"},
+                        {"name": "new", "takeover": False,
+                         "target": "https://new.example.com"}]
+        tr._C1_SIDECAR = self._fake_sidecar(None, {"https://keep.example.com:443"})
+        tr._c1_reconcile({"egress_proxy": None})
+        self.assertIsNone(tr._C1_SIDECAR)
 
     def test_failed_start_is_retried_after_config_change(self):
         """此前启动失败过的配置，改完配置必须能重试（失败标记清零）。"""
@@ -164,7 +218,6 @@ class TestC1Reconcile(unittest.TestCase):
         tr._C1_SIDECAR_FAILED = True
         tr._c1_reconcile({"egress_proxy": None})
         self.assertFalse(tr._C1_SIDECAR_FAILED)
-
 
 if __name__ == "__main__":
     unittest.main()

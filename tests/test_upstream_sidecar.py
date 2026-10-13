@@ -23,9 +23,17 @@ from upstream_sidecar import (
     _MAX_REQUEST_BODY,
     _SHUTDOWN_GRACE_S,
     _UPSTREAM_HEADER,
+    allowed_origins_for,
     normalize_origin,
 )
 from shield_defaults import parse_egress_proxy
+
+# 连不上的上游：**用环回未监听端口，不要用外部域名**。本文件契约是「不依赖外部网络」，
+# 而实测（2026-10-13）本机 /etc/resolv.conf 指向深信服 DNS stub，解析不存在的域名要
+# 10~15 秒才失败；测试客户端超时是 10 秒，会先炸成 ReadTimeout，用例变成看 DNS 脸色的
+# 假红（连跑 5 次失败 4 次）。拒连与解析失败在 httpx 里同属 `ConnectError`，侧车走的是
+# 同一条 fail-closed 路径，换成环回端口后判据不变、且立即可复现。
+_UNREACHABLE_TARGET = "https://127.0.0.1:1"
 
 
 class MockUpstream:
@@ -242,14 +250,16 @@ class TestUpstreamSidecar(unittest.IsolatedAsyncioTestCase):
         # 自定义头应该透传
         self.assertEqual(last_headers.get("x-custom"), "test-value")
 
-    async def test_tls_fail_closed(self):
-        """无效上游 → fail-closed 502（连接失败不放行）。"""
-        # 先把它登记进白名单：本用例测的是 TLS/DNS 失败后的 fail-closed，
-        # 不是白名单本身（否则先撞 403，测不到真正想测的那条路径）。
-        await self._restart_sidecar("https://self-signed.invalid")
+    async def test_unreachable_upstream_fails_closed(self):
+        """连不上的上游 → fail-closed 502（连接失败不放行）。
+
+        自签证书那条 TLS 路径由 `test_tls_rejects_self_signed_cert` 专门覆盖（本地起
+        TLS 服务，不碰外网）；本用例只验「连不上就阻断」，目标用环回未监听端口。
+        """
+        await self._restart_sidecar(_UNREACHABLE_TARGET)
         resp = await self.test_client.get(
             self._sidecar_url("/get"),
-            headers={"X-Maskit-Upstream": "https://self-signed.invalid"},
+            headers={"X-Maskit-Upstream": _UNREACHABLE_TARGET},
         )
         self.assertGreaterEqual(resp.status_code, 500)
 
@@ -279,11 +289,12 @@ class TestUpstreamSidecar(unittest.IsolatedAsyncioTestCase):
 
     async def test_retry_on_connect_error(self):
         """连接失败时重试一次（PRE_SEND_PHASES 安全）。"""
-        # 用一个 DNS 解析失败的上游 → ConnectError → 重试 → 502
-        await self._restart_sidecar("https://nonexistent-host-12345.invalid")
+        # 连不上（拒连）→ ConnectError → 重试 → 502。目标必须登记进白名单，
+        # 否则先撞 403、测不到重试那条路径。
+        await self._restart_sidecar(_UNREACHABLE_TARGET)
         resp = await self.test_client.get(
             self._sidecar_url("/get"),
-            headers={"X-Maskit-Upstream": "https://nonexistent-host-12345.invalid"},
+            headers={"X-Maskit-Upstream": _UNREACHABLE_TARGET},
         )
         self.assertEqual(resp.status_code, 502)
         self.assertEqual(resp.json().get("error"), "upstream_connect_failed")
@@ -952,6 +963,34 @@ class TestSidecarFramingAndLimits(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(normalize_origin("https://h:0"), None)
         self.assertEqual(normalize_origin("https://h:99999"), None)
         self.assertEqual(normalize_origin(None), None)
+
+    def test_allowed_origins_for_is_single_source(self):
+        """白名单集合只认 origin：去重、补默认端口、丢掉非法 target 且**留痕**。
+
+        构造（`UpstreamSidecar.__init__`）与热重载换代（`transparent._c1_reconcile`）
+        共用这一个函数——两边各算一份就会出现「构造时放行 A、比对时算出 B」，于是旧池
+        既不退役、请求又条条 403。
+        """
+        with self.assertLogs(c1mod.logger, level="WARNING") as logs:
+            origins = allowed_origins_for([
+                {"target": "https://API.Example.com/v1"},          # 大小写/路径归一
+                {"target": "https://api.example.com:443/other"},    # 同 origin → 去重
+                {"target": "http://127.0.0.1:8080"},
+                {"target": "socks5://h:1080"},                       # 非 http(s) → 丢
+                {"target": ""},                                      # 空值 → 丢
+                "not-a-dict",                                        # 形状不对 → 跳过，不抛
+            ])
+        self.assertEqual(origins, frozenset({
+            "https://api.example.com:443",
+            "http://127.0.0.1:8080",
+        }))
+        # 被丢掉的 target 必须留痕：静默跳过 = 「面板开着 takeover、请求却条条 403」，
+        # 而 403 看起来像越权而不是配置写错。
+        self.assertTrue(any("规范化失败" in line for line in logs.output),
+                        logs.output)
+        # 配置里没有上游 → 空集合：方向是「全拒」，不是「不限制」。
+        self.assertEqual(allowed_origins_for(None), frozenset())
+        self.assertEqual(allowed_origins_for([]), frozenset())
 
 
 class TestSidecarStaleConnection(unittest.IsolatedAsyncioTestCase):

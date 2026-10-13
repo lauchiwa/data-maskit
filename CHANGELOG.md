@@ -2,6 +2,16 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.10.1] - 2026-10-13
+
+### 修复
+- 引擎：上游发完 `[DONE]` 后未按规范收尾响应体时，流式请求不再丢失还原记录，正常结束也不会被误记为「客户端取消」。
+- 引擎：上游 target 变更后，接管连接池按新目标白名单自动换代，不再对配置内的合法目标返回 403。
+
+### Fixed
+- Engine: when an upstream omits the closing chunk after `[DONE]`, streaming requests no longer lose their restore record or get misreported as a client cancel.
+- Engine: after an upstream target change, the takeover pool now rebuilds against the new target allowlist instead of rejecting configured targets with 403.
+
 ## [0.10.0] - 2026-10-11
 
 ### 新增

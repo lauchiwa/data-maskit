@@ -158,6 +158,25 @@ def normalize_origin(url):
     return "%s://%s:%d" % (scheme, host, port)
 
 
+def allowed_origins_for(upstreams):
+    """上游 origin 白名单的**唯一**真相来源。
+
+    构造（``UpstreamSidecar.__init__``）与热重载换代（``transparent._c1_reconcile``）
+    都必须走这里：两边各算一份就会埋下一个只在「改了 target 却没重启进程」时暴露的
+    偏差——构造时放行 A、比对时算出 B，于是旧池既不退役、请求又条条被 403 拒转，
+    而面板上只看到「开关开着、请求全挂」。
+    """
+    targets = [up.get("target") for up in (upstreams or []) if isinstance(up, dict)]
+    origins = [normalize_origin(t) for t in targets]
+    dropped = [t for t, o in zip(targets, origins) if not o]
+    if dropped:
+        # 静默跳过会变成「面板上开了 takeover、请求却条条 403」，而 403 的原因
+        # 看起来像越权而不是配置写错。当场说清楚是哪几个 target。
+        logger.warning("C1 上游 target 规范化失败，这些上游即使开 takeover 也会被拒转：%s",
+                       ", ".join(str(t)[:80] for t in dropped[:5]))
+    return frozenset(o for o in origins if o)
+
+
 class UpstreamSidecar:
     """C1 sidecar: 进程级 httpx 池 + asyncio HTTP/1.1 转发器。
 
@@ -178,16 +197,7 @@ class UpstreamSidecar:
         self._egress_url = egress_proxy_url(self._config.get("egress_proxy"))
         # 只转发配置里声明过的上游 origin（见模块红线）。空集合 = 配置里没有任何上游，
         # 这时**什么都不放行**，而不是「当作不限制」。
-        _targets = [up.get("target") for up in (self._config.get("upstreams") or [])
-                    if isinstance(up, dict)]
-        _origins = [normalize_origin(t) for t in _targets]
-        _dropped = [t for t, o in zip(_targets, _origins) if not o]
-        if _dropped:
-            # 静默跳过会变成「面板上开了 takeover、请求却条条 403」，而 403 的原因
-            # 看起来像越权而不是配置写错。当场说清楚是哪几个 target。
-            logger.warning("C1 上游 target 规范化失败，这些上游即使开 takeover 也会被拒转：%s",
-                           ", ".join(str(t)[:80] for t in _dropped[:5]))
-        self._allowed_origins = frozenset(o for o in _origins if o)
+        self._allowed_origins = allowed_origins_for(self._config.get("upstreams"))
         # 调用方侧的并发闸：见 `_MAX_CONCURRENT_HANDLERS`
         self._slots = asyncio.Semaphore(_MAX_CONCURRENT_HANDLERS)
         self._stats: dict[str, int] = {

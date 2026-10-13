@@ -1765,11 +1765,11 @@ class ShieldEngineTests(unittest.TestCase):
             orig = tr._restore_sse_event
             calls = {"n": 0}
 
-            def boom(block, sid_, final=False):
+            def boom(block, sid_, final=False, **kw):
                 calls["n"] += 1
                 if calls["n"] >= 2:
                     raise RuntimeError("boom-injected")
-                return orig(block, sid_, final=final)
+                return orig(block, sid_, final=final, **kw)
 
             tr._restore_sse_event = boom
             try:
