@@ -84,6 +84,11 @@ jobs:
       - name: .env import parser cases
         run: node --experimental-strip-types ../scripts/check-env-import.mjs
 
+      # 复制工具的回退失败语义：execCommand 返回 false 表示复制没生效，必须抛错，
+      # 否则调用方会提示「已复制」而剪贴板里还是旧内容（issue #38）。纯函数 + DOM 桩。
+      - name: Copy helper failure contract
+        run: node --experimental-strip-types ../scripts/check-copy-text.mjs
+
       # 浏览器扩展（extension/）的静态门禁：i18n 键集一致性、shared.js 加载顺序、
       # 驼峰 runAt、静态站点清单与 manifest 对齐、安全红线扫描。
       # 放在本 job 只是因为这里已经装好了 node —— 扩展与前端是两套东西。

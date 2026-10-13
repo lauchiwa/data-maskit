@@ -49,6 +49,11 @@ GATES = [
     {"group": "frontend", "name": "i18n dictionary parity", "cwd": "frontend", "argv": ["{node}", "../scripts/check-i18n.mjs"]},
     {"group": "frontend", "name": ".env import parser cases", "cwd": "frontend",
      "argv": ["{node}", "--experimental-strip-types", "../scripts/check-env-import.mjs"]},
+    # 复制工具（lib/utils.ts copyText）的回退失败语义。前端没有单测框架，用例走 Node：
+    # execCommand('copy') 返回 false 表示复制没生效，必须抛错 —— 旧实现丢弃返回值，
+    # 调用方据此提示「已复制」，而剪贴板里还是上一次的内容（issue #38）。
+    {"group": "frontend", "name": "Copy helper failure contract", "cwd": "frontend",
+     "argv": ["{node}", "--experimental-strip-types", "../scripts/check-copy-text.mjs"]},
     # 浏览器扩展的静态门禁。放在 frontend 组（ci.yml 的 frontend job）只是因为
     # 那个 job 已经把 node 装好了；扩展与前端是两套东西，别被分组名误导。
     # 为什么必须有：extension/ 原先**没有任何自动化门禁**——python 单测碰不到它，

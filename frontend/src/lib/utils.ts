@@ -10,6 +10,9 @@ export function cn(...inputs: ClassValue[]) {
  * 复制文本到剪贴板（带回退）。
  * WebView2 下 navigator.clipboard 在某些安全上下文下不可用，
  * 回退到 document.execCommand('copy')。
+ *
+ * 回退返回 false 表示复制**没有生效**（焦点被抢、权限被拒等），必须抛错，
+ * 否则调用方会把失败当成功提示「已复制」（issue #38）。
  */
 export async function copyText(text: string): Promise<void> {
   try {
@@ -27,11 +30,13 @@ export async function copyText(text: string): Promise<void> {
   document.body.appendChild(ta)
   ta.focus()
   ta.select()
+  let ok = false
   try {
-    document.execCommand('copy')
+    ok = document.execCommand('copy')
   } finally {
     document.body.removeChild(ta)
   }
+  if (!ok) throw new Error('copy_failed')
 }
 
 /**

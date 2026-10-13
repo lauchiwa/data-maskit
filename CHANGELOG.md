@@ -2,6 +2,16 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [Unreleased]
+
+### 修复
+- 前端：复制回退失败时不再谎报「已复制」，设置页会正确提示复制失败。
+- 引擎：还原详情区分「模型回显但未还原」与「模型未回显」，不再把后者渲染成「未还原」告警；未还原计数不再被日期串等正常文本误触发；签名/密文思考块的契约豁免在还原侧也计数可见。
+
+### Fixed
+- Frontend: a failed clipboard fallback no longer reports "copied"; the settings page now shows a copy-failed toast.
+- Engine: restore details now distinguish "echoed but not restored" from "not echoed"; unresolved counting no longer fires on ordinary text such as date strings; restore-side contract skips of signed/encrypted thinking blocks are counted and visible.
+
 ## [0.10.1] - 2026-10-13
 
 ### 修复
