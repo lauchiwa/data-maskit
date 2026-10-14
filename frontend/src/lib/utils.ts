@@ -142,3 +142,19 @@ export function formatPercent(
   return `${s}%`
 }
 
+/**
+ * 版本号归一化：剥掉 tag 形态的 `v` 前缀，得到与 package.json / Cargo.toml /
+ * 引擎 `panel.__version__` 一致的纯 semver（如 `0.11.0`）。
+ *
+ * 为什么需要：更新检查的三条来源形态不一致 —— Tauri Updater 的 `update.version`
+ * （来自 latest.json）是纯 semver，而 GitHub API 的 `tag_name` 是 `v0.11.0`。
+ * 界面模板统一写成 `v{v}`，不归一化就会出现「更新到 vv0.11.0」（实测）。
+ * Release 链接需要 tag 形态，由调用方显式拼 `v`。
+ *
+ * 空值/空白 → undefined（不返回空串，避免调用方把它当有效版本渲染成 `v`）。
+ */
+export function normalizeVersion(v?: string | null): string | undefined {
+  const s = String(v ?? '').trim().replace(/^v/i, '')
+  return s || undefined
+}
+

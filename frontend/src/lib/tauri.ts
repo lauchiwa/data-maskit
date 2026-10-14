@@ -5,6 +5,7 @@
  */
 import { invoke } from '@tauri-apps/api/core'
 import { isTauri, shieldFetch, ShieldApiError } from './shield-fetch'
+import { normalizeVersion } from './utils'
 
 export interface EngineState {
   ready: boolean
@@ -138,7 +139,10 @@ async function fetchLatestFromGitHub(): Promise<{ version?: string; notes?: stri
 export async function checkUpdate(currentVersion?: string): Promise<UpdateCheck> {
   if (isTauri()) {
     try {
-      return await invoke<UpdateCheck>('check_update')
+      const r = await invoke<UpdateCheck>('check_update')
+      // 归一化版本形态：Rust 侧来自 latest.json（纯 semver），但显示模板统一写 `v{v}`，
+      // 统一成不带 v 才能保证渲染出「更新到 v0.11.0」而不是「vv0.11.0」。
+      return { ...r, version: normalizeVersion(r.version), current_version: normalizeVersion(r.current_version) }
     } catch (e) {
       return { ok: false, has_update: false, error: String(e) }
     }
@@ -198,8 +202,9 @@ export async function checkUpdate(currentVersion?: string): Promise<UpdateCheck>
     return {
       ok: true,
       has_update: hasUpdate,
-      version: latestTag,
-      current_version: curVer ? `v${cleanCur}` : undefined,
+      // 归一化为纯 semver：GitHub 的 tag_name 带 v，与 Tauri 侧形态对齐（见 normalizeVersion）
+      version: normalizeVersion(latestTag),
+      current_version: normalizeVersion(curVer),
       notes: data.notes || '',
       pub_date: data.pub_date,
     }

@@ -33,8 +33,10 @@ import {
 import { getStatus, dismissAutoRecover } from '@/api/proxy'
 import { getTodayStats, getRestoreItems, getConfig, saveConfig, getHealth, getStatsModels } from '@/api/settings'
 import { getLogs } from '@/api/logs'
-import { mergeMaskRestore } from '@/lib/log-events'
+import { mergeMaskRestore, type MergedEvent } from '@/lib/log-events'
 import { EventTypeIcon, EVENT_TYPE_META } from '@/components/events/EventTypeIcon'
+import { OutcomeBadge } from '@/components/events/OutcomeBadge'
+import { deriveOutcome, describeTerminal } from '@/lib/log-outcome'
 import { EventDetailDialog } from '@/components/events/EventDetailDialog'
 import { DiagnosticPreviewButton } from '@/components/settings/DiagnosticPreviewButton'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
@@ -204,11 +206,30 @@ export default function Dashboard() {
   // 与「有样本但零改写率 0%」必须分开渲染——前者是没数据，后者是数据很差。
   const prefix = stats?.prefix ?? null
 
-  // 最近事件：合并 MASK/RESTORE 成「一次请求一行」并取最新 10 行（与 Logs 页同口径）
-  const recentMerged = useMemo(
-    () => mergeMaskRestore(recentLogs?.events ?? []).slice(0, 10),
-    [recentLogs?.events],
-  )
+  // 最近事件：合并 MASK/RESTORE 成「一次请求一行」并取最新 10 行（与 Logs 页同口径）。
+  // nowSec 与行一起返回：结论里的「进行中 / 未完成」需要它，且必须与筛选用同一个值。
+  const { rows: recentMerged, nowSec } = useMemo(() => {
+    const now = Date.now() / 1000
+    return { rows: mergeMaskRestore(recentLogs?.events ?? [], { nowSec: now }).slice(0, 10), nowSec: now }
+  }, [recentLogs?.events])
+
+  /**
+   * 状态列文案（无 HTTP 码时的回退）：终态归因 → 原始 status 语义。
+   * 与 Logs 页同一口径：CANCEL/ERR 显示「客户端断开 / 上游静默 106s / 域名解析失败」，
+   * 而不是旧实现那句 `String(status).slice(0, 6)`（把 restored 截成 restor）。
+   */
+  const statusText = (e: MergedEvent): string | null => {
+    const term = describeTerminal(e)
+    if (term) return term.vars ? tf(term.key, term.vars) : t(term.key)
+    if (e.status) {
+      return e.status === 'no_placeholder_in_response'
+        ? t('logs.statusNoRestore')
+        : e.status === 'no_sensitive_data'
+          ? t('logs.statusNoSensitive')
+          : String(e.status)
+    }
+    return null
+  }
 
   // 今日费用估算：读 /api/stats/models?days=1（today 自然日），只计已定价模型
   const todayCostModels = costData?.models ?? []
@@ -760,19 +781,20 @@ export default function Dashboard() {
                     </div>
                   </TableCell>
                   <TableCell className="py-2.5 px-4">
+                    {/* 结论（与 Logs 页同一列语义）：事件类型降为左侧小图标，悬停可看 */}
                     <span className="flex items-center gap-1.5">
-                      <EventTypeIcon type={e.type} className="h-3.5 w-3.5" />
-                      <span className="text-[11px] font-medium">{t(EVENT_TYPE_META[e.type]?.labelKey ?? e.type)}</span>
-                      {e.stream_actual && (
-                        <span className="ml-1 rounded bg-muted/60 px-1 py-0.5 font-mono text-[9px] text-muted-foreground">
-                          {e.stream_actual === 'stream' ? t('logs.streaming') : t('logs.whole')}
-                        </span>
-                      )}
+                      <span className="shrink-0" title={t(EVENT_TYPE_META[e.type]?.labelKey ?? e.type)}>
+                        <EventTypeIcon type={e.type} className="h-3 w-3 opacity-60" />
+                      </span>
+                      <OutcomeBadge outcome={deriveOutcome(e, nowSec)} />
                     </span>
                   </TableCell>
-                  {/* 上游：优先配置名 upstream，client_app（进程探测）仅作缺失回退 */}
+                  {/* 上游：优先配置名 upstream，client_app（进程探测）仅作缺失回退；扩展流量加小徽标 */}
                   <TableCell className="py-2.5 px-4 truncate text-xs text-muted-foreground" title={String(e.upstream || e.client_app || '')}>
-                    {String(e.upstream || e.client_app || '—')}
+                    <span className="flex items-center gap-1">
+                      {e.ingress === 'ext' && <Globe className="h-3 w-3 shrink-0 text-blue-600 dark:text-blue-400" />}
+                      <span className="min-w-0 truncate">{String(e.upstream || e.client_app || '—')}</span>
+                    </span>
                   </TableCell>
                   {/* 模型：完整 host/path 放 title（悬停可见），列只展示模型名 */}
                   <TableCell className="py-2.5 px-4 font-mono text-[11px]" title={`${e.host ?? ''}${e.path ?? ''}${e.model ? `\n${tf('logs.modelIn', { m: e.model })}` : ''}`}>
@@ -798,7 +820,7 @@ export default function Dashboard() {
                       <span className="text-muted-foreground/50">—</span>
                     )}
                   </TableCell>
-                  {/* 状态：http_status 状态码或 status 语义 */}
+                  {/* 状态：http_status 状态码或终态归因/status 语义（与 Logs 页同口径） */}
                   <TableCell className="py-2.5 px-4 text-center">
                     {e.http_status ? (
                       <Badge
@@ -814,17 +836,25 @@ export default function Dashboard() {
                       >
                         {e.http_status}
                       </Badge>
-                    ) : e.status ? (
-                      <span className="truncate text-[9px] text-muted-foreground" title={String(e.status)}>
-                        {e.status === 'no_placeholder_in_response' ? t('logs.statusNoRestore') : e.status === 'no_sensitive_data' ? t('logs.statusNoSensitive') : String(e.status).slice(0, 6)}
+                    ) : statusText(e) ? (
+                      <span className="truncate text-[9px] text-muted-foreground" title={statusText(e) ?? ''}>
+                        {statusText(e)}
                       </span>
                     ) : (
                       <span className="text-muted-foreground/50">—</span>
                     )}
                   </TableCell>
-                  {/* 耗时 */}
+                  {/* 耗时：端到端优先；只有脱敏耗时时显式标注口径（与 Logs 页同口径） */}
                   <TableCell className="py-2.5 px-4 text-right tabular-nums text-xs text-muted-foreground">
-                    {fmtMs(e.total_ms ?? e.upstream_ms ?? (e as { mask_ms?: number }).mask_ms)}
+                    {(e.total_ms ?? e.upstream_ms) != null ? (
+                      <span title={t('logs.durE2eHint')}>{fmtMs(e.total_ms ?? e.upstream_ms)}</span>
+                    ) : e.mask_ms != null ? (
+                      <span className="text-muted-foreground/70" title={t('logs.durMaskHint')}>
+                        {tf('logs.durMask', { v: fmtMs(e.mask_ms) })}
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground/50">—</span>
+                    )}
                   </TableCell>
                   {/* 费用：RESTORE 事件由后端按 model×usage 估算，与 Logs 页口径一致 */}
                   <TableCell className="py-2.5 px-4 text-right tabular-nums text-[11px]">

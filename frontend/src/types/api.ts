@@ -307,6 +307,15 @@ export interface ShieldEvent {
    */
   ingress?: 'proxy' | 'ext'
   reason?: string
+  /**
+   * 失败归因的责任方（CANCEL / ERR）：client / dns / proxy / engine / upstream。
+   * 取值与判定见 engine/transparent.py 的 `_FAILURE_OWNERS` 与 `_flow_failure_owner`。
+   * 列表的状态列靠它把「客户端断开 / 域名解析失败 / 出口代理失败 / 上游错误」分开显示 ——
+   * 没有它就只能看到一个「—」。
+   */
+  failure_owner?: string
+  /** 异常类名（ERR）：如 ReadTimeout / ConnectionResetError，便于按类型聚合。 */
+  error_type?: string
   msg?: string
   seq: number
 }

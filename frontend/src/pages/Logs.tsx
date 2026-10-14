@@ -23,6 +23,7 @@ import { Download, Trash2, RefreshCw, Search, HelpCircle, Loader2, X, Globe, Fil
 import { getLogs, exportLogs, clearLogs, getLogMode, setLogMode, startLogTrace, stopLogTrace } from '@/api/logs'
 import { getAuditEvents } from '@/api/audit'
 import { EventTypeIcon, EVENT_TYPE_META } from '@/components/events/EventTypeIcon'
+import { OutcomeBadge, OUTCOME_META } from '@/components/events/OutcomeBadge'
 import { EventDetailDialog } from '@/components/events/EventDetailDialog'
 import { AuditEventDetailDialog, severityMeta, signalInfo } from '@/components/audit/AuditEventDetailDialog'
 import { Button } from '@/components/ui/button'
@@ -53,6 +54,16 @@ import dayjs from 'dayjs'
 import { cn } from '@/lib/utils'
 import { useI18n } from '@/lib/i18n'
 import { mergeMaskRestore, FILTER_ALL, type MergedEvent } from '@/lib/log-events'
+import {
+  OUTCOME_HINT_KEY,
+  OUTCOME_LABEL_KEY,
+  OUTCOME_ORDER,
+  deriveOutcome,
+  describeTerminal,
+  outcomeFilterValue,
+  outcomeFromFilter,
+  type OutcomeKey,
+} from '@/lib/log-outcome'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { useVisibility } from '@/lib/useVisibility'
 
@@ -127,11 +138,14 @@ interface AuditRow {
  * 逐列错位（此前就是这么漂移的）。同时给每个需要截断的 grid cell 都加 `min-w-0`
  * —— grid item 默认 `min-width:auto`，不加的话 `truncate` 完全不生效，长值会被
  * 行容器的 `overflow-hidden` **硬切断**（没有省略号，看着像文字被压重叠）。
+ *
+ * 2026-10-13 由 9 列收到 8 列：「入口」列删除 —— 99% 的行都写同样的「代理链路」，
+ * 是纯重复噪声；浏览器扩展流量改为「上游」单元格前的一个小徽标。
  */
 const LOG_GRID_COLS =
-  'grid-cols-[68px_88px_112px_108px_minmax(96px,1fr)_minmax(190px,1.4fr)_54px_58px_72px]'
+  'grid-cols-[68px_92px_minmax(112px,0.9fr)_minmax(140px,1.1fr)_minmax(190px,1.5fr)_68px_64px_72px]'
 /** 表格最小宽度：上面这些列 + gap + 左右内边距能完整放下的下限；低于它由外层横向滚动接管。 */
-const LOG_MIN_W = 'min-w-[940px]'
+const LOG_MIN_W = 'min-w-[890px]'
 
 /** 「隐藏噪声」偏好的存储键（localStorage）：跨会话保留，重开客户端后仍生效。
  *  命名沿用 AppLayout 的 `maskit_sidebar_collapsed`（maskit_ + 模块 + 字段），
@@ -244,7 +258,11 @@ export default function LogsPage() {
       setQ(urlQ)
     }
     if (urlType) {
-      setFilterType(urlType)
+      // 结论哨兵要归一成规范值再进 state：URL 回填把 type 整体转了大写，
+      // 而 Radix Select 的 value 必须与 SelectItem 逐字相等 —— 不归一的话触发器会显示空白
+      // （列表还会因为 exactType 对不上而变成空表，且不报任何错）。
+      const oc = outcomeFromFilter(urlType)
+      setFilterType(oc ? outcomeFilterValue(oc) : urlType)
     }
     if (urlFulltext) {
       setFulltext(true)
@@ -271,7 +289,9 @@ export default function LogsPage() {
   // 筛选参数只写一份（轮询/前缀/加载更早/按时间回看四处共用）：
   // 各写各的必然漂移——实测教训就是导出一致性（列表只看扩展、导出却是全量）。
   const filterParams = useMemo(() => ({
-    type: filterType === FILTER_ALL || filterType === 'EXT_ALL' || filterType === 'PASS_COMBINED'
+    // 结论是前端**派生量**（后端只按 type 精确过滤，没有 outcome 维度），
+    // 所以结论筛选不下推给后端 —— 与既有的 PASS_COMBINED / EXT_ALL 同法。
+    type: filterType === FILTER_ALL || filterType === 'EXT_ALL' || filterType === 'PASS_COMBINED' || outcomeFromFilter(filterType) !== null
       ? undefined : filterType,
     sensitive,
     q,
@@ -392,23 +412,32 @@ export default function LogsPage() {
   })
   const auditRows = auditQuery.data ?? EMPTY_LIST
 
-  // 合并展示：审计信号 + 事件按 sid 合并 MASK/RESTORE 成一条「往返链路」行，按 ts 降序
-  // （用户明确要求：一次请求对应一条日志；CANCEL/DNS_ERROR/ERR 等非链路事件保持独立行）
-  const merged = useMemo(() => {
+  // 合并展示：审计信号 + 事件按 sid 合并成一条「一次请求一行」的行，按 ts 降序。
+  // MASK/RESTORE/CANCEL/ERR 的折叠规则（含「绝不吞日志」的边界）见 lib/log-events.ts。
+  // 时间基准 nowSec 在 memo 里取一次并一并返回：结论里的「进行中 / 未完成」靠它，
+  // 筛选与渲染必须用**同一个**值，否则 180s 边界上的行会「筛进来却显示未完成」。
+  const { rows: merged, nowSec } = useMemo(() => {
+    const now = Date.now() / 1000
+    const outcomeFilter = filterType ? outcomeFromFilter(filterType) : null
+    // 「全部」之外都是**显式**筛选，优先于「隐藏噪声」这个便捷默认值
+    // —— 否则在下拉里选「用户取消」只会得到空列表（与 log-events.ts 同口径）。
+    const explicitFilter = filterType !== FILTER_ALL
     const noiseTypes = new Set(['SKIP', 'PASS', 'BYPASS', 'CANCEL', 'DNS_ERROR'])
     const audit: (AuditRow & { _audit: true })[] = auditRows
       .filter((row) => {
         if (filterType === FILTER_ALL) return true
+        // 审计行（SCAN_WARN）的结论恒为「安全告警」，走同一个推导，不另开分支
+        if (outcomeFilter) return deriveOutcome(row, now) === outcomeFilter
         if (filterType === 'EXT_ALL') return (row as { ingress?: string }).ingress === 'ext'
         if (filterType === 'PASS_COMBINED') return ['PASS', 'BYPASS', 'SKIP'].includes(row.type)
         return row.type === filterType
       })
-      .filter((row) => !hideNoise || !noiseTypes.has(row.type))
+      .filter((row) => explicitFilter || !hideNoise || !noiseTypes.has(row.type))
       .map((row) => ({ ...row, _audit: true as const }))
-    // 普通事件：MASK/RESTORE 合并与排序交给共享函数（与 Dashboard 最近日志同口径）
-    const ev = mergeMaskRestore(events, { filterType, hideNoise })
+    // 普通事件：折叠与排序交给共享函数（与 Dashboard 最近日志同口径）
+    const ev = mergeMaskRestore(events, { filterType, hideNoise, nowSec: now })
     // 按 ts 降序合并审计行与事件行
-    return [...audit, ...ev].sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0)) as LogRow[]
+    return { rows: [...audit, ...ev].sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0)) as LogRow[], nowSec: now }
   }, [auditRows, events, filterType, hideNoise])
 
   // 分页切片（真实分页：对 merged 切片）
@@ -598,8 +627,12 @@ export default function LogsPage() {
     if (exporting) return
     setExporting(true)
     try {
+      const outcomeFilter = outcomeFromFilter(filterType)
       const resp = await exportLogs({
-        type: filterType === FILTER_ALL || filterType === 'EXT_ALL' || filterType === 'PASS_COMBINED' ? undefined : filterType,
+        // 结论是前端**派生量**，不下推给后端：后端只认 type，且它的 type 正则
+        // 会把 'OUTCOME:x' 判为非法后**静默忽略** —— 看起来就像筛选没生效。
+        type: filterType === FILTER_ALL || filterType === 'EXT_ALL' || filterType === 'PASS_COMBINED' || outcomeFilter
+          ? undefined : filterType,
         sensitive,
         q,
         fulltext,
@@ -608,13 +641,37 @@ export default function LogsPage() {
       })
       // 截断状态从**响应头**读：文件是下载走的，body 里的 truncated 用户看不到。
       // 不告知的后果实测过：用户导出一天日志，只拿到上限条数却以为拿到了全部。
-      const exportedN = resp.headers.get('X-Maskit-Exported') || ''
+      let exportedN = resp.headers.get('X-Maskit-Exported') || ''
       const matchedN = resp.headers.get('X-Maskit-Matched') || ''
       const wasTruncated = resp.headers.get('X-Maskit-Truncated') === '1'
-      const doneMsg = wasTruncated
-        ? tf('logs.exportedTruncated', { n: exportedN, total: matchedN })
-        : t('logs.exported')
-      const blob = await resp.blob()
+      let blob: Blob
+      if (outcomeFilter) {
+        // 按结论筛选时必须**在本地补筛一次**（§D3.2 导出一致性：列表看的是什么，
+        // 导出的就得是什么）。口径与列表一致：先按 sid 折叠、再判结论，命中会话的
+        // **原始事件**全部保留（导出的是一条条事件，不是列表里合并后的行）。
+        const raw = (await resp.json()) as { events?: ShieldEvent[]; count?: number } & Record<string, unknown>
+        const all = raw.events ?? []
+        const hitSids = new Set(
+          mergeMaskRestore(all, { nowSec })
+            .filter((r) => deriveOutcome(r, nowSec) === outcomeFilter)
+            .map((r) => r.sid)
+            .filter(Boolean),
+        )
+        const kept = all.filter((e) => (e.sid && hitSids.has(e.sid)) || deriveOutcome(e, nowSec) === outcomeFilter)
+        raw.events = kept
+        raw.count = kept.length
+        exportedN = String(kept.length)
+        blob = new Blob([JSON.stringify(raw, null, 2)], { type: 'application/json' })
+      } else {
+        blob = await resp.blob()
+      }
+      const doneMsg = outcomeFilter
+        ? wasTruncated
+          ? tf('logs.exportedOutcomeTruncated', { n: exportedN })
+          : tf('logs.exportedOutcome', { n: exportedN })
+        : wasTruncated
+          ? tf('logs.exportedTruncated', { n: exportedN, total: matchedN })
+          : t('logs.exported')
       const filename = `maskit-events-${dayjs().format('YYYY-MM-DD-HHmmss')}.json`
       if (isTauri()) {
         const { save } = await import('@tauri-apps/plugin-dialog')
@@ -678,6 +735,108 @@ export default function LogsPage() {
     if (s < 60) return `${s.toFixed(1)}s`
     const m = Math.floor(s / 60)
     return `${m}m${Math.round(s % 60)}s`
+  }
+
+  /**
+   * 结论：列表主判据（推导规则见 lib/log-outcome.ts）。
+   *
+   * 为什么不在渲染处直接读 `row.type`：一次请求的 MASK 与终态会折叠成一行、折叠行保留
+   * MASK 的 type，直接读 type 会把「脱敏成功」「已取消」「失败」渲染成一模一样的「脱敏」。
+   */
+  const outcomeOf = (row: LogRow): OutcomeKey => deriveOutcome(row, nowSec)
+
+  /**
+   * 耗时列：端到端优先，只有脱敏耗时时**显式标注口径**。
+   *
+   * 此前这一列是 `total_ms ?? upstream_ms ?? mask_ms` 三种口径混排且无标注，同一列里
+   * 同时出现 86ms 与 12.4s，用户据此判定「统计有问题」。另注：`total_ms` 是历史遗留字段，
+   * 引擎从未发射过它（只在导出白名单里登记过），实际口径就是 `upstream_ms ?? mask_ms`。
+   */
+  const durationCell = (row: LogRow) => {
+    const e2e = row.total_ms ?? row.upstream_ms
+    if (e2e != null) return <span title={t('logs.durE2eHint')}>{fmtMs(e2e)}</span>
+    const mask = (row as { mask_ms?: number }).mask_ms
+    if (mask != null) {
+      return (
+        <span className="text-muted-foreground/70" title={t('logs.durMaskHint')}>
+          {tf('logs.durMask', { v: fmtMs(mask) })}
+        </span>
+      )
+    }
+    return <span className="text-muted-foreground/50">—</span>
+  }
+
+  /**
+   * 状态列：HTTP 码 → 终态归因 → 原始 status 语义。
+   *
+   * 5xx 必须标出**来源**：上游返回的 503 与网关熔断的 503 在列表里原本长得一模一样，
+   * 实测被当成「网关坏了」（2026-09-30）。没有 HTTP 码时显示 CANCEL/ERR 的归因
+   * （客户端断开 / 上游静默 106s / 域名解析失败…），而不是旧实现那句
+   * `String(status).slice(0, 6)` —— 它把 `restored` 截成了 `restor`。
+   */
+  const statusCell = (row: LogRow) => {
+    if (row.http_status) {
+      return (
+        <>
+          <Badge
+            variant="outline"
+            className={cn(
+              'px-1 py-0 text-[9px] font-mono',
+              row.http_status >= 400
+                ? 'border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400'
+                : row.http_status >= 200 && row.http_status < 300
+                  ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+                  : 'border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400',
+            )}
+          >
+            {row.http_status}
+          </Badge>
+          {row.http_status >= 500 && (
+            <span
+              className="max-w-[6.5rem] truncate text-[9px] text-muted-foreground"
+              title={t(`logs.status5xx.${row.block_source || 'unknown'}`)}
+            >
+              {t(`logs.status5xx.${row.block_source || 'unknown'}`)}
+            </span>
+          )}
+        </>
+      )
+    }
+    const term = describeTerminal(row)
+    if (term) {
+      const text = term.vars ? tf(term.key, term.vars) : t(term.key)
+      return (
+        <span className="min-w-0 max-w-full truncate text-[9px] text-muted-foreground" title={text}>
+          {text}
+        </span>
+      )
+    }
+    if (row.status) {
+      const text =
+        row.status === 'no_placeholder_in_response'
+          ? t('logs.statusNoRestore')
+          : row.status === 'no_sensitive_data'
+            ? t('logs.statusNoSensitive')
+            : String(row.status)
+      return (
+        <span className="min-w-0 max-w-full truncate text-[9px] text-muted-foreground" title={String(row.status)}>
+          {text}
+        </span>
+      )
+    }
+    // 浏览器扩展链路的桥接事件（panel 的 /api/ext/*）不落 http_status（它只回 {ok, text}），
+    // 这里保持既有的 200 标识 —— 面板→扩展这一段确实是 200，不是伪造的上游状态码。
+    if ((row as { ingress?: string }).ingress === 'ext') {
+      return (
+        <Badge
+          variant="outline"
+          className="border-emerald-500/30 bg-emerald-500/10 px-1 py-0 text-[9px] font-mono text-emerald-600 dark:text-emerald-400"
+        >
+          200
+        </Badge>
+      )
+    }
+    return <span className="text-muted-foreground/50">—</span>
   }
 
   // 处理摘要列：事件行显示「脱敏 N / 还原 N」（无命中时回退路径/状态），审计行显示信号名 + 严重度
@@ -808,33 +967,37 @@ export default function LogsPage() {
           </SelectTrigger>
           <SelectContent>
             <SelectItem value={FILTER_ALL}>{t('logs.filterAll')}</SelectItem>
-            <SelectItem value="EXT_ALL" className="font-medium text-blue-600 dark:text-blue-400">
-              <div className="flex items-center gap-1.5">
-                <Globe className="h-3.5 w-3.5" />
-                <span>{t('logs.filterExt')}</span>
-              </div>
-            </SelectItem>
+            {/* 按结论：列表的**主判据**。结论是前端派生量（后端只按 type 精确过滤），
+                所以这几项走客户端筛选 —— 与既有的「放行与透传」合并项同法。
+                这一组把「成功还是失败」变成可筛的维度，也是原 11 项类型列表里最缺的一层。 */}
             <SelectGroup>
-              <SelectLabel>{t('logs.filterHandled')}</SelectLabel>
-              <SelectItem value="MASK">{t('logs.filterMasked')}</SelectItem>
-              <SelectItem value="RESTORE">{t('logs.filterRestored')}</SelectItem>
+              <SelectLabel>{t('logs.filterByOutcome')}</SelectLabel>
+              {OUTCOME_ORDER.map((k) => (
+                <SelectItem key={k} value={outcomeFilterValue(k)}>
+                  <div className="flex items-center gap-1.5">
+                    <span className={cn('h-2 w-2 shrink-0 rounded-full', OUTCOME_META[k].dot)} />
+                    <span>{t(OUTCOME_LABEL_KEY[k])}</span>
+                  </div>
+                </SelectItem>
+              ))}
             </SelectGroup>
             <SelectGroup>
-              <SelectLabel>{t('logs.filterErrors')}</SelectLabel>
-              <SelectItem value="BLOCK">{t('logs.filterBlocked')}</SelectItem>
-              <SelectItem value="ERR">{t('logs.filterErr')}</SelectItem>
-              <SelectItem value="SCAN_WARN">{t('logs.filterScanWarn')}</SelectItem>
+              <SelectLabel>{t('logs.filterByIngress')}</SelectLabel>
+              <SelectItem value="EXT_ALL" className="font-medium text-blue-600 dark:text-blue-400">
+                <div className="flex items-center gap-1.5">
+                  <Globe className="h-3.5 w-3.5" />
+                  <span>{t('logs.filterExt')}</span>
+                </div>
+              </SelectItem>
             </SelectGroup>
-            <SelectGroup>
-              <SelectLabel>{t('logs.filterPassedCombined')}</SelectLabel>
-              <SelectItem value="PASS_COMBINED">{t('logs.filterPassedAll')}</SelectItem>
-            </SelectGroup>
+            {/* 底层原语：排障时才需要，平时不占视线 */}
             <SelectGroup>
               <SelectLabel className="text-[10px] text-muted-foreground">{t('logs.filterAdvanced')}</SelectLabel>
+              <SelectItem value="MASK">{t('logs.filterMasked')}</SelectItem>
+              <SelectItem value="RESTORE">{t('logs.filterRestored')}</SelectItem>
               <SelectItem value="PASS">{t('logs.filterPass')}</SelectItem>
               <SelectItem value="BYPASS">{t('logs.filterBypass')}</SelectItem>
               <SelectItem value="SKIP">{t('logs.filterSkip')}</SelectItem>
-              <SelectItem value="CANCEL">{t('logs.filterCancel')}</SelectItem>
               <SelectItem value="DNS_ERROR">{t('logs.filterDns')}</SelectItem>
             </SelectGroup>
           </SelectContent>
@@ -1021,15 +1184,20 @@ export default function LogsPage() {
             <TooltipTrigger asChild>
               <HelpCircle className="h-3.5 w-3.5 cursor-help text-muted-foreground/60" />
             </TooltipTrigger>
-            <TooltipContent side="right" className="max-w-[320px] space-y-1">
+            <TooltipContent side="right" className="max-w-[340px] space-y-1">
               <div className="font-semibold">{t('logs.legendTitle')}</div>
-              <div className="flex items-center gap-1.5"><Badge className="bg-blue-500/10 text-blue-600 hover:bg-blue-500/10 dark:text-blue-400">{t('logs.filterMasked')}</Badge>{t('logs.legendMasked')}</div>
-              <div className="flex items-center gap-1.5"><Badge className="bg-emerald-500/10 text-emerald-600 hover:bg-emerald-500/10 dark:text-emerald-400">{t('logs.filterRestored')}</Badge>{t('logs.legendRestored')}</div>
-              <div className="flex items-center gap-1.5"><Badge variant="outline">{t('logs.filterPass')}</Badge>{t('logs.legendPass')}</div>
-              <div className="flex items-center gap-1.5"><Badge variant="outline">{t('logs.filterMissed')}</Badge>{t('logs.legendSkip')}</div>
-              <div className="flex items-center gap-1.5"><Badge className="bg-amber-500/10 text-amber-600 hover:bg-amber-500/10 dark:text-amber-400">{t('logs.filterScanWarn')}</Badge>{t('logs.legendScanWarn')}</div>
-              <div className="flex items-center gap-1.5"><Badge className="bg-red-500/10 text-red-600 hover:bg-red-500/10 dark:text-red-400">{t('logs.filterBlocked')}</Badge>{t('logs.legendBlock')}</div>
-              <div className="flex items-center gap-1.5"><Badge className="bg-amber-500/15 text-amber-600 hover:bg-amber-500/15 dark:text-amber-400">{t('logs.poisonBadge')}</Badge>{t('logs.legendPoison')}</div>
+              {OUTCOME_ORDER.map((k) => {
+                const Icon = OUTCOME_META[k].icon
+                return (
+                  <div key={k} className="flex items-start gap-1.5">
+                    <Icon className={cn('mt-0.5 h-3.5 w-3.5 shrink-0', OUTCOME_META[k].cls)} />
+                    <span className="min-w-0">
+                      <span className={cn('font-medium', OUTCOME_META[k].cls)}>{t(OUTCOME_LABEL_KEY[k])}</span>
+                      <span className="text-muted-foreground"> · {t(OUTCOME_HINT_KEY[k])}</span>
+                    </span>
+                  </div>
+                )
+              })}
             </TooltipContent>
           </Tooltip>
         </TooltipProvider>
@@ -1054,7 +1222,7 @@ export default function LogsPage() {
         className="min-h-0 flex-1 overflow-auto rounded-xl border bg-card shadow-[var(--shadow-card)]"
       >
         <div className={LOG_MIN_W}>
-        {/* 表头（固定）：时间(两行 日期+时间) / 结果 / 入口 / 上游 / 模型(收紧) / 处理摘要(脱敏/还原 宽列) / 状态 / 耗时 / 费用 */}
+        {/* 表头（固定）：时间(两行 日期+时间) / 结论 / 上游 / 模型 / 处理摘要(脱敏·还原 宽列) / 状态 / 耗时 / 费用 */}
         <div
           className={cn(
             'sticky top-0 z-10 grid gap-2 border-b bg-card px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground',
@@ -1063,7 +1231,6 @@ export default function LogsPage() {
         >
           <span>{t('logs.colTime')}</span>
           <span>{t('logs.colResult')}</span>
-          <span>{t('logs.colIngress')}</span>
           <span>{t('logs.colUpstream')}</span>
           <span>{t('logs.colModel')}</span>
           <span>{t('logs.colSummary')}</span>
@@ -1093,37 +1260,37 @@ export default function LogsPage() {
                   <span>{row.ts ? dayjs(row.ts * 1000).format('MM-DD') : '—'}</span>
                   <span className="opacity-70">{row.ts ? dayjs(row.ts * 1000).format('HH:mm:ss') : ''}</span>
                 </span>
-                {/* 结果 */}
-                <span className="flex items-center gap-1 min-w-0">
-                  <EventTypeIcon type={row.type} className="h-3.5 w-3.5 shrink-0" />
-                  <span className="truncate text-[11px] font-medium">{t(EVENT_TYPE_META[row.type]?.labelKey ?? row.type)}</span>
+                {/* 结论：这次请求最终怎么了。事件类型（脱敏/还原/透传…）降为左侧小图标，
+                    悬停看类型、点开看详情 —— 此前「结果」列直接渲染事件类型，而合并行保留
+                    的是 MASK 的 type，于是「脱敏成功」「客户端取消」「上游 502」长得一模一样。 */}
+                <span className="flex min-w-0 items-center gap-1">
+                  <span className="shrink-0" title={t(EVENT_TYPE_META[row.type]?.labelKey ?? row.type)}>
+                    <EventTypeIcon type={row.type} className="h-3 w-3 opacity-60" />
+                  </span>
+                  <OutcomeBadge outcome={outcomeOf(row)} />
                 </span>
-                {/* 入口：proxy=CLI 代理链路；ext=浏览器扩展。如果是文档脱敏，同时显式标注 📄 文档脱敏 */}
-                <div className="flex flex-col justify-center min-w-0">
-                  {(row as { ingress?: string }).ingress === 'ext' ? (
-                    <div className="flex flex-col gap-0.5">
-                      <span className="inline-flex w-fit items-center gap-1 whitespace-nowrap rounded bg-blue-500/10 px-1.5 py-0.5 text-[10px] font-medium text-blue-600 dark:text-blue-400">
-                        <Globe className="h-3 w-3 shrink-0" />
-                        <span>{t('logs.badgeExt')}</span>
-                      </span>
-                      {(!row._audit && (row.path === '/ext/mask-file' || (row.dialog && row.dialog.includes('文件脱敏')))) && (
-                        <span className="inline-flex w-fit items-center gap-0.5 whitespace-nowrap text-[9px] font-medium text-amber-600 dark:text-amber-400" title={(!row._audit && row.dialog) ? row.dialog : t('logs.badgeDoc')}>
-                          <FileText className="h-2.5 w-2.5 shrink-0" />
-                          <span>{t('logs.badgeDoc')}</span>
-                        </span>
-                      )}
-                    </div>
-                  ) : (
-                    <span className="min-w-0 truncate whitespace-nowrap text-[10px] text-muted-foreground">
-                      {t('logs.ingress.proxy')}
-                    </span>
+                {/* 上游：优先配置名 upstream，client_app（进程探测）仅作缺失回退；扩展行展示目标站点 host。
+                    入口维度不再单独占一列（99% 的行都写同样的「代理链路」，纯重复噪声），
+                    只在浏览器扩展流量前挂一个小徽标；文档脱敏再挂一个 📄 图标。 */}
+                <span
+                  className="flex min-w-0 items-center gap-1"
+                  title={`${(row as { ingress?: string }).ingress === 'ext' ? t('logs.badgeExt') : t('logs.ingress.proxy')}${row.host ? ` · ${row.host}${row.path ?? ''}` : ''}`}
+                >
+                  {(row as { ingress?: string }).ingress === 'ext' && (
+                    <Globe className="h-3 w-3 shrink-0 text-blue-600 dark:text-blue-400" />
                   )}
-                </div>
-                {/* 上游：优先配置名 upstream，client_app（进程探测）仅作缺失回退；扩展行展示目标站点 host */}
-                <span className="min-w-0 truncate text-[11px] font-medium text-foreground/85" title={String(row.upstream || row.client_app || row.host || '')}>
-                  {(row as { ingress?: string }).ingress === 'ext'
-                    ? (row.host || 'Web AI')
-                    : String(row.upstream || row.client_app || '—')}
+                  {(row as { ingress?: string }).ingress === 'ext' &&
+                    !row._audit &&
+                    (row.path === '/ext/mask-file' || (row.dialog && row.dialog.includes('文件脱敏'))) && (
+                      <span className="shrink-0" title={(row as { dialog?: string }).dialog ?? t('logs.badgeDoc')}>
+                        <FileText className="h-3 w-3 text-amber-600 dark:text-amber-400" />
+                      </span>
+                    )}
+                  <span className="min-w-0 truncate text-[11px] font-medium text-foreground/85">
+                    {(row as { ingress?: string }).ingress === 'ext'
+                      ? (row.host || t('logs.webChat'))
+                      : String(row.upstream || row.client_app || '—')}
+                  </span>
                 </span>
                 {/* 模型：模型名 + 流式标签，完整 host/path 放 title（悬停可见）；扩展行展示模型或 Web 对话 */}
                 <span
@@ -1141,51 +1308,20 @@ export default function LogsPage() {
                 </span>
                 {/* 处理摘要：脱敏/还原计数，审计行为信号名 + 严重度，无命中的行回退路径 */}
                 {renderSummary(row)}
-                {/* 状态：http_status 数字或 status 中文语义。
-                    5xx 必须标出**来源**：上游返回的 503 与网关熔断的 503 在列表里
-                    原本长得一模一样，实测被当成"网关坏了"（2026-09-30）。 */}
+                {/* 状态：HTTP 码 / 终态归因 / 原始 status 语义，见上方 statusCell */}
                 <span className="flex min-w-0 flex-col items-center gap-0.5">
-                  {row.http_status ? (
-                    <>
-                      <Badge
-                        variant="outline"
-                        className={cn(
-                          'px-1 py-0 text-[9px] font-mono',
-                          row.http_status >= 400
-                            ? 'border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400'
-                            : row.http_status >= 200 && row.http_status < 300
-                              ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-                              : 'border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400',
-                        )}
-                      >
-                        {row.http_status}
-                      </Badge>
-                      {row.http_status >= 500 && (
-                        <span
-                          className="max-w-[6.5rem] truncate text-[9px] text-muted-foreground"
-                          title={t(`logs.status5xx.${row.block_source || 'unknown'}`)}
-                        >
-                          {t(`logs.status5xx.${row.block_source || 'unknown'}`)}
-                        </span>
-                      )}
-                    </>
-                  ) : row.status ? (
-                    <span className="min-w-0 truncate text-[9px] text-muted-foreground" title={String(row.status)}>
-                      {row.status === 'no_placeholder_in_response' ? t('logs.statusNoRestore') : row.status === 'no_sensitive_data' ? t('logs.statusNoSensitive') : String(row.status).slice(0, 6)}
+                  {statusCell(row)}
+                  {/* transport 观测阶段：只有非 complete 才值得显示。complete 是 100% 的常态，
+                      每行都印一遍「交换完成」只是噪声（实测最近 7 天 6445 条 RESTORE 全是 complete）。 */}
+                  {'transport' in row && row.transport && row.transport.phase && row.transport.phase !== 'complete' && (
+                    <span className="max-w-[6.5rem] truncate text-[9px] text-muted-foreground" title={t('transport.caution')}>
+                      {t(`transport.phase.${row.transport.phase}`)}
                     </span>
-                  ) : (row as { ingress?: string }).ingress === 'ext' ? (
-                    <Badge
-                      variant="outline"
-                      className="border-emerald-500/30 bg-emerald-500/10 px-1 py-0 text-[9px] font-mono text-emerald-600 dark:text-emerald-400"
-                    >
-                      200
-                    </Badge>
-                  ) : '—'}
-                  {'transport' in row && row.transport && <span className="max-w-[6.5rem] truncate text-[9px] text-muted-foreground" title={t('transport.caution')}>{t(`transport.phase.${row.transport.phase || 'unknown'}`)}</span>}
+                  )}
                 </span>
-                {/* 耗时：合并行取整链路(RESTORE)，MASK 单行(未还原/阻断)取脱敏管线耗时 */}
+                {/* 耗时：端到端优先；只有脱敏耗时时显式标注口径（见上方 durationCell） */}
                 <span className="text-right tabular-nums text-[11px] text-muted-foreground">
-                  {fmtMs(row.total_ms ?? row.upstream_ms ?? (row as { mask_ms?: number }).mask_ms)}
+                  {durationCell(row)}
                 </span>
                 {/* 费用（RESTORE 事件由后端按模型×usage 估算） */}
                 <span className="text-right tabular-nums text-[11px]">

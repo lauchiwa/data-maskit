@@ -54,6 +54,15 @@ GATES = [
     # 调用方据此提示「已复制」，而剪贴板里还是上一次的内容（issue #38）。
     {"group": "frontend", "name": "Copy helper failure contract", "cwd": "frontend",
      "argv": ["{node}", "--experimental-strip-types", "../scripts/check-copy-text.mjs"]},
+    # 日志「结论」推导 + MASK/终态折叠的用例。列表里一眼看到的是「成功还是失败」，
+    # 而它靠的是字段组合判据（terminal/http_status/unresolved/decision…）——
+    # 判据写错不会报错，只会静默地把「已取消」显示成「成功」。
+    {"group": "frontend", "name": "Log outcome & merge cases", "cwd": "frontend",
+     "argv": ["{node}", "--experimental-strip-types", "../scripts/check-log-outcome.mjs"]},
+    # 版本号归一化的用例。更新检查的三条来源形态不一（Tauri 的 latest.json 是纯 semver，
+    # GitHub 的 tag_name 带 v），界面模板统一写 `v{v}` —— 漏归一化就渲染出「更新到 vv0.11.0」。
+    {"group": "frontend", "name": "Version normalization cases", "cwd": "frontend",
+     "argv": ["{node}", "--experimental-strip-types", "../scripts/check-update-version.mjs"]},
     # 浏览器扩展的静态门禁。放在 frontend 组（ci.yml 的 frontend job）只是因为
     # 那个 job 已经把 node 装好了；扩展与前端是两套东西，别被分组名误导。
     # 为什么必须有：extension/ 原先**没有任何自动化门禁**——python 单测碰不到它，

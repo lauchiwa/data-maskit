@@ -201,7 +201,7 @@ export function AboutUpdateCard({ version, dataRoot, running, autoInstall, updat
                 </div>
                 {result.version && (
                   <a
-                    href={`https://github.com/xiaYuTian11/maskit/releases/tag/${result.version}`}
+                    href={`https://github.com/xiaYuTian11/maskit/releases/tag/v${result.version}`}
                     target="_blank"
                     rel="noreferrer"
                     className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
