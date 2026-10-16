@@ -2084,6 +2084,49 @@ mod panel_alive_tests {
         (listener, port)
     }
 
+    /// 子进程探活失败时的分层诊断：reqwest 客户端构建 / 裸 TCP / 裸 HTTP 各自成败。
+    ///
+    /// 为什么需要它：2026-10-16 CI（windows-2025-vs2026 镜像 20261013.288 起）
+    /// `local_http_probe_ignores_proxy_environment` 子进程探活瞬时失败（整测 0.01s，
+    /// 无超时参与），而代码与依赖自 10-02 未变、旧镜像 20260925.250 全绿。
+    /// `panel_alive_on` 内部把错误全部吞掉只回布尔，远端只剩一个 false 无法归因；
+    /// 这里把三层各自的结果带进断言消息，一次 CI 迭代就能定位到底断在哪层。
+    /// 只在失败路径调用（会消耗 server 线程的一个请求配额）。
+    fn probe_failure_diagnostics(port: u16) -> String {
+        use std::io::{Read, Write};
+        let mut parts: Vec<String> = Vec::new();
+        match reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(800))
+            .build()
+        {
+            Ok(_) => parts.push("reqwest_build=ok".to_string()),
+            Err(e) => parts.push(format!("reqwest_build=ERR:{e}")),
+        }
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(mut s) => {
+                parts.push("tcp=ok".to_string());
+                let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(800)));
+                if s.write_all(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").is_err() {
+                    parts.push("http_write=ERR".to_string());
+                } else {
+                    let mut buf = [0u8; 256];
+                    match s.read(&mut buf) {
+                        Ok(n) => parts.push(format!(
+                            "http_resp={}",
+                            String::from_utf8_lossy(&buf[..n.min(96)])
+                                .replace('\r', "")
+                                .replace('\n', "|")
+                        )),
+                        Err(e) => parts.push(format!("http_read=ERR:{e}")),
+                    }
+                }
+            }
+            Err(e) => parts.push(format!("tcp=ERR:{e}")),
+        }
+        parts.join("; ")
+    }
+
     /// 核心回归：端口在监听但无 HTTP 响应时，**不能**判定为就绪。
     ///
     /// 旧实现只做 TCP connect，本用例里 `port_ready_on` 会返回 true，于是
@@ -2123,7 +2166,18 @@ mod panel_alive_tests {
         use std::time::{Duration, Instant};
         const CHILD_PORT: &str = "MASKIT_TEST_LOCAL_HTTP_PORT";
         if let Ok(port) = std::env::var(CHILD_PORT) {
-            assert!(EngineManager::panel_alive_on(port.parse().unwrap()));
+            let port: u16 = port.parse().unwrap();
+            if !EngineManager::panel_alive_on(port) {
+                // 瞬时失败可能是杀软对新编 exe 的首次网络拦截：诊断 + 短暂等待后
+                // 重试一次，成功仍能证明 no_proxy 生效（本测试的唯一目的）；
+                // 仍失败则断言消息里带上分层诊断（见 probe_failure_diagnostics）。
+                let diag = probe_failure_diagnostics(port);
+                std::thread::sleep(Duration::from_millis(200));
+                assert!(
+                    EngineManager::panel_alive_on(port),
+                    "panel_alive_on=false（win25 镜像 20261013.288 起回归），diag: {diag}"
+                );
+            }
             return;
         }
         // Change proxy variables only in a child, never in the parallel test runner.
@@ -2135,12 +2189,27 @@ mod panel_alive_tests {
         listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
             let end = Instant::now() + Duration::from_secs(30);
+            // 单请求改为多请求（上限 8，首个请求后 1s 空闲即收尾）：探活失败后的
+            // 诊断与重试还要再打这个端口，一次性 accept 会把后续请求顶成
+            // connection refused，诊断读数自相矛盾。成功路径多等 1s 即退出，
+            // 不拖慢 CI；失败路径本就要等满/接近窗口。
+            let mut idle_deadline: Option<Instant> = None;
+            let mut served: u32 = 0;
             while Instant::now() < end {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    served += 1;
                     stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
                     let mut buf = [0u8; 2048];
                     let _ = stream.read(&mut buf);
                     let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}");
+                    if idle_deadline.is_none() {
+                        idle_deadline = Some(Instant::now() + Duration::from_secs(1));
+                    }
+                    if served >= 8 {
+                        return;
+                    }
+                }
+                if idle_deadline.map_or(false, |d| Instant::now() > d) {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(5));
