@@ -175,6 +175,9 @@ export function mergeMaskRestore(events: readonly ShieldEvent[], opts: MergeOpti
       status: r.status ?? m.status,
       restored: r.restored ?? m.restored,
       unresolved: r.unresolved ?? m.unresolved,
+      // 外部占位符（非本机签发）：与 unresolved 同源携带，否则合并行上永远显示不出来
+      foreign: r.foreign ?? m.foreign,
+      foreign_samples: r.foreign_samples ?? m.foreign_samples,
       degraded: r.degraded ?? m.degraded,
       stream_actual: r.stream_actual ?? m.stream_actual,
       // A terminal snapshot owns the evidence, including explicit unknowns.

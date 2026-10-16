@@ -103,10 +103,18 @@ interface AuditRow {
   seq: number
   count?: number
   restored?: number
-  /** 查不到原文、原样透传出去的占位符数。>0 通常意味着模型自造了占位符 */
+  /** 本机签发过、但映射已丢（复用表淘汰 / 重启后未预热）的占位符数，已原样透传 */
   unresolved?: number
   /** 未还原占位符样本（引擎侧外发；仅未还原时存在，用于区分模型改写与映射丢失） */
   unresolved_samples?: string[]
+  /**
+   * 非本机签发的占位符形态字符串数（外部历史携带 / 文档示例 / 模型自造）。
+   * 与 `unresolved` 分开计数：本机无论如何都还原不了它们，**不进告警**，
+   * 只用中性色展示，否则面板数字会长期虚高。
+   */
+  foreign?: number
+  /** 外来/示例占位符样本（引擎侧外发，用于详情弹窗定位） */
+  foreign_samples?: string[]
   /** 5xx 归因（引擎外发）：upstream=上游返回原样透传 / engine=本机熔断 / fallback=代理未运行兜底。
    *  列表里必须看得见 —— 否则「上游返回 503」会被当成网关故障（2026-09-30 实测误判） */
   block_source?: string
@@ -862,11 +870,14 @@ export default function LogsPage() {
     // 普通事件：优先展示脱敏/还原计数（一次请求一条链路行的核心信息）
     const masked = (row.count ?? 0) > 0
     const restored = (row.restored ?? 0) > 0
-    // 未还原的占位符：绝大多数情况是模型自己编了一个我们从没发出去过的占位符
-    // （它把 {{IPPRIVATE_83fc6a}} 的后缀当成可计算的数字改写），少数是映射过期。
-    // 不显示出来的话，用户只在终端里看到裸露的 {{...}} 而无从判断是谁的问题——
-    // 0.1.12 就是因此误判成「还原坏了」，进而加了一段凭空推算 IP 的代码。
+    // 未还原的占位符：本机**签发过**、但映射已经丢了（复用表淘汰 / 重启后没预热
+    // 回来）。不显示出来的话，用户只在终端里看到裸露的 {{...}} 而无从判断是谁的
+    // 问题——0.1.12 就是因此误判成「还原坏了」，进而加了一段凭空推算 IP 的代码。
     const unresolved = (row.unresolved ?? 0) > 0
+    // 外部占位符：本机**从没签发过**的后缀（客户端历史携带 / 文档示例 / 模型自造）。
+    // 同样要看得见，但用中性色、不报警：还原不了它们是必然的，不是引擎的错
+    // （真机实测：当天 4 条「还原失败」里 0 条是本机签发过的 token）。
+    const foreign = (row.foreign ?? 0) > 0
     // 兜底还原：模型把花括号剥了，靠宽松正则捞回来的。是成功，所以用中性色不报警，
     // 但要看得见——它是「模型正在改写输出格式」的前兆信号。
     const degraded = (row.degraded ?? 0) > 0
@@ -894,7 +905,7 @@ export default function LogsPage() {
       .filter(Boolean)
       .join(' | ')
 
-    if (masked || restored || unresolved || degraded || stateChip) {
+    if (masked || restored || unresolved || degraded || foreign || stateChip) {
       return (
         // 拆成上下两行（计数 / 标签）是**为根治重叠**：此前挤在单行里，标签组一旦被压缩，
         // 内部 `whitespace-nowrap` 的子元素会溢出自身边界，与后面的「未还原 N」糊在一起
@@ -916,6 +927,11 @@ export default function LogsPage() {
             {degraded && (
               <span className="shrink-0 whitespace-nowrap text-muted-foreground" title={t('logs.degradedHint')}>
                 {t('logs.colDegraded')} {row.degraded}
+              </span>
+            )}
+            {foreign && (
+              <span className="shrink-0 whitespace-nowrap text-muted-foreground" title={t('logs.foreignHint')}>
+                {t('logs.colForeign')} {row.foreign}
               </span>
             )}
             {stateChip && (

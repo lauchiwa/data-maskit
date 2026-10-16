@@ -287,9 +287,14 @@ export default function Dashboard() {
       isCompact: alertNum.isCompact,
       sub: [
         { label: t('dash.blocked'), value: ((stats as Record<string, unknown> | undefined)?.by_type as Record<string, {events:number}> | undefined)?.BLOCK?.events ?? 0 },
-        { label: t('dash.restoreFail'), value: stats?.restore_failed ?? 0 },
+        { label: t('dash.restoreFail'), value: stats?.restore_failed ?? 0, title: t('logs.unresolvedHint') },
         { label: t('dash.errors'), value: ((stats as Record<string, unknown> | undefined)?.by_type as Record<string, {events:number}> | undefined)?.ERR?.events ?? 0 },
         { label: t('dash.respWarn'), value: ((stats as Record<string, unknown> | undefined)?.by_type as Record<string, {events:number}> | undefined)?.SCAN_WARN?.events ?? 0 },
+        // 外部占位符：本机从未签发过的占位符形态字符串（客户端历史携带 / 文档示例 /
+        // 模型自造）。**既不计入 alerts、也不计入「还原失败」**——本机无论如何都
+        // 还原不了它们，混进还原失败只会让指标长期虚高（实测当天 4 条里 0 条是
+        // 本机签发过的）。恒显示（0 也是值），避免有时有有时无让用户以为漏了。
+        { label: t('dash.foreignTokens'), value: stats?.restore_by_status?.foreign ?? 0, title: t('dash.foreignTokensHint') },
       ],
       icon: AlertCircle, num: 'text-amber-600 dark:text-amber-400',
       iconBg: 'from-amber-500/15 to-amber-500/5 text-amber-600 dark:text-amber-400',
@@ -532,7 +537,7 @@ export default function Dashboard() {
                 {c.sub ? (
                   <div className="mt-auto grid grid-cols-2 gap-x-2 gap-y-0.5 border-t pt-2 text-xs text-muted-foreground" style={{ minHeight: 44 }}>
                     {c.sub.map((s) => (
-                      <span key={s.label} className="truncate">
+                      <span key={s.label} className="truncate" title={s.title}>
                         {s.label} <b className="font-medium tabular-nums text-foreground">{s.value}</b>
                       </span>
                     ))}

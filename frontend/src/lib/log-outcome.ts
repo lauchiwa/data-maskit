@@ -93,8 +93,10 @@ export interface OutcomeInput {
    */
   terminal?: 'RESTORE' | 'CANCEL' | 'ERR'
   http_status?: number
-  /** 查不到原文、原样透传出去的占位符数（RESTORE） */
+  /** 本机签发过、但映射已丢（复用表淘汰 / 重启后未预热）的占位符数（RESTORE） */
   unresolved?: number
+  /** 非本机签发的占位符形态字符串数（RESTORE）。**不触发告警**，只用中性色展示 */
+  foreign?: number
   /** 靠宽松兜底修回来的占位符数（RESTORE） */
   degraded?: number
   /** 处置结论（MASK）：masked / scanned_clean / blocked / passthrough */

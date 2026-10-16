@@ -2,6 +2,16 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.11.1] - 2026-10-16
+
+### 修复
+- 引擎：还原失败不再把「本机从未签发过」的占位符算进去（客户端历史携带的外部 token / 对话里的文档示例 / 模型自造），新增「外部占位符」独立计数，面板与详情页分开显示。
+- 引擎：语义识别不再把代码标识符（`JSON.parse`、`FSPAGE_9105` 这类）判成人名/机构名掩码，模型看到的代码不再被改写（真机当日 NAME 命中里六成是变量名/方法名）。
+
+### Fixed
+- Engine: restore failures no longer include placeholder-shaped strings this instance never issued (foreign tokens from client history / doc examples / model-invented); a separate "foreign tokens" counter is shown apart from restore failures on the dashboard and in the detail dialog.
+- Engine: NER no longer masks code identifiers (`JSON.parse`, `FSPAGE_9105`, …) as person/organization names, so the code a model sees is no longer rewritten (six in ten of the day's NAME hits were variable or method names).
+
 ## [0.11.0] - 2026-10-14
 
 ### 新增

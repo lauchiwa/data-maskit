@@ -2667,6 +2667,7 @@ def _warmup_recent_from_db():
         # 旧 token 直接不登记，天然不产生 REV/后缀索引孤儿。
         seen_orig = set()
         collected = []
+        issued = set()
         for (payload_str,) in rows:
             try:
                 p = json.loads(payload_str)
@@ -2674,10 +2675,16 @@ def _warmup_recent_from_db():
                     tok = it.get("tok")
                     orig = it.get("original")
                     label = it.get("label") or ""
-                    if not tok or not orig or not _PLACEHOLDER_RX.match(tok):
+                    if not tok or not _PLACEHOLDER_RX.match(tok):
                         continue
-                    # 过滤凭据类与占位符自身
-                    if label in CREDENTIAL_LABELS or _PLACEHOLDER_RX.match(orig):
+                    # 签发台账先登记：凭据类在库里没有 original（只有 digest+preview），
+                    # 会被下面的映射恢复过滤掉，但它同样是「本机签发过」的后缀——
+                    # 不登记的话，凭据类一旦映射丢失就会被误判成「外来占位符」，
+                    # 恰好把最该告警的那一类静默掉。
+                    sfx = _token_suffix(tok)
+                    if sfx:
+                        issued.add(sfx)
+                    if not orig or label in CREDENTIAL_LABELS or _PLACEHOLDER_RX.match(orig):
                         continue
                     if orig in seen_orig:
                         continue
@@ -2690,6 +2697,8 @@ def _warmup_recent_from_db():
         # 曾按倒序直接写入：恢复 >2000 条时反而把最新的映射先删掉，重启后
         # 活跃会话最需要的占位符还原命中率倒挂（审计 P2）。
         with _STATE_LOCK:
+            for sfx in issued:
+                _note_issued_suffix(sfx)
             for tok, orig, label in reversed(collected):
                 _RECENT_FWD[orig] = [tok, label, now]
                 _RECENT_REV[tok] = [orig, label, now]
@@ -4164,6 +4173,55 @@ def _suffix_indexable(suffix):
     return len(suffix) == 6 and all(c in _TOKEN_ALPHABET for c in suffix)
 
 
+# ── 已签发后缀台账：把「映射丢了」与「压根不是本机签的」分开 ──────────────
+#
+# 解决什么（真机事件库实测）：面板上的「还原失败」把两类东西混进同一个数字——
+#   · 本机签发过、但映射已丢（复用表淘汰 / 会话被扫 / 重启后没预热回来）：
+#     这是**真的要排查**的还原失败；
+#   · 从未由本机签发过的占位符形态字符串：客户端历史里携带的外来 token、
+#     对话里写的文档示例（后缀清一色同一个字母那种）、模型自己编的。本机无论
+#     如何都还原不了它们，算成「还原失败」只会让指标长期虚高——实测当天 4 条
+#     未还原里 0 条属于前者，15 条历史共 69 个样本 0 个命中已签发集合。
+#
+# 台账只存 6 位后缀本身（随机指纹），不含原文、不含标签，也不落盘：
+# 启动时由 `_warmup_recent_from_db` 从事件库预热（与复用表同一份来源），运行期由
+# `_suffix_index_add` 增量登记。因此它的语义是「**本机近期签发过**」——超出事件库
+# 保留期/预热窗口的老 token 会落到「外来」一侧，而那时它们的映射本来也早已不可还原。
+_ISSUED_SUFFIXES = {}          # suffix -> 登记时刻（dict 保插入序，封顶时按序淘汰）
+_ISSUED_SUFFIXES_MAX = 200000  # 内存上界；正常用量（7 天约 700 条）远够
+
+
+def _note_issued_suffix(suffix):
+    """登记「本机签发过这个后缀」。调用方必须已持 `_STATE_LOCK`。
+
+    封顶后按登记顺序淘汰最老的一批：判据退化成「近期签发过」，老 token 落到
+    「外来」一侧——这与事实相符（那时它们的映射早已过了 TTL，本来就还原不回来）。
+    """
+    sfx = str(suffix or "").lower()
+    if len(sfx) != 6:
+        return
+    if sfx in _ISSUED_SUFFIXES:
+        _ISSUED_SUFFIXES[sfx] = time.time()
+        return
+    if len(_ISSUED_SUFFIXES) >= _ISSUED_SUFFIXES_MAX:
+        for _ in range(max(1, _ISSUED_SUFFIXES_MAX // 10)):
+            _ISSUED_SUFFIXES.pop(next(iter(_ISSUED_SUFFIXES)), None)
+    _ISSUED_SUFFIXES[sfx] = time.time()
+
+
+def _issued_suffix(suffix):
+    """该后缀是否由本机签发过。
+
+    自带 `_STATE_LOCK`（RLock，可重入）：热路径调用点已在锁内，而
+    `_count_orphans_without_session` 这类计数路径在锁外，统一由本函数持锁。
+    """
+    sfx = str(suffix or "").lower()
+    if not sfx:
+        return False
+    with _STATE_LOCK:
+        return sfx in _ISSUED_SUFFIXES
+
+
 def _suffix_index_add(token):
     """登记后缀索引。**撞车即置为不可用，绝不覆盖、也绝不保留其一。**
 
@@ -4184,6 +4242,9 @@ def _suffix_index_add(token):
         return
     tables = _tables()
     with _STATE_LOCK:
+        # 签发台账与后缀索引同处一个临界区：判据读的就是这里写进去的东西，
+        # 分开加锁会让「刚签发的 token 立刻被判定为外来」出现窗口。
+        _note_issued_suffix(sfx)
         cur = tables.suffix.get(sfx)
         if cur is None:
             tables.suffix[sfx] = token
@@ -5217,9 +5278,7 @@ def restore(text, sid, channel="", escape=False, final=False):
             # 能走到这里说明外层**已判定为双花括号占位符形态**，计数不会误伤：
             # 后缀是 6 位 hex 或 6 位纯辅音，普通文本不会自然出现 `{{ word_abcdfg }}`。
             with _STATE_LOCK:      # B-1a ②
-                s["unresolved"] = s.get("unresolved", 0) + 1
-                _record_unresolved_sample(s, whole)
-                _note_unresolved_echo(s, suffix)
+                _note_unresolved_token(s, whole, suffix)
             return whole
         with _STATE_LOCK:          # B-1a ②：计数 + 集合去重追加必须一起进锁
             s["restored"] = s.get("restored", 0) + 1
@@ -5256,9 +5315,7 @@ def restore(text, sid, channel="", escape=False, final=False):
                 # 判据用「整段里有没有反斜杠」最直白，也与该遍的语义严格一致。
                 if "\\" in whole:
                     with _STATE_LOCK:      # B-1a ②
-                        s["unresolved"] = s.get("unresolved", 0) + 1
-                        _record_unresolved_sample(s, whole)
-                        _note_unresolved_echo(s, m.group(2))
+                        _note_unresolved_token(s, whole, m.group(2))
                 return whole
             with _STATE_LOCK:              # B-1a ②
                 s["restored"] = s.get("restored", 0) + 1
@@ -5325,9 +5382,7 @@ def restore(text, sid, channel="", escape=False, final=False):
                 if (not (m.start() > 0 and m.string[m.start() - 1] == "\\")
                         and not bare_legacy):
                     with _STATE_LOCK:      # B-1a ②
-                        s["unresolved"] = s.get("unresolved", 0) + 1
-                        _record_unresolved_sample(s, whole)
-                        _note_unresolved_echo(s, tok_body.rsplit("_", 1)[-1])
+                        _note_unresolved_token(s, whole, tok_body.rsplit("_", 1)[-1])
                 return whole
             with _STATE_LOCK:              # B-1a ②
                 s["restored"] = s.get("restored", 0) + 1
@@ -5755,7 +5810,7 @@ def _count_unresolved(sid, n=1):
             pass
 
 
-# 未还原占位符的样本留存上限。只留形态（token 本身是占位符，不含任何明文），
+# 未还原占位符的样本留存上限。只留形态（token 本身是占位符，不含任何原文），
 # 落库安全；上限压到 5 是为了不让长响应把 payload 撑大。
 _UNRESOLVED_SAMPLES_MAX = 5
 
@@ -5813,6 +5868,73 @@ def _note_unresolved_echo(s, suffix):
         pass
 
 
+# 外来占位符的样本留存上限（同 `_UNRESOLVED_SAMPLES_MAX`，理由相同）。
+_FOREIGN_SAMPLES_MAX = 5
+
+
+def _record_sample_into(s, key, cap, tok):
+    """往会话的某个样本列表里追加一条占位符形态样本（只做诊断）。
+
+    `unresolved_samples` 与 `foreign_samples` 的存储规则完全一致，只有列表名与
+    上限不同；抽出来是为了让两边不会各自飘移（样本里存的都是占位符本身，
+    不含原文，落库安全）。
+    """
+    try:
+        lst = s.get(key)
+        if not isinstance(lst, list):
+            lst = s[key] = []
+        if len(lst) < cap and tok not in lst:
+            lst.append(tok)
+    except Exception:
+        pass
+
+
+def _record_unresolved_sample(s, tok):
+    """留存几个「查不到原文」的占位符样本，供事件详情弹窗定位。
+
+    为什么必须留：`unresolved` 原先只有一个计数，用户看到「未还原 7」却无从知道
+    是哪些 token、什么形态。而这两种情况的处置完全不同，光看计数分不出来：
+
+    - 形态正常（`{{EMAIL_abcdfg}}`）→ 引擎表里真的没有它：引擎重启后
+      **凭据类永远不会被 `_warmup_recent_from_db` 预热**（库里只有 digest+preview，
+      红线 4），或是复用表 TTL 过期 / 会话被 sweep 掉；
+    - 形态被改写（`{{ email_abcdfg }}`、小写标签、剥掉花括号）→ 模型在动输出格式，
+      是「哪天彻底还原不回来」的前兆。
+
+    只做诊断，不参与任何还原决策，异常一律吞掉。
+    """
+    _record_sample_into(s, "unresolved_samples", _UNRESOLVED_SAMPLES_MAX, tok)
+
+
+def _record_foreign_sample(s, tok):
+    """留存几个「非本机签发」的占位符样本（`foreign_samples`）。
+
+    与 `unresolved_samples` 的区别只在来源：那个列表里的后缀本机签发过、映射
+    丢了；这个列表里的后缀从未由本机签发过（客户端历史携带的外来 token、
+    对话里写的文档示例、模型自己编的），本机无论如何都还原不了。
+    """
+    _record_sample_into(s, "foreign_samples", _FOREIGN_SAMPLES_MAX, tok)
+
+
+def _note_unresolved_token(s, whole, suffix):
+    """占位符查不到原文时的记账：分出「映射丢了」与「压根不是本机签的」。
+
+    调用方必须已持 `_STATE_LOCK`（与 unresolved 计数同一临界区）。
+    返回 True 表示这是本机签发过的 token（真·映射丢失，要排查）。
+
+    **只影响计数与告警，不影响替换行为**：两条分支都原样返回占位符、绝不猜原文
+    （那是 `_lookup` 的既定安全边界，与本次改动无关）。
+    """
+    if _issued_suffix(suffix):
+        s["unresolved"] = int(s.get("unresolved") or 0) + 1
+        _record_unresolved_sample(s, whole)
+        _note_unresolved_echo(s, suffix)
+        return True
+    s["foreign"] = int(s.get("foreign") or 0) + 1
+    _record_foreign_sample(s, whole)
+    return False
+
+
 # ── 会话不存在时的孤儿计数兜底表 ──────────────────────────────────────────
 # sid -> [count, [样本...], ts]
 #
@@ -5826,7 +5948,7 @@ def _note_unresolved_echo(s, suffix):
 # 屏幕上一堆未还原，事件页只有一条 `unresolved=1`，用户直接质疑统计造假。
 #
 # 于是这里**只计数、不还原**：数出文本里有几个占位符形态，留给
-# `/api/ext/restore` 合并进 RESTORE 事件。样本只存占位符本身，不含任何明文。
+# `/api/ext/restore` 合并进 RESTORE 事件。样本只存占位符本身，不含任何原文。
 _NO_SESSION_ORPHANS = {}
 _NO_SESSION_ORPHANS_MAX = 256
 
@@ -5838,15 +5960,26 @@ def _count_orphans_without_session(sid, text):
     这是页面上最显眼、也是模型原样吐回时最常见的形态；裸 token / 单花括号
     在本遍不做统计，避免把正文里的普通标识符算进来（那属于宽松遍的判据，
     它需要会话上下文来区分残片）。
+
+    计数按来源分开（与 `_note_unresolved_token` 同口径）：会话不存在时两种都会
+    命中，但「本机签发过」才值得告警，外来/示例占位符只做留痕。
     """
     try:
         n = 0
         samples = []
+        foreign = 0
+        foreign_samples = []
         for m in _BRACED_PLACEHOLDER_RX.finditer(text):
-            n += 1
-            if len(samples) < _UNRESOLVED_SAMPLES_MAX:
-                samples.append(m.group(0))
-        if n <= 0:
+            whole = m.group(0)
+            if _issued_suffix(m.group(2)):
+                n += 1
+                if len(samples) < _UNRESOLVED_SAMPLES_MAX:
+                    samples.append(whole)
+            else:
+                foreign += 1
+                if len(foreign_samples) < _FOREIGN_SAMPLES_MAX:
+                    foreign_samples.append(whole)
+        if n <= 0 and foreign <= 0:
             return
         if sid not in _NO_SESSION_ORPHANS and len(_NO_SESSION_ORPHANS) >= _NO_SESSION_ORPHANS_MAX:
             # 超上限淘汰最老的一条（与 _EXT_FRAMES_MAX 同思路，防止内存被顶上去）
@@ -5854,26 +5987,38 @@ def _count_orphans_without_session(sid, text):
             _NO_SESSION_ORPHANS.pop(oldest, None)
         rec = _NO_SESSION_ORPHANS.get(sid)
         if rec is None:
-            _NO_SESSION_ORPHANS[sid] = [n, samples, time.time()]
+            _NO_SESSION_ORPHANS[sid] = [n, samples, time.time(), foreign, foreign_samples]
         else:
             rec[0] += n
             for x in samples:
                 if len(rec[1]) < _UNRESOLVED_SAMPLES_MAX and x not in rec[1]:
                     rec[1].append(x)
+            rec[3] = int(rec[3] or 0) + foreign
+            for x in foreign_samples:
+                if len(rec[4]) < _FOREIGN_SAMPLES_MAX and x not in rec[4]:
+                    rec[4].append(x)
             rec[2] = time.time()
     except Exception:
         pass
 
 
 def _take_orphans_without_session(sid):
-    """取走并清零（同一 sid 只应被一条 RESTORE 事件消费）。返回 (count, samples)。"""
+    """取走并清零（同一 sid 只应被一条 RESTORE 事件消费）。
+
+    返回 `(unresolved_n, unresolved_samples, foreign_n, foreign_samples)`。
+    两组分别对应「本机签发过、映射丢了」与「非本机签发」，消费方（代理链路
+    `_restore_emit` 与面板 ext 链路）必须分开记，不能相加后只报一个数。
+    """
     try:
         rec = _NO_SESSION_ORPHANS.pop(sid, None)
         if not rec:
-            return 0, []
-        return int(rec[0] or 0), [str(x) for x in (rec[1] or [])][:_UNRESOLVED_SAMPLES_MAX]
+            return 0, [], 0, []
+        return (int(rec[0] or 0),
+                [str(x) for x in (rec[1] or [])][:_UNRESOLVED_SAMPLES_MAX],
+                int(rec[3] or 0) if len(rec) > 3 else 0,
+                [str(x) for x in (rec[4] if len(rec) > 4 else [])][:_FOREIGN_SAMPLES_MAX])
     except Exception:
-        return 0, []
+        return 0, [], 0, []
 
 
 
@@ -10423,6 +10568,10 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
     restored_count = int(s.get("restored", 0) or 0)
     restored_unique = len(s.get("restored_tokens", set()) or set())
     unresolved = int(s.get("unresolved", 0) or 0)
+    # 非本机签发的占位符形态字符串（客户端历史携带的外来 token / 对话里写的
+    # 文档示例 / 模型自造）。与 `unresolved` 分开计数：本机无论如何都还原不了
+    # 它们，算成「还原失败」只会让指标长期虚高（真机：当天 4 条里 0 条是前者）。
+    foreign = int(s.get("foreign", 0) or 0)
     degraded = int(s.get("degraded", 0) or 0)
     restore_signed_skipped = int(s.get("restore_signed_skipped") or 0)
     if masked_count == 0:
@@ -10574,12 +10723,19 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
         restored=restored_count,
         restored_unique=restored_unique,
         unresolved=unresolved,
+        # 非本机签发计数：**不参与 `restore_status` 与 `success` 判定**，也不进
+        # 「还原失败」告警；前端单列一行展示，明细里带上样本以便定位。
+        foreign=foreign,
         # 未还原占位符样本（最多 5 条；样本本身是占位符，不含任何原文）。
         # 此前**只有扩展链路**（panel 的 /api/ext/restore）外发它，代理链路只在
         # 会话里收集 —— 面板只显示一个数字，用户无从区分「模型改写/自造占位符」
         # 与「映射过期或引擎重启导致查不到原文」，而这两种情况的处置完全不同。
         **({"unresolved_samples": [str(x)[:120] for x in (s.get("unresolved_samples") or [])][:5]}
            if s.get("unresolved_samples") else {}),
+        # 外来/示例占位符样本：与 `unresolved_samples` 同源存储规则，只是来源不同
+        # （后缀从未由本机签发过）。分开给前端，才能把两类在详情弹窗里分开展示。
+        **({"foreign_samples": [str(x)[:120] for x in (s.get("foreign_samples") or [])][:5]}
+           if s.get("foreign_samples") else {}),
         # 靠宽松兜底（模型剥了花括号）修回来的个数。
         # 这个计数一直存在于会话里，但**从没被发进事件**——注释写着「计数进
         # RESTORE 事件，让用户看得见」，实际 _emit 参数里没有它，于是

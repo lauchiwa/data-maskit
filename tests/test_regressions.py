@@ -1464,6 +1464,37 @@ class WriterResilienceTests(unittest.TestCase):
             self.assertNotIn("{{", str(it))
         self.assertEqual(len(data["items"]), 2, "不同打码预览分别聚合，不与真实明文合并")
 
+    def test_foreign_tokens_are_counted_but_never_alarm(self):
+        """外来占位符（非本机签发）单独进 `daily_status` 的 'foreign' 行。
+
+        它们**不得**计入 restore_failed / alerts：真机实测当天 4 条「还原失败」里
+        0 条是本机签发过的 token，混在一起会让面板数字长期虚高，用户据此以为
+        「又一堆没还原」（实际上是文档示例/外部历史/模型自造）。
+        """
+        now = time.time()
+        base = event_store.today_stats(now=now)
+        ph = "{" * 2 + "LABEL_xbbtds" + "}" * 2
+        event_store.append_event({
+            "ts": now, "type": "RESTORE", "restored": 0,
+            "status": "no_placeholder_in_response",
+            "restore_status": "no_placeholder_in_response",
+            "unresolved": 0, "foreign": 3, "foreign_samples": [ph],
+        })
+        st = event_store.today_stats(now=now)
+        self.assertEqual(st["restore_by_status"].get("foreign"), 1,
+                         "外来占位符必须单独可见（否则用户在详情页看不到它）")
+        self.assertEqual(st["restore_failed"], base["restore_failed"],
+                         "外来占位符不得计入「还原失败」")
+        self.assertEqual(st["alerts"], base["alerts"], "也不得计入告警总数")
+        # 反向锁：本机签发过、映射丢了的照旧必须计入还原失败
+        event_store.append_event({
+            "ts": now, "type": "RESTORE", "restored": 0, "status": "unresolved",
+            "restore_status": "unresolved", "unresolved": 1, "foreign": 0,
+        })
+        st2 = event_store.today_stats(now=now)
+        self.assertEqual(st2["restore_failed"], base["restore_failed"] + 1,
+                         "真·映射丢失（本机签发过）仍必须计入「还原失败」")
+
     def test_clear_events_also_clears_summary_tables(self):
         """SHIELD-CLEAR-001 更新（用户要求：统计永久保存）：清空日志清事件明细
         + daily_words（词级 PII 明细），但 daily_stats/daily_status/daily_tokens
@@ -4417,6 +4448,9 @@ class LoosePlaceholderRestoreTests(_RuleTestBase):
         """收紧计数的反向锁：带花括号形态与纯辅音后缀查不到时必须计数。
 
         它们命中即「真·占位符形态没还原」，藏起来等于静默漏报。
+        **计到哪一类取决于来源**：这几个后缀本机从没签发过（就是文档里那种示例
+        形态），所以进 `foreign`（外部/示例占位符），不进「还原失败」告警；
+        「签发过但映射丢了」那一条由下个用例锁。
         """
         sid = "loose-fp-count"
         tr._new_session(sid)
@@ -4424,8 +4458,38 @@ class LoosePlaceholderRestoreTests(_RuleTestBase):
                      "变量 MAX_bcdfgh 出现"]:
             with self.subTest(text=text):
                 self.assertEqual(tr.restore_final(text, sid), text)
-        self.assertEqual(int(tr.sessions[sid].get("unresolved") or 0), 4,
-                         "带花括号与纯辅音后缀的查不到必须计数")
+        s = tr.sessions[sid]
+        self.assertEqual(int(s.get("foreign") or 0), 4,
+                         "带花括号与纯辅音后缀的查不到必须计数（未签发 → foreign）")
+        self.assertEqual(int(s.get("unresolved") or 0), 0,
+                         "本机从没签发过的后缀不该进「还原失败」告警")
+
+    def test_issued_suffix_that_lost_its_mapping_counts_as_unresolved(self):
+        """反向锁：**本机签发过**的后缀查不到原文时，必须进 unresolved。
+
+        与上一条互补：判据是「这个后缀在不在签发台账里」，不是 token 的形态。
+        这条路径才是用户真正要排查的「还原失败」（复用表淘汰 / 重启后没预热回来）。
+        """
+        sid = "issued-lost"
+        tr._new_session(sid)
+        real = "172.20.30.40"
+        tok = tr._recall_token(real, "IPPRIVATE")
+        try:
+            self.assertTrue(tr._issued_suffix(tr._token_suffix(tok)),
+                            "真实签发路径必须把后缀登记进台账")
+            # 模拟映射丢失：会话 rev 与复用表都拿掉（引擎重启后没预热回来的样子）
+            tr.sessions[sid]["rev"].pop(tok, None)
+            tr._tables().rev.pop(tok, None)
+            self.assertEqual(tr.restore_final(f"主机 {tok}", sid), f"主机 {tok}",
+                             "查不到原文仍必须原样返回，绝不猜")
+            s = tr.sessions[sid]
+            self.assertEqual(int(s.get("unresolved") or 0), 1,
+                             "本机签发过的后缀丢失映射 = 真·还原失败，必须告警")
+            self.assertEqual(int(s.get("foreign") or 0), 0)
+        finally:
+            tr._RECENT_FWD.pop(real, None)
+            tr._RECENT_REV.pop(tok, None)
+            tr._suffix_index_del(tok)
 
     def test_degraded_is_reported_separately_from_restored(self):
         """用户要能在日志里看出「这次是靠兜底救回来的」，而不是一切正常。"""
@@ -5687,13 +5751,24 @@ class LLMMutatedPlaceholderAutoHealTests(unittest.TestCase):
         # 真实登记过的占位符照常还原，删除模糊匹配不影响正常路径
         self.assertEqual(tr.restore_final(f"主机 {tok_orig}", sid), f"主机 {real_ip}")
 
-    def test_unresolved_counter_records_fabricated_token(self):
-        """模型自造的占位符必须计入 unresolved，让用户看得见「这里是编的」。"""
+    def test_fabricated_token_is_traced_but_not_counted_as_restore_failure(self):
+        """模型自造的占位符必须**留痕**，但不算「还原失败」。
+
+        本机从没签发过 `{{IPPRIVATE_83fc02}}` 这类后缀，还原不了是必然的、也不是
+        引擎的错；把它们算进「还原失败」会让面板数字长期虚高（真机实测：当天 4 条
+        「还原失败」里 0 条是本机签发过的 token，15 条历史共 69 个样本 0 个命中）。
+        但绝不能静默：样本要留给详情弹窗，用户得看得见「这里是编的」。
+        """
         sid = "mutated-count"
         tr._new_session(sid)
         tr.restore_final("网关 {{IPPRIVATE_83fc02}} 与 {{PHONE_aabbcc}}", sid)
-        self.assertEqual(tr.sessions[sid].get("unresolved"), 2)
-        self.assertEqual(tr.sessions[sid].get("restored", 0), 0)
+        s = tr.sessions[sid]
+        self.assertEqual(int(s.get("unresolved") or 0), 0,
+                         "自造 token 不该算「还原失败」")
+        self.assertEqual(int(s.get("foreign") or 0), 2, "但必须留痕，不能静默")
+        self.assertEqual(len(s.get("foreign_samples") or []), 2,
+                         "样本要留给详情弹窗定位")
+        self.assertEqual(s.get("restored", 0), 0)
 
     def test_anti_token_chaining_in_recall(self):
         """占位符被当成 orig 传入 _recall_token 时，绝不套娃生成新占位符。
@@ -8206,7 +8281,9 @@ class NerLongTextSegmentationTests(unittest.TestCase):
 
         text = "甲" * (ner_engine.MAX_TEXT_CHARS + 500)
         before = ner_engine.cache_stats()["long_split_calls"]
-        with mock.patch.object(ner_engine, "extract_entities", fake):
+        # 分段内部调的是推理主体；公共入口那层会再过滤代码标识符，
+        # 在这里 mock 公共入口等于测不到分段逻辑。
+        with mock.patch.object(ner_engine, "_extract_entities_raw", fake):
             out = ner_engine._extract_long(text)
         self.assertEqual(ner_engine.cache_stats()["long_split_calls"] - before, 1,
                          "分段次数未计数")
@@ -8534,9 +8611,12 @@ class CredentialSynonymAndRestoreTests(unittest.TestCase):
         self.assertEqual(full_output, "run {{CONNSTR_kppmhp}} done",
                          "无会话状态下半截占位符绝不许吞字（前缀丢失）")
 
-        # 完整孤儿占位符必须如实记录孤儿计数
+        # 完整孤儿占位符必须如实记录孤儿计数（来源分开记，合计不得丢）
         tr.restore("echo {{CONNSTR_kppmhp}}", dead_sid)
-        self.assertGreaterEqual(tr._NO_SESSION_ORPHANS.get(dead_sid, [0])[0], 1,
+        rec = tr._NO_SESSION_ORPHANS.get(dead_sid)
+        self.assertIsNotNone(rec, "无会话请求遇到占位符必须如实记录孤儿计数")
+        total = int(rec[0] or 0) + (int(rec[3] or 0) if len(rec) > 3 else 0)
+        self.assertGreaterEqual(total, 1,
                                 "无会话请求遇到占位符必须如实记录孤儿计数")
 
 
@@ -8657,6 +8737,86 @@ class CustomWordTableIsolationTests(unittest.TestCase):
         self.assertEqual(len(re.findall(r"\{\{TERM_[a-z]{6}\}\}", out)), 1,
                          "整段长词应作为一个整体命中，而不是被短词切开")
         self.assertEqual(tr.word_table_issues(), {})
+
+
+class IssuedSuffixLedgerTests(unittest.TestCase):
+    """签发台账（`_ISSUED_SUFFIXES`）：把「映射丢了」与「压根不是本机签的」分开的判据源。
+
+    台账只存 6 位后缀（随机指纹），不含原文与标签；本机没签过就永远判为外来。
+    """
+
+    def test_roundtrip_and_shape_guard(self):
+        sfx = "zqkxdw"          # 6 位纯辅音，不会被真实签发撞上
+        self.assertFalse(tr._issued_suffix(sfx))
+        with tr._STATE_LOCK:
+            tr._note_issued_suffix(sfx)
+        self.assertTrue(tr._issued_suffix(sfx), "登记后必须可见")
+        with tr._STATE_LOCK:
+            tr._note_issued_suffix("abc")     # 非 6 位：形态判据直接拒收
+        self.assertFalse(tr._issued_suffix("abc"))
+        self.assertFalse(tr._issued_suffix(""), "空后缀绝不命中")
+
+    def test_cap_evicts_oldest(self):
+        """封顶后按插入序淘汰最老的（判据退化为「近期签发过」，方向保守）。"""
+        saved = dict(tr._ISSUED_SUFFIXES)
+        saved_max = tr._ISSUED_SUFFIXES_MAX
+        try:
+            with tr._STATE_LOCK:
+                tr._ISSUED_SUFFIXES.clear()
+                tr._ISSUED_SUFFIXES_MAX = 10
+                for i in range(12):
+                    tr._note_issued_suffix("aa%04d" % i)
+            self.assertFalse(tr._issued_suffix("aa0000"), "最老的应被淘汰")
+            self.assertTrue(tr._issued_suffix("aa0011"), "最新的必须还在")
+        finally:
+            with tr._STATE_LOCK:
+                tr._ISSUED_SUFFIXES.clear()
+                tr._ISSUED_SUFFIXES.update(saved)
+            tr._ISSUED_SUFFIXES_MAX = saved_max
+
+
+class NerCodeIdentifierFilterTests(unittest.TestCase):
+    """NER 出口的代码标识符过滤（2026-10-16 真机事件库实测后加）。
+
+    真机现象：`JSON.parse`（length=10）、`FSPAGE_9105`、随机串被分别判成
+    NAME / NAME / ORG；当日 NAME 命中 3162 次里 **1882 次**的原文以 ASCII 字母
+    开头（`u*` 长度 2、`n******r` 长度 8…），几乎全是变量名/方法名。误掩码会把
+    模型看到的代码改成占位符，比漏掉一个英文人名危险得多——后者本来就不是
+    中文 NER 引擎的职责。
+    """
+
+    def test_code_identifier_shapes_are_filtered(self):
+        import ner_engine as ner
+        for bad in ("JSON.parse", "FSPAGE_9105", "user", "nodeList", "MAX_SIZE",
+                    "obj.field", "arr[0]", "os.path.join", "TRyJbxxDshVO`"):
+            with self.subTest(text=bad):
+                self.assertTrue(ner._looks_like_code_identifier(bad), bad)
+
+    def test_chinese_and_spaced_names_are_kept(self):
+        import ner_engine as ner
+        for good in ("张大锤", "北京朝阳区", "某某(有限公司)", "John Smith", "John"):
+            with self.subTest(text=good):
+                self.assertFalse(ner._looks_like_code_identifier(good), good)
+
+    def test_extract_entities_filters_identifiers_at_public_exit(self):
+        """公共入口必须滤掉代码标识符；保留的实体连 start/end 一起原样带出。"""
+        import ner_engine as ner
+        raw = [{"type": "NAME", "start": 0, "end": 10, "text": "JSON.parse"},
+               {"type": "NAME", "start": 11, "end": 14, "text": "张大锤"}]
+        with mock.patch.object(ner, "_extract_entities_raw", return_value=raw):
+            got = ner.extract_entities("任意文本")
+        self.assertEqual(got, [{"type": "NAME", "start": 11, "end": 14, "text": "张大锤"}],
+                         "代码标识符被滤掉，中文人名必须连坐标一起保留")
+
+    def test_public_exit_is_the_only_filter_layer(self):
+        """过滤只在公共出口做一次（重复过滤会把已保留的项也删掉）。"""
+        import ner_engine as ner
+        with mock.patch.object(ner, "_extract_entities_raw",
+                               return_value=[{"type": "NAME", "start": 0, "end": 3,
+                                              "text": "张大锤"}]) as raw_mock:
+            got = ner.extract_entities("张大锤")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(raw_mock.call_count, 1)
 
 
 if __name__ == "__main__":

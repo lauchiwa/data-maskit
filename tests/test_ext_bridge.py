@@ -442,7 +442,12 @@ class MaskRestoreTests(ExtBridgeTestCase):
         r = self._restore(orphan, sid, stream_id="t4", final=True, escape=True)
         self.assertEqual(r.status_code, 200)
         self.assertIn("{{PHONE_qqqqqq}}", r.get_json()["text"], "查不到原文必须原样返回，绝不猜")
-        self.assertEqual(tr.sessions[sid].get("unresolved"), 1)
+        # 这个后缀本机从没签发过（不是 mask 出来的），所以进 foreign 而不是
+        # unresolved —— 「还原失败」只统计本机签发过、映射丢了的那些。
+        self.assertEqual(tr.sessions[sid].get("unresolved"), 0,
+                         "非本机签发的后缀不该算「还原失败」")
+        self.assertEqual(int(tr.sessions[sid].get("foreign") or 0), 1,
+                         "但必须留痕（外来/示例占位符），不能静默")
 
 
 class SidAndLimitTests(ExtBridgeTestCase):
@@ -1265,14 +1270,19 @@ class ExtEventFieldParityTests(ExtBridgeTestCase):
         return max(evs, key=lambda e: int(e.get("seq") or 0))
 
     def test_restore_event_carries_unresolved_for_ui(self):
+        """RESTORE 事件必须带 `unresolved`（本机签发过、映射丢了）与 `foreign`
+        （非本机签发）两个计数——用户要能分清「引擎没还原」与「这本来就不是我们签的」。
+        """
         j = self._mask('{"c":"13812345678"}').get_json()
         orphan = '{"c":"{{PHONE_qqqqqq}}"}'
         out = self._restore(orphan, j["sid"], stream_id="parity", final=True, escape=True)
         self.assertIn("{{PHONE_qqqqqq}}", out.get_json()["text"])
 
         ev = self._newest_ext_event("RESTORE")
-        self.assertEqual(ev.get("unresolved"), 1,
-                         "unresolved 必须进事件，否则日志页的「未还原」告警对扩展流量永不触发")
+        self.assertEqual(ev.get("foreign"), 1,
+                         "外来占位符必须进事件，否则用户分不清「引擎坏了」与「不是我们签的」")
+        self.assertEqual(ev.get("unresolved"), 0,
+                         "本机没签发过的后缀不该算「还原失败」（会让面板数字长期虚高）")
         self.assertEqual(ev.get("degraded"), 0, "degraded 需要有心跳值（0 也是值）")
 
     def test_restore_items_distinguish_echoed_from_not_echoed(self):

@@ -699,6 +699,16 @@ def _update_stats(conn, rec, replay=False):
                 "ON CONFLICT(day,status) DO UPDATE SET cnt=cnt+1",
                 (day, str(rec.get("status"))),
             )
+        # 外来/示例占位符单独记一行（status='foreign'）：它们不是本机签发的，
+        # **不进「还原失败」告警**，但用户需要知道今天有多少「看着像占位符、
+        # 其实不是我们签的」字符串混在响应里。与主状态行并存：一条事件可以同时
+        # 命中 `unresolved` 与 `foreign`（两类 token 出现在同一个响应里）。
+        if typ == "RESTORE" and (_int_or_none(rec.get("foreign")) or 0) > 0:
+            conn.execute(
+                "INSERT INTO daily_status(day, status, cnt) VALUES(?,?,1) "
+                "ON CONFLICT(day,status) DO UPDATE SET cnt=cnt+1",
+                (day, "foreign"),
+            )
         # 敏感词明细只收 MASK 事件（避免 RESTORE 重复计数）
         # Token 用量与模型统计：收 RESTORE 与带 usage 的 PASS 事件（透传直连）
         if typ in ("RESTORE", "PASS"):
@@ -2367,6 +2377,9 @@ def today_stats(now=None):
     # 审计高危并入告警口径（口径与审计页一致，见 _audit_high_count）
     audit_high = _audit_high_count(day_start)
     alerts += audit_high
+    # 外来/示例占位符只随 restore_by_status 下发（键 'foreign'），**不进 alerts**：
+    # 它们不是本机签发的，算成告警会让指标长期虚高（真机实测：当天 4 条「还原
+    # 失败」里 0 条是本机签发过的 token，69 个历史样本 0 个命中已签发集合）。
     restore_by_status = dict(status_map)
     by_label, by_label_words, top_list, words_by_ingress = _word_groups(word_rows)
     return {

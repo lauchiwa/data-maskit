@@ -481,6 +481,10 @@ class EmittedFieldRegistrationTests(unittest.TestCase):
         "items": "打码条目：导出侧单独做 original 剔除后保留（见 panel.py 的 clean_items）",
         "restore_status": "还原态枚举：仅列表/弹窗展示",
         "unresolved": "未还原占位符数：仅展示与自检",
+        # 外来/示例占位符（非本机签发）：与 unresolved 成对出现，同样只展示。
+        # 不进导出是为了不让「导入一份日志」把本机从未签发过的占位符带进别人眼里——
+        # 它本来就不是本机的数据。
+        "foreign": "外来/示例占位符数（非本机签发）：仅展示与自检",
         "restored_unique": "还原去重数：仅展示",
         "masked_total": "本轮打码总数：仅展示",
         "new_count": "本轮新增映射数：仅展示",

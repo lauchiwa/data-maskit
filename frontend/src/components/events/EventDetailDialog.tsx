@@ -551,6 +551,13 @@ export function EventDetailDialog({
                         {t('logs.colUnresolved')} <strong>{event.unresolved}</strong>
                       </span>
                     )}
+                    {/* 外部占位符：本机从未签发过的后缀。同样要看得见，但中性色、
+                        不报警：还原不了它们是必然的，不是引擎的错 */}
+                    {(event.foreign ?? 0) > 0 && (
+                      <span className="text-muted-foreground" title={t('logs.foreignHint')}>
+                        {t('logs.colForeign')} <strong>{event.foreign}</strong>
+                      </span>
+                    )}
                     {(event.degraded ?? 0) > 0 && (
                       <span className="text-muted-foreground">
                         {t('logs.colDegraded')} <strong>{event.degraded}</strong>
@@ -567,6 +574,14 @@ export function EventDetailDialog({
                   <div className="mt-1.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] leading-snug text-amber-700 dark:text-amber-300">
                     <span>{t('logs.unresolvedSamples')}</span>
                     <span className="ml-1 font-mono">{event.unresolved_samples.join(' / ')}</span>
+                  </div>
+                )}
+                {/* 外来/示例占位符样本：本机从未签发过的那些。用中性色与上面那条区分——
+                    这条不是故障，是「模型/历史里带来的、本机无能为力的东西」。 */}
+                {Array.isArray(event.foreign_samples) && event.foreign_samples.length > 0 && (
+                  <div className="mt-1.5 rounded border border-border bg-muted/40 px-2 py-1 text-[11px] leading-snug text-muted-foreground">
+                    <span>{t('logs.foreignSamples')}</span>
+                    <span className="ml-1 font-mono">{event.foreign_samples.join(' / ')}</span>
                   </div>
                 )}
               </div>

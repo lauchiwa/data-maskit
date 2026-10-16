@@ -15,7 +15,7 @@ Data Maskit 控制面板 - 本地 Flask 服务
 # 本程序基于「希望有用」的目的分发，但不附带任何担保；亦无对适销性或特定用途
 # 适用性的默示担保。详见 GNU Affero 通用公共许可证。
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
-__version__ = '0.11.0'
+__version__ = '0.11.1'
 import json
 import codecs
 import copy
@@ -7501,9 +7501,13 @@ def api_ext_restore():
                 # 什么告警都不显示，用户无从判断是"引擎坏了"还是"模型在编"（代理链路
                 # 正是因为看得见才没有踩这个坑）。这里补齐，两个字段都不进任何聚合。
                 unresolved = int(s.get("unresolved") or 0)
+                # 非本机签发的占位符形态字符串：与 unresolved 分开记，不进告警
+                # （与代理链路 `_emit_restore_summary` 同口径）。
+                foreign = int(s.get("foreign") or 0)
+                foreign_samples = [str(x) for x in (s.get("foreign_samples") or [])][:5]
                 degraded = int(s.get("degraded") or 0)
                 # 未还原占位符样本：只用于定位「到底是哪些 token 没还原、什么形态」。
-                # 存的是占位符本身（不含任何明文），落库安全。取不到就是空列表。
+                # 存的是占位符本身（不含任何原文），落库安全。取不到就是空列表。
                 unresolved_samples = [str(x) for x in (s.get("unresolved_samples") or [])][:5]
                 # 「回显但未还原」的后缀集合与响应侧契约豁免块数：与代理链路同源读取。
                 # 前者区分「模型没提」与「回显了但映射丢了」，后者让签名思考块豁免
@@ -7513,12 +7517,17 @@ def api_ext_restore():
                 # 会话不存在时 restore() **只数不还原**（安全门：放行会让自造 sid 借
                 # 全局复用表还原占位符），计数落在兜底表里，这里并进本次事件——
                 # 否则「重启引擎后打开历史对话，页面上满屏 {{...}}」在事件页是 0。
-                _ns_count, _ns_samples = tr._take_orphans_without_session(sid)
+                _ns_count, _ns_samples, _ns_foreign, _ns_foreign_samples = tr._take_orphans_without_session(sid)
                 if _ns_count:
                     unresolved += _ns_count
                     for _x in _ns_samples:
                         if len(unresolved_samples) < 5 and _x not in unresolved_samples:
                             unresolved_samples.append(_x)
+                if _ns_foreign:
+                    foreign += _ns_foreign
+                    for _x in _ns_foreign_samples:
+                        if len(foreign_samples) < 5 and _x not in foreign_samples:
+                            foreign_samples.append(_x)
                 try:
                     restored_tokens = s.get("restored_tokens") or set()
                     seen_toks = set()
@@ -7574,9 +7583,11 @@ def api_ext_restore():
                 except Exception:
                     items = []
             # 仅在有还原成功、有异常未还原，或会话发生过敏感词打码时才记录 RESTORE，杜绝空事件刷屏
+            # （外来占位符单独计数，但同样只在真出现时建事件）
             should_emit = (
                 _ext_cfg().get("ext_record_events", True)
-                and (restored > 0 or unresolved > 0 or degraded > 0 or len(items) > 0)
+                and (restored > 0 or unresolved > 0 or degraded > 0
+                     or foreign > 0 or len(items) > 0)
             )
             if should_emit:
                 # 还原后的正文里可能**裸复述**了模型见过的凭据原文，落库前必须清洗
@@ -7594,6 +7605,9 @@ def api_ext_restore():
                 tr._emit("RESTORE", ingress="ext", sid=sid,
                          restored=restored, unresolved=unresolved, degraded=degraded,
                          unresolved_samples=unresolved_samples,
+                         # 外来/示例占位符：单独上报，**不进 unresolved**（与代理链路同口径）
+                         foreign=foreign,
+                         **({"foreign_samples": foreign_samples} if foreign_samples else {}),
                          # 响应侧契约豁免计数（与 MASK 侧同名；缺省不带，避免噪声）
                          **({"signed_blocks_skipped": restore_signed_skipped}
                             if restore_signed_skipped else {}),

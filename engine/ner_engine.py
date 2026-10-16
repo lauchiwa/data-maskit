@@ -171,6 +171,49 @@ _INIT_LOCK = threading.Lock()
 # 含汉字判定（编译一次）：整叶早返回与窗口级跳过共用，别在热路径上重复写字符比较。
 _CJK_RX = re.compile("[\u4e00-\u9fff]")
 
+# ── 代码标识符过滤（2026-10-16 真机事件库实测后加） ───────────────────────
+#
+# 现象：`JSON.parse`（label=NAME, length=10）、`FSPAGE_9105`、`TRyJbxxDshVO\``
+# 这类代码片段里的标识符被中文 BERT 判成人名/机构名。当日 NAME 命中 3162 次，
+# 其中 **1882 次原文以 ASCII 字母开头**（`u*` 长度 2、`n******r` 长度 8…），
+# 几乎全是变量名/方法名。后果比「多掩码一个词」严重得多：请求里的代码被改成了
+# 占位符，模型据此分析/改代码必然出错，而用户只看到「AI 答得不对」，
+# 根本归因不到脱敏层。
+#
+# 为什么已有的「纯英文/代码窗口直接跳过」挡不住：那道闸的判据是**整段无汉字**
+# （`_CJK_RX.search(text) is None`），而带中文注释或中文字符串的代码块照常进
+# 推理，subword 就把其中的 ASCII 标识符切成了「人名」。
+#
+# 代价取向：**宁可漏掩码，不可误掩码**。过滤掉的全是 ASCII 标识符形态，而本引擎
+# 本来就只负责**中文**人名/机构/地址；英文人名（`John Smith`）含空格不受影响，
+# 首字母大写的单个英文词（`John`）也仍交给模型判断。
+_IDENT_RX = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
+# 只在**不含汉字**的串上生效的「代码标点」：刻意不收 `- , ; ' "`，
+# 它们在自然文本/英文人名（`Jean-Luc`、`O'Brien`）里也常见，收了会误伤。
+_CODE_PUNCT = "._$`()[]{}<>/\\:=+*&|!#%@^~"
+
+
+def _looks_like_code_identifier(text) -> bool:
+    """ASCII 代码标识符形态（`JSON.parse` / `FSPAGE_9105` / `user`）→ True。
+
+    判据顺序（先宽后窄，含汉字的直接放过）：
+      1. 含汉字 → False（中文实体正是本引擎的职责，绝不插手）；
+      2. 含空白 → False（`John Smith` 这类英文人名/机构名）；
+      3. 含代码标点 → True（`JSON.parse`、`obj.field`、`arr[i]`）；
+      4. 纯 ASCII 标识符：全大写（常量）或首字母小写（变量）→ True；
+      5. 其余（首字母大写的纯字母词，如 `John`）→ False，交回模型判断。
+    """
+    t = str(text or "")
+    if not t or _CJK_RX.search(t):
+        return False
+    if any(ch in t for ch in " \t\r\n"):
+        return False
+    if any(ch in _CODE_PUNCT for ch in t):
+        return True
+    if not _IDENT_RX.match(t):
+        return False
+    return bool(t.isupper() or t[:1].islower())
+
 
 def _cgroup_cpu_quota():
     """容器 CPU 配额（核数，可为小数）；无配额或读不到返回 None。只读 /sys，不抛异常。"""
@@ -999,6 +1042,22 @@ def extract_entities(text: str) -> List[Dict]:
 
     返回: [{"type": "NAME"|"ORG"|"ADDR", "start": int, "end": int, "text": str}]
     返回的 dict 允许调用方读取，改动不会污染缓存（每次返回独立副本）。
+
+    **这是唯一对外入口**：出口统一过一层「代码标识符」过滤
+    （`_looks_like_code_identifier`，理由见其注释）——中文 BERT 在带中文注释的
+    代码窗口里会把 `JSON.parse` 这类标识符判成人名，而误掩码会直接改坏模型
+    看到的代码。过滤只删实体、不改变任何已通过判据的实体。
+    """
+    return [e for e in _extract_entities_raw(text)
+            if not _looks_like_code_identifier(e.get("text"))]
+
+
+def _extract_entities_raw(text: str) -> List[Dict]:
+    """`extract_entities` 的推理主体。
+
+    **不要直接从业务代码调它**：出口过滤在公共入口那层，绕过等于放代码标识符
+    继续被当作人名掩码。分段递归（`_extract_long`）也调本函数，避免同一实体
+    被过滤两次。
     """
     if not text or not isinstance(text, str) or len(text.strip()) < 2:
         return []
@@ -1305,7 +1364,7 @@ def _extract_long(text: str) -> List[Dict]:
         seg = text[start:cut]
         segs += 1
         assert len(seg) <= MAX_TEXT_CHARS, len(seg)
-        ents = extract_entities(seg)
+        ents = _extract_entities_raw(seg)
         for e in ents:
             # 平移回整条文本的坐标系；`text` 字段与段内一致，无需重取。
             out.append({

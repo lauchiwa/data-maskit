@@ -223,14 +223,20 @@ export interface ShieldEvent {
   count: number
   restored: number
   /**
-   * 查不到原文、原样透传给客户端的占位符数（仅 RESTORE 事件）。
-   * >0 多数意味着模型自造了一个我们从未生成过的占位符——它把
-   * {{LABEL_hex6}} 的随机后缀当成可计算的数字改写了。这类占位符
-   * 无法还原（对应的原文从不存在），只能如实告诉用户。
+   * 本机签发过、但映射已丢（复用表淘汰 / 会话被扫 / 重启后未预热回来）的占位符数
+   * （仅 RESTORE 事件）。这一类才是**真的要排查**的还原失败。
    */
   unresolved?: number
   /** 未还原占位符样本（引擎侧外发；仅未还原时存在，用于区分模型改写与映射丢失） */
   unresolved_samples?: string[]
+  /**
+   * 非本机签发的占位符形态字符串数（仅 RESTORE 事件）：客户端历史携带的外来 token、
+   * 对话里写的文档示例、模型自己编的。本机无论如何都还原不了它们，
+   * **不计入「还原失败」与告警**，否则面板数字会长期虚高。
+   */
+  foreign?: number
+  /** 外来/示例占位符样本（引擎侧外发；仅存在时才有，供详情弹窗定位） */
+  foreign_samples?: string[]
   /**
    * 靠宽松兜底修回来的占位符数（仅 RESTORE 事件）。模型把 {{}} 剥掉或写残时，
    * _LOOSE_PLACEHOLDER_RX 捞回来的那些。是成功路径，但值得看见——
@@ -402,6 +408,13 @@ export interface TodayStats {
   restored: number
   restore_ok: number
   restore_failed: number
+  /**
+   * 按 `restore_status` 分组的事件数。除 `restored` / `unresolved` / `no_*` 外，
+   * 还含 `foreign`：响应里出现了本机从未签发过的占位符形态字符串（外来 token /
+   * 文档示例 / 模型自造）。`foreign` **不计入 `restore_failed` 与 `alerts`**——
+   * 本机无论如何都还原不了它们，算成还原失败会让指标长期虚高。
+   */
+  restore_by_status?: Record<string, number>
   tokens: { prompt: number; completion: number }
   /**
    * 前缀保真度。**null = 本区间没有 MASK 事件样本**（空库 / 老库升级当天），
