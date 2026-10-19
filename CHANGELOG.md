@@ -2,7 +2,43 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+每个版本章节的**开头**必须有 `### 更新摘要 / Summary`（中英各一至三条）—— 它会被原样用作用户能看到的「版本介绍」（GitHub Release 首屏与更新弹窗），所以只写用户能感知到的变化，不写实现细节。技术条目写在摘要下面的分节里。
+
+## [0.11.2] - 2026-10-19
+
+### 更新摘要 / Summary
+- 更新弹窗和「关于」页现在直接告诉你这次改了什么，不再只有一句「修复 2 项」或一整段技术日志。
+- Windows 桌面版不会再出现「点了启动却起不来」：端口探测多了一条兜底，不再单靠系统命令。
+- 启动失败时不再只有一句「未就绪」：端口被占用、旧引擎残留、令牌没写出来会分开说明，日志也不会再因为进程被杀而整片丢失。
+- The update card and About page now tell you what actually changed, instead of a bare count or a wall of technical text.
+- Windows desktop no longer fails to start: port detection has a fallback when the system command reports nothing.
+- A failed start now says why — port taken, stuck engine, or missing token — and engine logs survive a force-kill.
+
+### 修复
+- Windows 启动：端口探测不再只依赖系统命令，命令被拦截或超时返空时改用连接探测兜底。此前该命令一旦失灵，就绪判定永远认为端口未监听，点启动会等满 60 秒后报失败，常驻守护还会反复重启正常工作的代理。
+- 引擎日志：壳层强杀引擎时，`engine-stdout.log` 的块缓冲来不及 flush，内存里的诊断行随进程一起消失（引擎存活期间该文件恒为空）。现由壳层注入 `PYTHONUNBUFFERED`，并把 `[panel]` / `[engine]` / `[proxy]` 诊断行落盘到数据目录 `engine.log`（2MB 轮转）；`SHIELD` 事件行携带原文预览，仍然只进内存。
+- 引擎启动：守护线程的假死判定（6 轮 × 2s ≈ 12s）比就绪预算（20s）更早，会把**正在初始化**的引擎强杀重拉，慢机上表现为「永远起不来 / 反复重启」；现加与就绪预算同值的启动宽限。就绪超时也不再只报一句「未就绪」：区分端口被第三方进程 / 本产品残留引擎占用、系统查不到占用 PID、令牌未写出，并把启动失败现场补写进 `crash-dumps`。
+
+### 优化
+- 版本说明：更新弹窗与「关于」页只展示「更新摘要」，不再把整章 CHANGELOG（含 `###` 标记与双语技术条目）原样渲染给用户；桌面端 `latest.json` 的 notes 也从「修复 N 项」改为摘要正文。
+- 版本说明：新增 `scripts/check-changelog.py` 门禁（已进 `scripts/verify-all.py` 的 version 组与 `ci.yml`），强制每个版本章节开头有中英双语「更新摘要」，并拦截反引号、源码文件名、`文件:行号`、4xx/5xx 状态码与硬技术术语。历史版本（0.10.1 之前）不回溯。
+
+### Fixed
+- Windows start: port detection no longer relies solely on the system command; when it is blocked or returns nothing, a connection probe takes over. A failing command previously made the readiness check see no listeners forever — start waited the full 60 s and reported failure, and the resident watchdog kept restarting a healthy proxy.
+- Engine log: a force-killed engine never got to flush its block-buffered stdout, so `engine-stdout.log` stayed empty for the engine's whole lifetime and every diagnostic line died with the process. The shell now injects `PYTHONUNBUFFERED` and persists `[panel]` / `[engine]` / `[proxy]` lines to `engine.log` in the data directory (2 MB rotation); `SHIELD` event lines carry plaintext previews and stay in memory only.
+- Engine start: the watchdog's hang detection (6 rounds × 2 s ≈ 12 s) fired before the 20 s readiness budget and killed engines that were still initialising, which on slow machines looked like "never starts / restarts forever"; a start grace period now matches the readiness budget. A readiness timeout also reports *why* (port held by a third-party process, a stuck engine of ours, an unidentifiable listener, or a token that was never written) and dumps the failure scene into `crash-dumps`.
+
+### Improvements
+- Update notes: the update card and About page now render only the user-facing summary instead of the whole CHANGELOG section (raw `###` markers and bilingual technical entries); the desktop `latest.json` notes carry the summary body instead of an "N fixed" count.
+- Update notes: new `scripts/check-changelog.py` gate (added to `scripts/verify-all.py`'s version group and `ci.yml`) requires a bilingual summary section at the top of every version section and rejects backticks, source filenames, `file:line` refs, 4xx/5xx status codes and hard jargon. Versions before 0.10.1 are exempt.
+
 ## [0.11.1] - 2026-10-16
+
+### 更新摘要 / Summary
+- 面板上的「还原失败」不再把不属于你的占位符也算进去，那个数字现在可信了。
+- 代码里的变量名、方法名不再被误当成人名打码，模型看到的代码和你写的一样。
+- The dashboard's "restore failures" no longer counts placeholders this machine never issued, so the number is trustworthy.
+- Code identifiers such as variable and method names are no longer masked as people's names, so the model sees your code unchanged.
 
 ### 修复
 - 引擎：还原失败不再把「本机从未签发过」的占位符算进去（客户端历史携带的外部 token / 对话里的文档示例 / 模型自造），新增「外部占位符」独立计数，面板与详情页分开显示。
@@ -13,6 +49,14 @@
 - Engine: NER no longer masks code identifiers (`JSON.parse`, `FSPAGE_9105`, …) as person/organization names, so the code a model sees is no longer rewritten (six in ten of the day's NAME hits were variable or method names).
 
 ## [0.11.0] - 2026-10-14
+
+### 更新摘要 / Summary
+- 日志页现在一眼能看出每条请求是成功还是失败，一次请求只占一行。
+- 列表更清爽：状态列直接告诉你是你这边断了、上游没回音，还是网络没连上。
+- 设置页复制失败会如实提示，版本号也不会再显示成两个 v。
+- Logs now show at a glance whether each request succeeded or failed, and one request is one row.
+- The list is tidier: the status column tells you whether the client, the upstream or the network is at fault.
+- A failed copy now says so, and the version number no longer shows a doubled "v".
 
 ### 新增
 - 面板日志：新增「结论」列（成功 / 有告警 / 失败 / 已取消 / 进行中 / 未完成 / 未处理 / 安全告警），一眼能看出请求成败；事件类型降为小图标。
@@ -43,6 +87,12 @@
 - Engine: restore details now distinguish "echoed but not restored" from "not echoed"; unresolved counting no longer fires on ordinary text such as date strings; restore-side contract skips of signed/encrypted thinking blocks are counted and visible.
 
 ## [0.10.1] - 2026-10-13
+
+### 更新摘要 / Summary
+- 上游偶尔不按规范收尾时，流式回复不再丢掉还原记录，也不会被误记成「你取消了请求」。
+- 换过上游地址后，连接会自动跟着换到新地址，不再把配好的地址拒掉。
+- When an upstream ends a stream sloppily, the restore record is no longer lost and the request is not mislabelled as a cancel.
+- After you change an upstream address, connections follow it instead of being rejected.
 
 ### 修复
 - 引擎：上游发完 `[DONE]` 后未按规范收尾响应体时，流式请求不再丢失还原记录，正常结束也不会被误记为「客户端取消」。

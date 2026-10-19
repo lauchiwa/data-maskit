@@ -6,6 +6,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { isTauri, shieldFetch, ShieldApiError } from './shield-fetch'
 import { normalizeVersion } from './utils'
+import { pickUserNotes } from './releaseNotes'
 
 export interface EngineState {
   ready: boolean
@@ -123,7 +124,9 @@ async function fetchLatestFromGitHub(): Promise<{ version?: string; notes?: stri
     })
     if (!resp.ok) throw new Error(`更新服务返回 HTTP ${resp.status}`)
     const d = (await resp.json()) as { tag_name?: string; body?: string; published_at?: string }
-    return { version: d.tag_name, notes: d.body, pub_date: d.published_at }
+    // body 是整章 CHANGELOG（含 `### 修复` 双语条目与原样 Markdown），只取「更新摘要」
+    // 那一段再交给弹窗 —— 否则用户在更新卡片里读到的是带 `###` 的技术日志（issue #40）。
+    return { version: d.tag_name, notes: pickUserNotes(d.body || ''), pub_date: d.published_at }
   } finally {
     clearTimeout(timeout)
   }

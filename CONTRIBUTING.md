@@ -20,7 +20,7 @@
 # 0. Python 3.13 + pip install -r requirements.txt（其它版本未验证）
 python -V   # 3.13.x
 
-# 1. 全量门禁（python / frontend / rust / version 四组共 15 项）
+# 1. 全量门禁（python / frontend / rust / version 四组共 23 项）
 python scripts/verify-all.py
 
 # 只想跑某几组 / 看清单
@@ -40,7 +40,8 @@ python tests/smoke_egress.py
 # frontend：类型检查 + 构建 + Lint + 中英文字典对齐 + .env 导入解析用例
 cd frontend && npm ci && npm run build && npm run lint \
   && node ../scripts/check-i18n.mjs \
-  && node --experimental-strip-types ../scripts/check-env-import.mjs && cd ..
+  && node --experimental-strip-types ../scripts/check-env-import.mjs \
+  && node --experimental-strip-types ../scripts/check-release-notes.mjs && cd ..
 
 # rust：壳编译与单测（先 mkdir src-tauri/resources/engine 占位）
 cd src-tauri && cargo check && cargo test --lib && cd ..
@@ -50,6 +51,7 @@ cd src-tauri && cargo check && cargo test --lib && cd ..
 python scripts/check-version.py
 python scripts/audit-public-release.py
 python scripts/check-workflows.py   # 依赖 pyyaml；改动 .github/workflows 时必跑
+python scripts/check-changelog.py   # 版本章节必须有「更新摘要 / Summary」
 ```
 
 > 本地跑门禁前若 `frontend/dist` 已存在，某些带安全删除守卫的环境会拦截 vite 清空
@@ -86,6 +88,32 @@ python scripts/check-workflows.py   # 依赖 pyyaml；改动 .github/workflows �
 - `.env*` / `proxy_token` / `engine/config.json` / 事件库已 gitignore；新增凭据类文件必须确认不入库
 - 不要在代码、测试样例、提交信息、PR 中贴真实 API key、内网地址、个人数据；测试用的凭据形态串必须一眼可见是伪造的（如 `sk-test-0000…`）
 - 本项目承诺零遥测：新增任何对外网络请求必须先在 SECURITY.md「出站清单」登记并默认关闭
+
+## 更新日志（CHANGELOG）
+
+`CHANGELOG.md` 不只是开发者日志：GitHub Release 正文、桌面端更新弹窗、Web/Docker 控制台的
+「更新日志」卡片都直接读它。所以每个版本章节**开头**必须有一段给普通用户看的说明：
+
+```md
+## [0.11.1] - 2026-10-16
+
+### 更新摘要 / Summary
+- 面板上的「还原失败」不再把不属于你的占位符也算进去，那个数字现在可信了。
+- The dashboard's "restore failures" no longer counts placeholders this machine never issued.
+
+### 修复 / Fixed
+- （技术细节写在这里，可以写文件名、函数名、状态码）
+```
+
+规则（由 `scripts/check-changelog.py` 在 CI 里强制）：
+
+- 摘要必须是本版本**第一个**子节，1~3 条，中英各至少一条；
+- 摘要里不写反引号代码、源码文件名、`文件:行号`、HTTP 状态码与硬技术术语
+  （SSE / NDJSON / mitmproxy / NER / GIL / JSON / TLS / Content-Encoding …）；
+  中文 ≤ 200 字、英文 ≤ 400 字符；
+- 「占位符」「上游」「流式」「脱敏」「还原」「API」「URL」是产品概念，可以出现；
+- 技术细节不受限制，写在摘要下面的分节里；
+- `0.10.1` 之前的历史章节不回溯检查（已发布的 Release 页改不了）。
 
 ## 版本
 

@@ -312,7 +312,8 @@ impl EngineManager {
         ))
     }
 
-    /// 拉起引擎（debug 构建不自动拉，dev 手动 `python panel.py --no-browser`；
+    /// 拉起引擎（debug 构建不自动拉，dev 手动 `python panel.py --no-browser`——
+    /// 那个入口只起面板、**不自启代理也不挂 fallback**，完整链路见 engine_entry.py；
     /// SHIELD_CLIENT_ONLY=1 时纯客户端模式，连外部引擎；
     /// 端口已有引擎监听时直接复用（升级/热切换场景，避免反复拉起失败）
     fn spawn(&self, app: &AppHandle) -> Result<(), String> {
@@ -356,6 +357,13 @@ impl EngineManager {
             .map_err(|e| format!("打开引擎日志失败: {e}"))?;
         let child = Command::new(&exe)
             .current_dir(&dir)
+            // 无缓冲：引擎是常驻进程，且被壳层以 `taskkill /F /T` 强杀
+            // （terminate_process_tree），没有 flush 机会。默认块缓冲（8KB）下，
+            // print 的启动标记与 traceback 在进程存活期间根本不会进
+            // engine-stdout.log —— 实测存活 1.5s 的文件仍是 0 字节，强杀后更加丢失。
+            // 没有这一行，「启动失败无日志可查」是必然结果，而不是偶发。
+            .env("PYTHONUNBUFFERED", "1")
+            .env("PYTHONIOENCODING", "utf-8")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file.try_clone().map_err(|e| e.to_string())?))
             .stderr(Stdio::from(log_file))
@@ -462,9 +470,14 @@ impl EngineManager {
                 return;
             }
             if std::time::Instant::now() > deadline {
+                // 归因：三种完全不同的故障（端口被占 / 本产品残留引擎无响应 / token 没写出来）
+                // 以前共用一句「未就绪（5801/token）」，用户只能猜——而被占时**根本不会有
+                // 引擎进程被拉起**（spawn 在 port_ready 分支就 return 了），看起来和「引擎慢」
+                // 一模一样。归因必须在超时处做，否则前端只能显示一句无法行动的废话。
+                let reason = self.readiness_failure_reason();
                 if let Ok(mut s) = self.state.lock() {
                     s.ready = false;
-                    s.last_error = Some(format!("引擎 {READY_TIMEOUT_SECS}s 内未就绪（5801/token）"));
+                    s.last_error = Some(reason);
                 }
                 return;
             }
@@ -476,6 +489,55 @@ impl EngineManager {
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
+    }
+
+    /// 就绪失败归因（前端直接把 `last_error` 渲染给用户）。
+    ///
+    /// 三种故障都表现为「20s 后还是没就绪」，但处置方式完全不同：端口被无关进程占着
+    /// 要去结束那个进程；本产品残留引擎无响应要重启软件；token 没写出来则是数据目录
+    /// 不可写。共用一句「未就绪（5801/token）」等于让用户去猜——尤其端口被占时
+    /// **根本不会有引擎进程被拉起**（`spawn` 在 `port_ready` 分支就 return 了），
+    /// 在用户眼里和「引擎启动慢」一模一样。
+    fn readiness_failure_reason(&self) -> String {
+        // 有 child = 引擎是我们拉起的，端口上很可能就是它自己在 listen，
+        // 不该把「还没起来」归因成「被别的进程占了」。
+        let owns_child = self.child.lock().map(|c| c.is_some()).unwrap_or(false);
+        if !owns_child {
+            match pid_listening_on_port(engine_port()) {
+                Some(pid) => {
+                    return match engine_process_identity(pid) {
+                        Some(true) => format!(
+                            "端口 {} 被本产品残留引擎进程（pid {pid}）占用且无响应，请结束该进程或重启软件",
+                            engine_port()
+                        ),
+                        Some(false) => format!(
+                            "端口 {} 被其他进程（pid {pid}）占用，面板无法启动；请结束该进程或改用其他端口",
+                            engine_port()
+                        ),
+                        None => format!(
+                            "端口 {} 被 pid {pid} 占用但无法确认其身份（可能权限不足），请手动排查",
+                            engine_port()
+                        ),
+                    };
+                }
+                None => {
+                    // 端口在监听却连 PID 都取不到（netstat 缺失/被安全软件拦截/输出无法解析）：
+                    // 既不能报「被占用」（不知道是谁），也不能让用户去查 token（方向错了）。
+                    if Self::port_ready() {
+                        return format!(
+                            "端口 {} 有进程在监听，但系统查不到其 PID（netstat 不可用或被拦截），面板无法启动；请手动排查端口占用",
+                            engine_port()
+                        );
+                    }
+                }
+            }
+        }
+        if !token_candidates().iter().any(|p| p.exists()) {
+            return format!(
+                "引擎 {READY_TIMEOUT_SECS}s 内未写出访问令牌（数据目录不可写？），面板无法就绪"
+            );
+        }
+        format!("引擎 {READY_TIMEOUT_SECS}s 内未就绪（5801/token）")
     }
 
     /// 崩溃监控：进程退出 → 自动重启（限频）+ 记 auto_recovered_at
@@ -520,8 +582,18 @@ impl EngineManager {
                 // 用 panel_alive() 而非 port_ready()：Flask 死锁时端口照常握手，
                 // 只探 TCP 永远看不到「假死」，正是本分支要防的那类故障。
                 if has_child && !Self::panel_alive() {
-                    strikes += 1;
-                    (strikes >= HANG_STRIKES, has_child)
+                    // 启动宽限：刚 spawn 的引擎在解压/import/建库，/healthz 不通是正常现象。
+                    // 没有宽限时 strikes 从第一秒就计，6 轮（约 12s）就把**正在初始化**的
+                    // 引擎 taskkill 掉，比 readiness_loop 的 20s 预算还早 8s——两个超时
+                    // 没对齐，慢机上表现为「永远起不来 / 反复重启」（issue #41）。
+                    let started_at = self.state.lock().ok().and_then(|s| s.started_at);
+                    if start_grace_active(started_at, now_epoch()) {
+                        strikes = 0;
+                        (false, has_child)
+                    } else {
+                        strikes += 1;
+                        (strikes >= HANG_STRIKES, has_child)
+                    }
                 } else {
                     strikes = 0;
                     (false, has_child)
@@ -916,6 +988,22 @@ fn restart_backoff_until(restarts: &[u64], now: u64) -> Option<u64> {
         .map(|t| t.saturating_add(60))
         .unwrap_or_else(|| now.saturating_add(60));
     Some(ready_at.max(now.saturating_add(1)))
+}
+
+/// 启动宽限判定（纯函数，便于单测）。
+///
+/// `started_at` 是本次 spawn 的时刻。引擎从 spawn 到 `/healthz` 可用之间要经过
+/// PyInstaller 解压、import mitmproxy/onnxruntime、建库、Flask 绑定 —— 弱机上
+/// 实测可超 10s，杀软全盘扫描时更久。
+///
+/// 这段窗口里 crash_watchdog 的假死探测必然全失败，而 `HANG_STRIKES(6) × 2s ≈ 12s`
+/// 就会把**正在初始化**的引擎 taskkill 掉，比 `readiness_loop` 的 20s 预算还早 8s。
+/// 两个超时没对齐时，慢机表现为「永远起不来 / 反复重启」（issue #41）。
+/// 宽限期与 readiness 预算同值：20s 内只清零不判死，20s 后交给 watchdog 接管。
+fn start_grace_active(started_at: Option<u64>, now: u64) -> bool {
+    started_at
+        .map(|t| now.saturating_sub(t) < READY_TIMEOUT_SECS)
+        .unwrap_or(false)
 }
 
 /// 探测监听指定端口的 PID（复用已有引擎时用于状态展示）。
@@ -1935,6 +2023,48 @@ mod autostart_tests {
         };
         assert!(!second_check);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+/// 引擎启动宽限的回归测试（issue #41）。
+///
+/// 修之前的故障链：`spawn` 之后 watchdog 立刻开始数假死，`HANG_STRIKES(6) × 2s ≈ 12s`
+/// 就把**正在初始化**的引擎 taskkill 掉，而 `readiness_loop` 的预算是 20s ——
+/// 慢机（PyInstaller 解压 + 杀软扫描）永远起不来，表现为「反复重启」。这些用例守死
+/// 「宽限期必须覆盖整个 readiness 预算、且到点一定恢复判定」。
+#[cfg(test)]
+mod start_grace_tests {
+    use super::{start_grace_active, READY_TIMEOUT_SECS};
+
+    const T: u64 = 1_700_000_000;
+
+    #[test]
+    fn grace_covers_the_whole_readiness_window() {
+        // 刚 spawn：宽限生效，watchdog 不得按假死计数（否则 12s 就把正在初始化的引擎杀了）
+        assert!(start_grace_active(Some(T), T));
+        assert!(start_grace_active(Some(T), T + 1));
+        assert!(start_grace_active(Some(T), T + READY_TIMEOUT_SECS - 1));
+    }
+
+    #[test]
+    fn grace_expires_exactly_at_readiness_deadline() {
+        // 边界：宽限与 readiness 预算同值，20s 整交给 watchdog 接管判定
+        assert!(!start_grace_active(Some(T), T + READY_TIMEOUT_SECS));
+        assert!(!start_grace_active(Some(T), T + READY_TIMEOUT_SECS + 1));
+    }
+
+    #[test]
+    fn missing_started_at_keeps_legacy_behaviour() {
+        // 复用外部引擎/未记录启动时刻：没有宽限，保持旧行为（立即计数）
+        assert!(!start_grace_active(None, T));
+    }
+
+    #[test]
+    fn clock_going_backwards_does_not_disable_watchdog() {
+        // 系统时间被改早（started_at 落在未来）：saturating_sub 归零 → 仍算宽限内，
+        // 不能 panic；但也必须到点恢复判定，不能变成永久豁免。
+        assert!(start_grace_active(Some(T + 100), T));
+        assert!(!start_grace_active(Some(T + 100), T + 100 + READY_TIMEOUT_SECS));
     }
 }
 

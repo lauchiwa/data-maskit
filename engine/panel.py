@@ -15,7 +15,7 @@ Data Maskit 控制面板 - 本地 Flask 服务
 # 本程序基于「希望有用」的目的分发，但不附带任何担保；亦无对适销性或特定用途
 # 适用性的默示担保。详见 GNU Affero 通用公共许可证。
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
-__version__ = '0.11.1'
+__version__ = '0.11.2'
 import json
 import codecs
 import copy
@@ -701,6 +701,47 @@ def _next_seq():
 # 800 行环形缓冲几分钟就被占满，崩溃现场的 Traceback 全被冲掉。一律不进 log_buf。
 _CONN_NOISE_RE = re.compile(r"client (connect|disconnect|tls|handshake)|server (connect|disconnect)|\d+\.\d+\.\d+\.\d+:\d+: client")
 
+# 面板自身诊断行的落盘通道（engine.log）。
+#
+# 为什么需要：_emit_log 只进 800 行内存环形缓冲，而引擎进程是被壳层
+# `taskkill /F /T` 强杀的（src-tauri/src/lib.rs 的 terminate_process_tree），
+# 没有 flush 机会 —— 启动失败、上游端口未监听、代理自启异常这些最需要事后归因的
+# 行，会在进程被杀的瞬间整片消失（issue #41 报障时没有任何日志可交，就是这么来的）。
+#
+# **只落 [panel]/[engine]/[proxy] 前缀的诊断行**：SHIELD 事件行携带 req_preview /
+# original 等明文，落盘会把「原文只进详情弹窗」的约束打穿，而诊断包会带走这个文件。
+_DIAG_LOG_MAX = 2 * 1024 * 1024
+_DIAG_PREFIXES = ("[panel]", "[engine]", "[proxy]")
+# 默认只在打包态（PyInstaller 冻结）开启：它解决的是「壳层 taskkill /F 导致内存日志
+# 整片消失」，而源码态有控制台可看、测试会把诊断行写进用户真实数据目录。
+# 需要排查时用 MASKIT_DIAG_LOG=1 强制打开。
+_DIAG_LOG_ENABLED = bool(getattr(sys, "frozen", False)) or (
+    os.environ.get("MASKIT_DIAG_LOG", "").strip().lower() in ("1", "true", "yes")
+)
+_diag_log_lock = threading.Lock()
+
+
+def _persist_diag_line(line):
+    """把面板自身诊断行追加到 DATA_ROOT/engine.log（超 2MB 轮转一份 .1）。
+
+    失败绝不抛出：日志落盘是排障增强，不能反过来影响脱敏主链路。
+    路径在调用时解析（不是模块级常量）：测试会 patch `panel.DATA_ROOT` 做隔离，
+    提前绑死就会绕过隔离、写进用户真实的 `%APPDATA%\Maskit`。
+    """
+    try:
+        path = DATA_ROOT / "engine.log"
+        rotated = DATA_ROOT / "engine.log.1"
+        with _diag_log_lock:
+            try:
+                if path.exists() and path.stat().st_size > _DIAG_LOG_MAX:
+                    os.replace(path, rotated)
+            except Exception:
+                pass
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        pass
+
 
 def _emit_log(line: str):
     line = line.rstrip("\r\n")
@@ -721,6 +762,9 @@ def _emit_log(line: str):
         log_buf.append(line)
         if ev:
             events.append(ev)
+    # 落盘放在锁外：文件 IO 不能占着 buf_lock（2.5s 轮询的 /api/logs 会等这把锁）。
+    if _DIAG_LOG_ENABLED and line.startswith(_DIAG_PREFIXES):
+        _persist_diag_line(line)
 
 
 # tail 通道脱敏白名单：log_buf 保留 SHIELD 行原文供本地排障
@@ -2326,16 +2370,22 @@ def _listening_port_pids(ports, fresh=False):
                     continue
                 if port in wanted:
                     found.setdefault(port, set()).add(pid)
-    # POSIX 工具不可用时，连接探测只补充端口存在性，不伪造 PID（PID 1 可能被误杀）。
-    if sys.platform != "win32":
-        for p in wanted - set(found):
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(0.05)
-                    if s.connect_ex(("127.0.0.1", p)) == 0:
-                        found[p] = set()
-            except Exception:
-                pass
+    # 端口表取不到时（Windows 的 netstat 被安全软件/组策略拦截、连接数大导致 5s
+    # 超时，或精简镜像缺 ss/lsof），连接探测只补充端口存在性，不伪造 PID
+    # （PID 1 可能被误杀）。**必须全平台生效**：Windows 曾只在 netstat 分支取 PID
+    # 而没有这段兜底，netstat 一旦返回空，本函数就恒返回空字典，于是：
+    # ① 启动就绪判定恒判「端口未监听」，必然等到 _START_READY_TIMEOUT 后报启动失败；
+    # ② 端口占用预检永远查不出占用（真冲突被推迟成 60s 后误报「未监听」）；
+    # ③ watchdog 每 10s 就把正在正常转发的 mitmdump 杀掉重启（issue #41）。
+    # 只探 netstat 未命中的端口：未监听时 connect 立即 RST，不会刷爆 mitmdump 日志。
+    for p in wanted - set(found):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.05)
+                if s.connect_ex(("127.0.0.1", p)) == 0:
+                    found[p] = set()
+        except Exception:
+            pass
     _netstat_cache["ts"] = now
     _netstat_cache["data"] = found
     return {port: pids for port, pids in found.items() if port in wanted}
@@ -2989,6 +3039,10 @@ def _start_proxy_locked():
         if p.poll() is None:
             # 端口迟迟不 listen：进程还活着但不可用，先杀掉释放端口，避免占端口的僵尸
             _emit_log(f"[panel] mitmdump {_START_READY_TIMEOUT}s 内未监听端口 {missing}，判定启动失败")
+            # 现场落盘必须在 kill 之前：这一分支的 mitmdump 真实输出只作为 API 返回值
+            # 给前端 toast，用户关掉提示就永久丢失；而 _emit_log 只进内存、进程随后
+            # 被强杀，等于启动失败现场什么都不剩（只有 crash-dumps 里才有端口占用表）。
+            _dump_crash_context("startfail")
             try:
                 _kill_proxy_tree(p.pid)
             except Exception:
@@ -9552,7 +9606,15 @@ def start_panel_server(open_browser_on_start=True):
         # 已存在的旧文件不会被 O_CREAT 的 mode 改写，必须显式再收紧一次
         os.chmod(token_path, 0o600)
     except Exception as e:
-        _emit_log(f"[panel] 写 token 文件失败(壳层取不到 token): {e}")
+        # 双写：_emit_log 只进内存，而壳层的就绪条件是「/healthz 通 + token 文件存在」
+        # （src-tauri/src/lib.rs 的 readiness_loop），写失败会让面板明明健康却永远判
+        # 「未就绪」（前端一直转圈、API 全 401）。必须进 engine-stdout.log，否则无现场。
+        _msg = f"[panel] 写 token 文件失败(壳层取不到 token): {e}"
+        _emit_log(_msg)
+        try:
+            print(_msg, file=sys.stderr, flush=True)
+        except Exception:
+            pass
     atexit.register(shutdown)
     # signal/console handler 只能在主线程注册；pywebview 模式下本函数在子线程运行
     is_main = threading.current_thread() is threading.main_thread()
@@ -9587,6 +9649,10 @@ def start_panel_server(open_browser_on_start=True):
 
 
 if __name__ == "__main__":
+    # 源码态直接运行（开发/调试 UI 用）：**不自启代理、不挂 fallback 兜底**。
+    # 完整引擎行为在 engine/engine_entry.py（Tauri sidecar 入口）——那边才跑
+    # _autostart + _start_fallback。所以用本入口时看到上游 187xx 端口无人监听
+    # 是预期现象，不要把「客户端连不上」当成脱敏链路的缺陷。
     import argparse as _ap
     _p = _ap.ArgumentParser(description="Data Maskit 引擎面板")
     _p.add_argument("--no-browser", action="store_true", help="不自动打开浏览器（测试/后台用）")

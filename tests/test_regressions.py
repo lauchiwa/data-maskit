@@ -2660,7 +2660,11 @@ class StabilityFixTests(unittest.TestCase):
         panel._netstat_cache["ts"] = 0.0
         panel._netstat_cache["data"] = {}
 
-        with mock.patch.object(panel.sys, "platform", "win32"):
+        with mock.patch.object(panel.sys, "platform", "win32"), \
+             mock.patch.object(panel.socket, "socket") as sock_cls:
+            # 兜底探测必须 mock：netstat 返回空时 Windows 也会做 connect 探测（issue #41），
+            # 真实探测结果取决于宿主 18777 有没有人监听（开发机上可能真有）→ 断言变随机。
+            sock_cls.return_value.__enter__.return_value.connect_ex.return_value = 111
             self.assertEqual(panel._listening_port_pids({18777}), {18777: {4321}})
             listening["on"] = False  # 端口真实释放（等价 _stop_passthrough）
             # 默认走缓存：仍是旧快照

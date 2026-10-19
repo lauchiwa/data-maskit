@@ -181,6 +181,7 @@ Data Maskit 是一个**本地脱敏代理**：拦截本机 LLM API 请求，敏�
 | `MASKIT_TRUST_PROXY` | `0` | 信任单跳 `X-Forwarded-Proto` / `X-Forwarded-Host` | **仅**在前置代理会覆盖（而非追加）这些头时开启 |
 | `MASKIT_DISABLE_ORIGIN_CHECK` | `0` | 关闭 `/api/*` 的 Origin 同源校验 | 跨源防御降级为仅令牌单层，启动会打警告 |
 | `MASKIT_ACCESS_LOG` | `0` | 打开 werkzeug 逐请求访问日志 | 默认关闭：面板每 2.5s 轮询一次，开启后 `engine-stdout.log` 会快速增长 |
+| `MASKIT_DIAG_LOG` | 打包态开启；源码态/测试关闭 | 把 `[panel]` / `[engine]` / `[proxy]` 诊断行追加到数据目录 `engine.log`（超 2MB 轮转一份 `.1`）。存在的理由：引擎被壳层 `taskkill /F /T` 强杀，`engine-stdout.log` 的块缓冲来不及 flush，启动失败现场会整片消失 | SHIELD 事件行（含 `req_preview` / `original` 明文）**永不落盘**，只收诊断前缀；诊断包会带走这个文件，改口径时需同步隐私声明 |
 | `MASKIT_START_READY_TIMEOUT` | `60` | 代理冷启动就绪等待上限（秒） | 只影响启动判定 |
 | `MASKIT_BYTE_SPLICE` | `1` | 命中敏感词时只就地替换被脱敏的字符串字面量（保住客户端 body 排版与上游前缀缓存）；设 `0` 退回整棵重序列化 | 只影响回写字节与 CPU，**不改变发往上游的内容**：替换结果必须通过 `json.loads(结果) == 脱敏后的树` 等价校验，不过即退回重序列化 |
 | `MASKIT_BIND_HOST` | `127.0.0.1` | `docker-compose.yml` 的主机侧绑定地址 | 公网部署必须显式确认 |

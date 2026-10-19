@@ -63,6 +63,11 @@ GATES = [
     # GitHub 的 tag_name 带 v），界面模板统一写 `v{v}` —— 漏归一化就渲染出「更新到 vv0.11.0」。
     {"group": "frontend", "name": "Version normalization cases", "cwd": "frontend",
      "argv": ["{node}", "--experimental-strip-types", "../scripts/check-update-version.mjs"]},
+    # 更新说明的摘要提取（pickUserNotes）。Web / Docker 端的 notes 来自 GitHub Release
+    # 的整章 body（`### 修复` 双语 + Markdown），旧实现原样塞进 <p> —— 用户读到的是
+    # 技术日志（issue #40）。正则被改坏只会静默退回「又是一块 Markdown」，不报错。
+    {"group": "frontend", "name": "Release notes summary cases", "cwd": "frontend",
+     "argv": ["{node}", "--experimental-strip-types", "../scripts/check-release-notes.mjs"]},
     # 浏览器扩展的静态门禁。放在 frontend 组（ci.yml 的 frontend job）只是因为
     # 那个 job 已经把 node 装好了；扩展与前端是两套东西，别被分组名误导。
     # 为什么必须有：extension/ 原先**没有任何自动化门禁**——python 单测碰不到它，
@@ -77,6 +82,11 @@ GATES = [
     {"group": "version", "name": "Version numbers agree", "cwd": ".", "argv": ["{python}", "scripts/check-version.py"]},
     {"group": "version", "name": "Public release audit", "cwd": ".", "argv": ["{python}", "scripts/audit-public-release.py"]},
     {"group": "version", "name": "Workflow YAML and shell syntax", "cwd": ".", "argv": ["{python}", "scripts/check-workflows.py"]},
+    # 版本说明必须是人话（issue #40）。CHANGELOG 被直接当用户更新说明用：
+    # `render-release-notes.py` 切整章作 Release body，`generate-latest-json.py`
+    # 取它作桌面弹窗 notes。光靠 AGENTS.md 的约定不够（条目里照样堆术语），
+    # 所以要求每个受检版本开头有「更新摘要 / Summary」、双语、不含硬术语与状态码。
+    {"group": "version", "name": "CHANGELOG user-facing summary", "cwd": ".", "argv": ["{python}", "scripts/check-changelog.py"]},
     # 扩展 zip 是 Release 上唯一的「网页版 AI」入口：ChatGPT / Claude 没有 Base URL 可配，
     # 只能靠扩展把页面请求送进引擎。打包脚本坏掉＝用户下载不到扩展，且要等发版才暴露。
     {"group": "version", "name": "Browser extension package builds", "cwd": ".", "argv": ["{python}", "scripts/pack-extension.py", "--check"]},

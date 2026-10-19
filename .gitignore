@@ -58,6 +58,9 @@ engine/config.json
 config.json.bak-*
 model_prices_cache.json
 engine-runtime.json
+# 崩溃现场（_dump_crash_context 写 DATA_ROOT/crash-dumps）：纯运行时产物，
+# 开发态下 DATA_ROOT 就是 engine/，不忽略会在 git status 里冒出来被误提交。
+crash-dumps/
 # 运行期信号（限时排障截止时间 + 清空映射代号）。开发态下 `_DATA_ROOT` 就是 engine/，
 # 所以它会落在源码目录里；不忽略就会在 `git status` 里冒出来 → 被择手提交。
 # `log-trace.json` 是 0.7.0 更名前的旧文件名，一并留着以免旧文件被误入库。

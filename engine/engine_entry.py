@@ -1,12 +1,15 @@
 """Data Maskit 引擎 sidecar 入口（Tauri 版）。
 
-PyInstaller 入口不能带参数，本文件包装 panel 启动逻辑，复刻 `run_panel()` 的
-步骤 0（ACL 收紧）+ 1（Flask 主线程）+ 1.5（代理自启/fallback 兜底），仅去掉
-窗口/托盘（由 Tauri 壳承担）。
+PyInstaller 入口不能带参数，本文件包装 panel 启动逻辑：ACL 收紧 → NER 预检/预热
+→ 代理自启/fallback 兜底（后台线程）→ Flask 主线程阻塞，仅去掉窗口/托盘（由
+Tauri 壳承担）。
 
-⚠️ 不能只调 start_panel_server()：代理自启与 fallback 兜底逻辑在 `run_panel()`
-步骤 1.5（v1.5.65 实测确认），不在 start_panel_server 内——漏掉会导致「面板
-起了但上游端口无人监听，客户端连接被拒」。
+⚠️ `panel.py` 里**没有** `run_panel()` 这个函数（旧版拆分后已删除），不要再按
+这个名字去找「完整启动流程」——本文件就是完整流程，纯面板入口见 panel.py 的
+`if __name__ == "__main__"` 分支（那个分支不自启代理）。
+
+⚠️ 不能只调 start_panel_server()：代理自启与 fallback 兜底逻辑不属于它（v1.5.65
+实测确认）——漏掉会导致「面板起了但上游端口无人监听，客户端连接被拒」。
 
 退出路径：Rust 壳三段式（HTTP /api/proxy/stop 优雅停 → 超时 taskkill /T /F），
 本进程主线程跑 Flask 时已注册 SIGINT/SIGTERM + console handler（shutdown 收尾）。

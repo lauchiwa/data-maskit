@@ -100,6 +100,11 @@ jobs:
       - name: Version normalization cases
         run: node --experimental-strip-types ../scripts/check-update-version.mjs
 
+      # 更新说明摘要提取：Web / Docker 端的 notes 来自 GitHub Release 的整章 body，
+      # 原样渲染会让用户在更新卡片里读到 `###` 与双语技术日志（issue #40）。
+      - name: Release notes summary cases
+        run: node --experimental-strip-types ../scripts/check-release-notes.mjs
+
       # 浏览器扩展（extension/）的静态门禁：i18n 键集一致性、shared.js 加载顺序、
       # 驼峰 runAt、静态站点清单与 manifest 对齐、安全红线扫描。
       # 放在本 job 只是因为这里已经装好了 node —— 扩展与前端是两套东西。
@@ -195,6 +200,12 @@ jobs:
       # CI 不 lint workflow，YAML 或 run 块写坏只在推送后（最坏是发版时）才炸
       - name: Workflow YAML and shell syntax must be valid
         run: python scripts/check-workflows.py
+
+      # 版本说明必须是人话（issue #40）。CHANGELOG 同时是 Release body 与桌面更新弹窗的
+      # 文案来源，而它原本是写给开发者的技术日志。要求每个受检版本开头有
+      # 「更新摘要 / Summary」、中英各一条、不含硬术语/反引号/源码文件名/状态码。
+      - name: CHANGELOG has a user-facing summary
+        run: python scripts/check-changelog.py
 
       # 扩展 zip 是 Release 上唯一的「网页版 AI」入口（ChatGPT / Claude 没有 Base URL 可配），
       # 打包脚本坏掉＝用户下载不到扩展。这里只验证能打出来，产物由 release.yml 上传。

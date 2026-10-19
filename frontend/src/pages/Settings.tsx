@@ -10,6 +10,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useVisibility } from '@/lib/useVisibility'
+import { pickUserNotes } from '@/lib/releaseNotes'
 import {
   Plus,
   Pencil,
@@ -767,12 +768,15 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
             : window.fetch('https://api.github.com/repos/xiaYuTian11/maskit/releases/latest'))
           const d = await r.json()
           version = String(d?.tag_name || '')
-          notes = String(d?.body || '')
+          // GitHub 的 body 是整章 CHANGELOG；服务端 /api/update/check 也可能把 GitHub
+          // body 原样转回。两处都过 pickUserNotes：有「更新摘要」取那段，没有则剥掉
+          // Markdown 标记再截断（老版本 Release 兼容），绝不把 `###` 甩到「关于」页。
+          notes = pickUserNotes(String(d?.body || ''))
           pubDate = String(d?.published_at || '')
         } catch {
           const d = await shieldFetch<{ version?: string; notes?: string; pub_date?: string }>('/api/update/check', { timeoutMs: 20000 })
           version = String(d?.version || '')
-          notes = String(d?.notes || '')
+          notes = pickUserNotes(String(d?.notes || ''))
           pubDate = String(d?.pub_date || '')
         }
         if (alive && version) {
