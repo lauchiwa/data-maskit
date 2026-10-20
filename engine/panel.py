@@ -15,7 +15,7 @@ Data Maskit 控制面板 - 本地 Flask 服务
 # 本程序基于「希望有用」的目的分发，但不附带任何担保；亦无对适销性或特定用途
 # 适用性的默示担保。详见 GNU Affero 通用公共许可证。
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
-__version__ = '0.11.2'
+__version__ = '0.11.3'
 import json
 import codecs
 import copy
@@ -206,6 +206,62 @@ SCRIPTS_DIR = _BUNDLE_ROOT  # transparent.py / shield_defaults.py 所在目录�
 HOSTS_FILE = r"C:\Windows\System32\drivers\etc\hosts"
 MARKER = "# LLM-Shield"  # 紧急恢复脚本 scripts/emergency-restore.bat 依赖此标记定位 hosts 块，改动须同步
 CA_CERT = Path(os.path.expanduser("~")) / ".mitmproxy" / "mitmproxy-ca-cert.cer"
+
+
+def _bootstrap_lan_access() -> bool:
+    """启动期读 `config.lan_access`，决定默认绑定地址。
+
+    绑定地址在 `app.run` 之前确定、之后无法热改（Flask 是阻塞单进程模型），所以
+    这里直接读盘，而不是等 `load_config` —— 那个函数在模块后半段才定义。
+    读盘失败（首次启动还没有 config.json / 文件损坏）一律按「仅本机」处理：
+    安全开关的失败方向必须是关，绝不能因为配置读不出来就把控制面暴露到局域网。
+    """
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return isinstance(raw, dict) and bool(raw.get("lan_access"))
+
+
+_LAN_IPS_CACHE = {"ts": None, "ips": []}
+
+
+def _lan_ipv4_addresses():
+    """本机非回环 IPv4 列表（设置页告诉用户「局域网该用哪个地址」）。
+
+    纯本地系统调用，不出网：UDP connect 只让内核选出口地址，不发送任何数据包。
+    缓存 60s——`/api/status` 每 2.5s 被轮询一次，没必要每次都解析一遍网卡。
+    """
+    now = time.monotonic()
+    # 初值是 None 而不是 0.0：`time.monotonic()` 在 Linux 上以开机时刻为零点，
+    # 开机 60 s 内启动面板时 `now - 0.0 < 60` 会命中缓存并一直返回空列表，
+    # 设置页的「局域网地址」就永远不出现（自引入的边界 bug，别改回 0.0）。
+    if _LAN_IPS_CACHE["ts"] is not None and now - _LAN_IPS_CACHE["ts"] < 60:
+        return _LAN_IPS_CACHE["ips"]
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127."):
+                ips.add(ip)
+    except Exception:
+        pass
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("192.0.2.1", 80))  # TEST-NET-1：不可路由，仅用于选出口地址
+            ip = probe.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                ips.add(ip)
+        finally:
+            probe.close()
+    except Exception:
+        pass
+    _LAN_IPS_CACHE["ts"] = now
+    _LAN_IPS_CACHE["ips"] = sorted(ips)
+    return _LAN_IPS_CACHE["ips"]
+
+
 def _default_panel_port() -> int:
     """面板端口：默认 5801，可用环境变量 LLM_SHIELD_PANEL_PORT 覆盖（测试/冲突规避）。"""
     try:
@@ -226,8 +282,25 @@ except Exception:
     _START_READY_TIMEOUT = 60
 ENV_BACKUP_PATH = ROOT / "shield-env-backup.json"
 EVENT_LOG_PATH = LEGACY_JSONL_PATH
-# 面板监听地址：桌面版恒 127.0.0.1；Docker/无头部署用 MASKIT_PANEL_HOST=0.0.0.0 开放。
-PANEL_HOST = os.environ.get("MASKIT_PANEL_HOST", "127.0.0.1").strip() or "127.0.0.1"
+# 面板监听地址：默认仅本机；设置页「局域网访问」开关（config.lan_access）打开后
+# 绑定 0.0.0.0，Docker/无头部署也可用 MASKIT_PANEL_HOST=0.0.0.0 显式指定（环境变量优先）。
+_LAN_ACCESS = _bootstrap_lan_access()
+
+
+def _resolve_bind_host(env_name: str, lan_access: bool) -> str:
+    """绑定地址优先级：环境变量 > 局域网开关 > 回环。
+
+    抽成纯函数是为了能直接钉住优先级——错了就是把控制面暴露到网段，
+    或者反过来把容器里的正常部署锁死到回环。
+    """
+    env_val = os.environ.get(env_name, "").strip()
+    if env_val:
+        return env_val
+    return "0.0.0.0" if lan_access else "127.0.0.1"
+
+
+_DEFAULT_BIND_HOST = _resolve_bind_host("MASKIT_PANEL_HOST", _LAN_ACCESS)
+PANEL_HOST = _DEFAULT_BIND_HOST
 # 远程模式 = 监听地址不是回环：Host 校验放开、Origin 改为同源校验，
 # X-Shield-Token 仍是唯一主防线（面板可改上游/注入头，绝不可免 token）。
 REMOTE_MODE = PANEL_HOST not in {"127.0.0.1", "localhost", "::1"}
@@ -271,6 +344,12 @@ _EXT_WARN_MAX = 200
 # 扩展上下文能出现的 Origin scheme。**扩展 ID 无法枚举**（解压加载/商店/profile 各异），
 # 所以只能按 scheme 放行；详见 _origin_ok() 里的实测说明与安全影响。
 _EXT_ORIGIN_SCHEMES = ("chrome-extension://", "moz-extension://", "safari-web-extension://")
+
+# Tauri 桌面壳的来源（Linux/Windows 为 `tauri://localhost`，macOS 为 `http://tauri.localhost`）。
+# 壳层与面板的通信一律走 127.0.0.1，但 Origin 是 WebView 自己带的，改不了；
+# 本地面板同源放行与远程模式（局域网开关）两条分支**都必须先经过这个白名单**，
+# 否则打开局域网访问会把桌面端自己锁在外面（2026-10-19 实测）。
+_TAURI_ORIGINS = frozenset({"tauri://localhost", "http://tauri.localhost"})
 _ext_cfg_state = {
     "ext_bridge_enabled": False,
     "ext_token": "",
@@ -305,8 +384,8 @@ def _ext_token_ok(token):
 # 反代 HTTPS 终止时显式信任单跳 X-Forwarded-*。默认关闭，避免直接暴露面板时
 # 客户端伪造转发头绕过 Origin 同源校验；启用者必须确保前置代理覆盖而非追加这些头。
 TRUST_PROXY_ENV = "MASKIT_TRUST_PROXY"
-# 反代/兜底端口监听地址：与面板一样，Docker 用 MASKIT_LISTEN_HOST=0.0.0.0 对外
-LISTEN_HOST = os.environ.get("MASKIT_LISTEN_HOST", "127.0.0.1").strip() or "127.0.0.1"
+# 反代/兜底端口监听地址：与面板同口径——默认仅本机，局域网开关或 MASKIT_LISTEN_HOST=0.0.0.0 放开
+LISTEN_HOST = _resolve_bind_host("MASKIT_LISTEN_HOST", _LAN_ACCESS)
 # API token 每次启动随机；远程模式下用户无法读容器内 proxy_token 文件，
 # 允许 MASKIT_PANEL_TOKEN 固定（≥16 位，太短直接忽略并回退随机，宁可拒绝也不弱化）。
 _MIN_PANEL_TOKEN_LEN = 16
@@ -491,21 +570,23 @@ def _origin_ok():
     # 也不要静默放行。
     if request.path in _EXT_ENDPOINTS and origin.lower().startswith(_EXT_ORIGIN_SCHEMES):
         return True
+    # Tauri 桌面壳的来源必须**先于**远程模式分支放行。
+    #
+    # 壳层的 fetch 经 Rust reqwest 代发，WebView2 自动附带 `Origin: tauri://localhost`
+    # （Request 构造时带入，JS 无法覆盖）。而桌面端开局域网访问（config.lan_access）
+    # 会把 REMOTE_MODE 置真，下面的同源校验拿它去比 `http://127.0.0.1:5801`，
+    # **必然不等**——用户只是打开了一个网络开关，桌面端界面却当场全部 403
+    # （2026-10-19 实测复现）。这不是放宽安全边界：壳层来源不是网页能伪造的
+    # （浏览器禁止 JS 设置 Origin），而 X-Shield-Token 仍是主防线。
+    if origin.lower() in _TAURI_ORIGINS:
+        return True
     # 远程模式：SPA 与 API 同源托管，Origin 必须等于本次请求的 scheme://host，
     # 拒绝任何外站页面借用户浏览器发起的跨源调用（token 在内存里，但 CSRF 面仍要关死）。
     if REMOTE_MODE:
         scheme, host = _effective_request_origin()
         return _normalize_origin(origin) == _normalize_origin(f"{scheme}://{host}")
-    # 放行面：本地面板同源 + Tauri 壳页面（tauri://localhost / http://tauri.localhost）。
-    # Tauri 壳的 fetch 经 Rust reqwest 代发（tauri-plugin-http），WebView2 会对跨域
-    # 请求自动附加 Origin: tauri://localhost（Request 构造时带入，JS 无法覆盖）——
-    # 不放行则新桌面壳全部 403。X-Shield-Token 仍是主防线（每次启动随机、仅本机）。
-    return origin in {
-        f"http://127.0.0.1:{PANEL_PORT}",
-        f"http://localhost:{PANEL_PORT}",
-        "tauri://localhost",
-        "http://tauri.localhost",
-    }
+    # 本地面板同源白名单（Tauri 壳已在上面统一放行）。
+    return origin.lower() in {f"http://127.0.0.1:{PANEL_PORT}", f"http://localhost:{PANEL_PORT}"}
 
 
 def _guard_reject(reason, resp, status=403):
@@ -722,7 +803,7 @@ _diag_log_lock = threading.Lock()
 
 
 def _persist_diag_line(line):
-    """把面板自身诊断行追加到 DATA_ROOT/engine.log（超 2MB 轮转一份 .1）。
+    r"""把面板自身诊断行追加到 DATA_ROOT/engine.log（超 2MB 轮转一份 .1）。
 
     失败绝不抛出：日志落盘是排障增强，不能反过来影响脱敏主链路。
     路径在调用时解析（不是模块级常量）：测试会 patch `panel.DATA_ROOT` 做隔离，
@@ -3681,6 +3762,13 @@ def default_config():
         # scheme://host 不一致会导致面板 403——无法进 UI 时用环境变量
         # MASKIT_DISABLE_ORIGIN_CHECK=1 逃生；能进 UI 时关这个开关等效。
         "origin_check": True,
+        # ── 局域网访问（默认关）──
+        # 开启后面板（5801）与代理端口绑定 0.0.0.0，同一局域网的其它设备可直接访问。
+        # 为什么默认关：一旦监听非回环地址，Host 校验必然放开（局域网 IP 无法枚举），
+        # 面板就只剩 X-Shield-Token 一道防线。桌面用户没有这个需求时，多开一个
+        # 入口就是纯风险。容器/无头部署不受它影响（MASKIT_PANEL_HOST 环境变量优先）。
+        # 改它需要重启引擎才生效（绑定地址在 app.run 时确定，无法热改）。
+        "lan_access": False,
         # 敏感词统计是否记录明文。默认开：打码 preview（1**@***.com）排出来的
         # 排行榜没有信息量，而数据只落本机 SQLite、不出网。关掉后库里永不出现明文。
         "record_plaintext_words": True,
@@ -4372,6 +4460,8 @@ def normalize_config(raw, warnings=None, *, validate_controls=True):
         "fail_closed": bool(raw.get("fail_closed", True)),
         "response_scan": bool(raw.get("response_scan", True)),
         "origin_check": bool(raw.get("origin_check", True)),
+        # 局域网访问：缺字段 = 旧配置 = 关（安全开关的默认必须偏保守，不能因升级静默放开）
+        "lan_access": bool(raw.get("lan_access", False)),
         "record_plaintext_words": bool(raw.get("record_plaintext_words", True)),
         "ext_bridge_enabled": ext_enabled,
         "ext_token": ext_token,
@@ -5426,6 +5516,11 @@ def api_status():
         "capture_mode": capture_mode,
         "proxy_port": PROXY_PORT,
         "proxy_url": f"http://127.0.0.1:{PROXY_PORT}",
+        # 局域网访问：config.lan_access 是用户意图，panel_host 是**本进程实际绑定**。
+        # 两者不一致（开关打开但仍绑回环）＝改了还没重启，前端据此提示重启。
+        "lan_access": bool(cfg.get("lan_access", False)),
+        "panel_host": PANEL_HOST,
+        "lan_urls": [f"http://{ip}:{PANEL_PORT}" for ip in _lan_ipv4_addresses()] if REMOTE_MODE else [],
         "upstreams": status_upstreams,
         "upstream_ports": upstream_ports,
         "admin": is_admin(),
@@ -9632,6 +9727,13 @@ def start_panel_server(open_browser_on_start=True):
         # 远程模式下用户只能从这里拿到 token（随机时打印明文；固定时只提示来源）
         if _env_token:
             print("[panel] remote mode: token from MASKIT_PANEL_TOKEN; open http://<host>:%d (enter token in WebUI, or quick access: .../#token=<MASKIT_PANEL_TOKEN>)" % PANEL_PORT)
+        elif _LAN_ACCESS:
+            # 桌面端自己打开的「局域网访问」：token 就在本机数据目录的 proxy_token（0600），
+            # 没必要再往 engine-stdout.log 写一份明文——那个文件会被用户随手贴进 issue
+            # 或诊断包（issue 模板就在让人贴日志）。容器/无头部署用 MASKIT_PANEL_HOST
+            # 触发远程模式（_LAN_ACCESS 为假），走下面的明文分支，保持原有排障路径。
+            print(f"[panel] lan access: shared token is in {ROOT / 'proxy_token'}; "
+                  f"other devices open http://<this-host>:{PANEL_PORT}/#token=<token>")
         else:
             print(f"[panel] remote mode: MASKIT_PANEL_TOKEN not set, generated token = {API_TOKEN}")
             print(f"[panel] open http://<host>:{PANEL_PORT} (enter token in WebUI, or quick access: .../#token={API_TOKEN})")

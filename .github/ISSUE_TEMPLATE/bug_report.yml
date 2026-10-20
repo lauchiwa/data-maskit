@@ -12,7 +12,7 @@ body:
     attributes:
       label: 版本 / Version
       description: 设置 → 关于 中的版本号，或 Docker 镜像标签
-      placeholder: "1.0.0 / ghcr.io/xiayutian11/maskit:1.0.0"
+      placeholder: "0.11.2 / ghcr.io/xiayutian11/maskit:0.11.2"
     validations:
       required: true
   - type: dropdown
@@ -49,5 +49,5 @@ body:
     id: logs
     attributes:
       label: 日志 / Logs
-      description: 设置 → 反馈 → 生成诊断包（已自动脱敏），或 docker logs maskit 的相关片段
+      description: 设置 → 工具 → 一键自检 →「预览诊断包」（已自动脱敏），或 docker logs maskit 的相关片段
       render: text

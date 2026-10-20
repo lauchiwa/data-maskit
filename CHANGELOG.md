@@ -4,6 +4,34 @@
 
 每个版本章节的**开头**必须有 `### 更新摘要 / Summary`（中英各一至三条）—— 它会被原样用作用户能看到的「版本介绍」（GitHub Release 首屏与更新弹窗），所以只写用户能感知到的变化，不写实现细节。技术条目写在摘要下面的分节里。
 
+## [0.11.3] - 2026-10-20
+
+### 更新摘要 / Summary
+- 流式回复不会再中途断掉：模型最后那段回答以前可能整段丢失，客户端还会误报成网络异常。
+- Windows 安装装得更干净：不再弹一段红色报错，桌面上也不会多出一个重复图标。
+- 同一局域网的其它设备现在也能打开控制台，需要先在设置里手动开启。
+- Streaming replies no longer break near the end — the model's final chunk used to vanish and clients reported a network error.
+- The Windows installer is cleaner: no red error output, and no duplicate desktop icon.
+- Other devices on your network can now open the console, after you turn it on in settings.
+
+### 修复
+- 流式回复不再整段丢失：响应里出现对象或数组形态的字段时还原会中断，客户端只收到后半截数据。
+- Windows 安装与卸载不再弹 PowerShell 报错；那条终止旧进程的命令此前每次都语法失败，进程实际没被杀掉。
+- 安装不再多出一个桌面快捷方式：改由安装程序按「创建桌面快捷方式」勾选与升级模式决定。
+- 反馈模板里的诊断包入口改回真实路径。
+
+### 新增
+- 局域网访问开关：设置 → 高级选项，开启后同一局域网的其它设备可访问控制台与代理端口（重启引擎生效）。
+
+### Fixed
+- Streaming replies are no longer truncated when a response field holds an object or array instead of a string.
+- The Windows installer and uninstaller no longer throw a PowerShell syntax error; that command had never actually terminated the old processes.
+- The installer no longer creates a duplicate desktop shortcut — creation follows the checkbox and the update mode.
+- The diagnostics-bundle entry in the bug report template now points at the real path.
+
+### Added
+- LAN access toggle under Settings → Advanced; other devices on the same network can reach the console and proxy ports (engine restart required).
+
 ## [0.11.2] - 2026-10-19
 
 ### 更新摘要 / Summary

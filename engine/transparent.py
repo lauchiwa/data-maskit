@@ -6048,11 +6048,18 @@ def _restore_tree(obj, sid, key=None, depth=0):
         # SSE 上思考增量事件会因"无槽位"改走本兜底，若不挡就会把明文还原回写入；
         # 整包/回退（`_restore_json_body`）与 NDJSON 同样靠这里。
         # 注意：挡的是**块**，不是字段名——同名业务字段仍照常还原。
-        if obj.get("type") in _RESTORE_SKIP_BLOCK_TYPES:
+        # 判据必须是「块类型字符串」。`type` 在 JSON Schema 里同时是**属性名**
+        # （`{"properties": {"type": {...}}}`）和**保留字**（`{"type": ["string","null"]}`），
+        # 值可以是对象或数组。直接拿它做 set 成员判断会抛 `TypeError: unhashable type`，
+        # 整条响应还原就此中断：流式下 `_stream_owned` 的兜底会丢掉**已出队的事件块**
+        # （客户端收到无 event:/data: 前缀的残帧，Responses API 的终止事件永远到不了），
+        # 非流式则整包退回未还原。2026-10-19 issue #44 实测触发形态。
+        block_type = obj.get("type")
+        if isinstance(block_type, str) and block_type in _RESTORE_SKIP_BLOCK_TYPES:
             # 契约豁免必须计数（与请求侧 `signed_blocks_skipped` 对称、同一理由：
             # 静默豁免等于用户以为还原管线处理过了）。块内增量不重复计，
             # 判据与理由见 `_note_restore_signed_skip`。
-            if not str(obj.get("type") or "").endswith("_delta"):
+            if not block_type.endswith("_delta"):
                 _note_restore_signed_skip(sid)
             return obj
         return {k: _restore_tree(v, sid, k, depth + 1) for k, v in obj.items()}
@@ -9775,11 +9782,15 @@ def _restore_sse_data(data, sid, final=False, final_prefixes=()):
     # Responses .done payloads replace the full value, rather than extending
     # its deltas. Discard that channel's stale tail after restoring the snapshot;
     # appending it would duplicate text or emit a delta after completion.
+    # 与 `_restore_tree` 的块类型判据同源：`type` 的值可能是对象/数组
+    # （JSON Schema 的 `properties.type`、`"type": ["string","null"]`），
+    # 直接当字典键同样抛 unhashable type。非字符串一律视作「无匹配快照」。
+    event_type = data.get("type")
     snapshot = {
         "response.output_text.done": ("text", "text"),
         "response.reasoning_text.done": ("text", "reason"),
         "response.function_call_arguments.done": ("arguments", "args"),
-    }.get(data.get("type"))
+    }.get(event_type) if isinstance(event_type, str) else None
     if snapshot is not None and isinstance(data.get(snapshot[0]), str):
         channel = _sse_response_channel(data, snapshot[1])
         s = _session_get(sid) or {}
@@ -10418,7 +10429,14 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
                     if idx < 0:
                         break
                     line, state["buf"] = state["buf"][:idx], state["buf"][idx + 1:]
-                    out.append(_restore_ndjson_line(line, sid, final=False) + "\n")
+                    # 已出队的行不能再丢：单行还原失败只降级该行为原样透传，
+                    # 不让异常冒泡到外层把整批已处理的行一起丢弃（同 SSE 分支）。
+                    try:
+                        out.append(_restore_ndjson_line(line, sid, final=False) + "\n")
+                    except Exception as e:
+                        _emit("ERR", host=host, method=method, path=emit_path, sid=sid,
+                              msg="ndjson_line:" + str(e)[:160], **source)
+                        out.append(line + "\n")
                 # 异常上游防御：单个超长行无换行符，累积超过 _SSE_BUF_MAX 强制还原清空
                 if len(state["buf"]) > _SSE_BUF_MAX:
                     out.append(_restore_ndjson_line(state["buf"], sid, final=True) + "\n")
@@ -10440,8 +10458,27 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
                         break
                     block, state["buf"] = state["buf"][:idx], state["buf"][idx + 2:]
                     del terminal[:]
-                    out.append(_restore_sse_event(block, sid, final=False,
-                                                  terminal=terminal) + "\n\n")
+                    # 事件块已经出队：异常一旦冒泡到外层 except，这一块既发不出去、
+                    # 也回不到 buf，客户端只会收到后续原始字节（无 event:/data: 前缀
+                    # 的残帧），本回调里已处理的其余事件也全部丢失（issue #44 的实际
+                    # 形态）。单块失败只把这一块降级为原样透传，其余事件不受影响。
+                    try:
+                        out.append(_restore_sse_event(block, sid, final=False,
+                                                      terminal=terminal) + "\n\n")
+                    except Exception as e:
+                        del terminal[:]   # 半途置位的终止标记不可信，清掉以免误收尾
+                        _emit("ERR", host=host, method=method, path=emit_path, sid=sid,
+                              msg="sse_event:" + str(e)[:160], **source)
+                        out.append(block + "\n\n")
+                        # 本块失败后同通道的缓冲再也等不到后续块：不补发就是静默丢字
+                        # （与外层 except 的 `_flush_pending` 同义，见 test_shield 的
+                        #  error-path 用例）。补发块自带 \n\n，不会与残块粘连。
+                        try:
+                            tail = _flush_pending(sid)
+                        except Exception:
+                            tail = ""
+                        if tail:
+                            out.append(tail)
                     if terminal:
                         state["stream_terminal"] = True
                 # 异常上游防御：上游持续推送只有单换行（无 \n\n 双空行）或无换行的巨型数据，

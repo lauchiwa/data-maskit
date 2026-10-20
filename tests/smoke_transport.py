@@ -30,9 +30,20 @@ class Upstream(ThreadingHTTPServer):
 
     def __init__(self):
         super().__init__(("127.0.0.1", 0), Handler)
-        self.accepts = 0
+        self.accepts = 0        # 原始 accept 数（含本机端口扫描等外来连接，只作诊断）
+        self.post_conns = []    # 跑过我们 POST 的客户端源端口（= 上游连接身份）
         self.requests = []
         self.guard = threading.Lock()
+
+    @property
+    def post_connection_count(self):
+        """我们自己的请求实际用了几条上游连接——连接复用的唯一判据。
+
+        不能用 ``accepts``：环回端口是共享资源，本机任何进程都能连进来（实测
+        2026-10-12 开发机上的 agent 工具链每几秒扫一遍端口段），accept 计数会把
+        外来探测算成「没复用」（同一脚本会随机假红）。
+        """
+        return len(self.post_conns)
 
     def get_request(self):
         sock, addr = super().get_request()
@@ -51,6 +62,9 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         with self.server.guard:
             self.server.requests.append((self.path, self.client_address, body))
+            # 源端口就是上游连接的身份：keep-alive 复用下多条 POST 同源端口。
+            if self.client_address[1] not in self.server.post_conns:
+                self.server.post_conns.append(self.client_address[1])
         text = json.loads(body)["messages"][0]["content"]
         if self.path.endswith("/stream"):
             self.send_response(200)
@@ -220,7 +234,10 @@ def main():
                     assert status == 200 and SECRET.encode() in body
                     assert SEMANTIC_TEXT in json.loads(body)["choices"][0]["message"]["content"]
                 with upstream.guard:
-                    assert upstream.accepts == 1, "test did not exercise an actual reused connection"
+                    assert upstream.post_connection_count == 1, (
+                        "test did not exercise an actual reused connection "
+                        "(post conns=%d, raw accepts=%d)"
+                        % (upstream.post_connection_count, upstream.accepts))
                     assert len(upstream.requests) == 2
                     assert upstream.requests[0][2] == upstream.requests[1][2], "stable masked bytes changed"
                     assert all(SECRET.encode() not in r[2] for r in upstream.requests)
@@ -229,7 +246,10 @@ def main():
                 chat(client, "/v1/close")
                 chat(client)
                 with upstream.guard:
-                    assert upstream.accepts == 2, "normal upstream close was not retired"
+                    assert upstream.post_connection_count == 2, (
+                        "normal upstream close was not retired "
+                        "(post conns=%d, raw accepts=%d)"
+                        % (upstream.post_connection_count, upstream.accepts))
                     assert len(upstream.requests) == 4, "unexpected POST replay"
                 print("PASS: ordinary close obtains a new upstream connection without replay")
 
@@ -261,7 +281,12 @@ def main():
                 assert any(e.get("transport", {}).get("reused") is True for e in rows), "reuse evidence missing"
                 assert any(e.get("transport", {}).get("phase") == "tls_handshake"
                            for e in rows if e.get("type") in ("ERR", "CANCEL")), "TLS failure phase missing"
-                assert upstream.accepts == 2 and len(upstream.requests) == 5
+                assert (upstream.post_connection_count == 2
+                        and len(upstream.requests) == 5), (
+                            "unexpected upstream connection/POST count "
+                            "(post conns=%d, raw accepts=%d, posts=%d)"
+                            % (upstream.post_connection_count, upstream.accepts,
+                               len(upstream.requests)))
                 print("PASS: persisted evidence distinguishes actual reuse and TLS failure")
 
                 # 握手熔断：这一次客户端不再等到自己超时，引擎在预算内掐掉这一跳，

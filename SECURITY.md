@@ -166,6 +166,8 @@ Data Maskit 是一个**本地脱敏代理**：拦截本机 LLM API 请求，敏�
 
 `MASKIT_PANEL_HOST=0.0.0.0` 时面板进入远程模式：Host 校验放开、Origin 改为同源校验，**所有 `/api/*` 仍必须携带 `X-Shield-Token`**（来自 `MASKIT_PANEL_TOKEN`、`MASKIT_PANEL_TOKEN_FILE`，或启动日志打印的随机值）。5801 与 187xx 端口只应暴露给可信网络，反代端口本身不做鉴权，Compose 默认只绑定回环地址。
 
+**桌面版的局域网访问开关（`config.lan_access`，默认 `false`）**：设置页「高级选项 → 局域网访问」打开后，面板与反代端口一起改绑 `0.0.0.0`，**重启引擎生效**。这是把上面那组风险显式交给桌面用户，所以默认关闭，且打开时设置页会给出可见警告与局域网访问地址。令牌仍取自数据目录的 `proxy_token`（其它设备首次访问需粘贴）。环境变量 `MASKIT_PANEL_HOST` / `MASKIT_LISTEN_HOST` 优先级高于该开关，容器部署行为不受它影响；配置读取失败时**一律回落到回环**（安全开关的失败方向恒为关）。
+
 如果 HTTPS 在可信反向代理处终止，请显式设置 `MASKIT_TRUST_PROXY=1`，并让代理覆盖单跳 `X-Forwarded-Proto` / `X-Forwarded-Host`；应用默认不信任这些头。浏览器登录推荐打开根路径后粘贴令牌，临时链接使用 `/#token=...`（fragment 不进访问日志）；`?token=...` 仅为旧版本兼容。
 
 `/api/*` 除令牌外还有一层 Origin 同源校验（CSRF 纵深防御）。若前置代理/CDN 回源时改写了 `Origin`，校验会拒绝这些请求；**静态资源（HTML / JS / CSS）不参与该校验**，因此即使校验拒绝也只会影响接口调用，不会导致页面白屏。遇到拒绝时优先排查代理是否正确透传 `X-Forwarded-Proto` / `X-Forwarded-Host` 并配合 `MASKIT_TRUST_PROXY=1`；仅在确实无法对齐时才关闭校验：环境变量 `MASKIT_DISABLE_ORIGIN_CHECK=1`（需在启动前设置，日志会打印警告）或设置页的 `origin_check` 开关（默认开启）。**关闭后 `/api/*` 的跨源防御只剩 `X-Shield-Token` 单层**，此时必须确保面板端口只暴露给可信网络。

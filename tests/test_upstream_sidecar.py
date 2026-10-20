@@ -36,21 +36,41 @@ from shield_defaults import parse_egress_proxy
 _UNREACHABLE_TARGET = "https://127.0.0.1:1"
 
 
+# 环回端口是**共享资源**：本机任何进程都能连进来。实测（2026-10-12）开发机上的 agent
+# 工具链端口扫描器每几秒把整个临时端口段扫一遍，往每个新监听端口发
+# `HEAD / HTTP/1.1`（**不带 Host**）。mock 上游原先按 accept 计数，这些外来连接把
+# 「两次请求只建一条连接」的断言打红——用例因此看本机装了什么软件的脸色（6 跑 4 红），
+# 而产品侧完全没问题。判据改成「请求带上测试标记头才算我们的流量」，连接也只在跑完
+# 标记请求之后才计数。加标记头要同时改 mock 与客户端，所以它是 opt-in 的：
+# 默认 tag=None 时行为与旧版完全一致（其余用例照旧）。
+_TEST_TAG_HEADER = "x-maskit-test-tag"
+_TEST_TAG = "sidecar-conn-reuse"
+_TEST_TAG_HEADERS = {_TEST_TAG_HEADER: _TEST_TAG}
+
+
 class MockUpstream:
     """本地 mock HTTP 上游服务器（h11 SERVER 模式）。
 
     同时充当假出口代理：代理端会收到绝对形式（absolute-form）的请求行
     ``GET http://target/get``，据此可判定流量确实经过了代理而非直连。
+
+    ``tag`` 给了值时只统计带该标记头的请求（见文件顶部 ``_TEST_TAG`` 的说明）：
+    给「连接数 / 请求数」这类精确断言用，避免被本机其它进程的端口探测污染。
     """
 
-    def __init__(self):
+    def __init__(self, tag: str | None = None):
         self._server = None
         self._port = 0
+        self.tag = tag
         self.received_headers = []  # 每次 request 收到的头
         self.received_targets = []  # 每次 request 收到的请求行 target
         self.received_methods = []  # 每次 request 收到的方法（HEAD 必须与 GET 区分）
         self.received_bodies = []   # 每次 request 收到的 body
-        self.connection_count = 0   # accepted 连接数（判定 keep-alive 是否真的复用）
+        self.request_peers = []     # 每个入账请求来自哪个客户端源地址（判「同一 socket」）
+        # 跑完过至少一个入账请求的连接数——keep-alive 复用与否就看它
+        self.connection_count = 0
+        # 连上来却没跑完入账请求的连接数（本机端口扫描等外来流量，只作诊断）
+        self.foreign_connections = 0
 
     async def start(self):
         self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
@@ -65,8 +85,14 @@ class MockUpstream:
     def url(self):
         return "http://127.0.0.1:%d" % self._port
 
+    @property
+    def port(self):
+        return self._port
+
     async def _handle(self, reader, writer):
-        self.connection_count += 1
+        peer = writer.get_extra_info("peername")
+        served = False          # 这条连接上跑完过至少一个入账请求
+        in_scope = False        # 当前请求是否算「我们的流量」
         conn = h11.Connection(our_role=h11.SERVER)
         pending = b""
         method = "GET"
@@ -85,14 +111,22 @@ class MockUpstream:
                         path = event.target.decode()
                         hdrs = {k.decode().lower(): v.decode()
                                 for k, v in event.headers}
-                        self.received_headers.append(hdrs)
-                        self.received_targets.append(path)
-                        self.received_methods.append(method)
+                        in_scope = (self.tag is None
+                                    or hdrs.get(_TEST_TAG_HEADER) == self.tag)
+                        if in_scope:
+                            if not served:
+                                served = True
+                                self.connection_count += 1
+                            self.received_headers.append(hdrs)
+                            self.received_targets.append(path)
+                            self.received_methods.append(method)
+                            self.request_peers.append(peer)
                         pending = b""
                     elif isinstance(event, h11.Data):
                         pending += event.data
                     elif isinstance(event, h11.EndOfMessage):
-                        self.received_bodies.append(pending)
+                        if in_scope:
+                            self.received_bodies.append(pending)
                         pending = b""
                         status, resp_headers, body = self._respond(
                             method, path, hdrs)
@@ -122,9 +156,14 @@ class MockUpstream:
                                             _struct.pack("ii", 1, 0))
                             writer.close()
                             return
-        except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
+        except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError,
+                # 外来探测（缺 Host、非 HTTP 字节）会让 h11 抛 RemoteProtocolError。
+                # 那不是本进程的错误，静默关掉即可，别让 asyncio 打一堆 traceback。
+                h11.RemoteProtocolError):
             pass
         finally:
+            if not served:
+                self.foreign_connections += 1
             try:
                 writer.close()
             except Exception:
@@ -624,11 +663,14 @@ class TestSidecarProxyClientSelection(unittest.IsolatedAsyncioTestCase):
     """
 
     async def asyncSetUp(self):
-        self.upstream = MockUpstream()  # 假真实上游
+        # 带标记的 mock + 带标记的客户端：这一组的断言是「建了几条连接」，
+        # 不加标记就会被本机端口扫描器探到的连接一起计数（见文件顶部注释）。
+        self.upstream = MockUpstream(tag=_TEST_TAG)  # 假真实上游
         await self.upstream.start()
-        self.proxy = MockUpstream()     # 假出口代理
+        self.proxy = MockUpstream(tag=_TEST_TAG)     # 假出口代理
         await self.proxy.start()
-        self.test_client = httpx.AsyncClient(timeout=10.0, trust_env=False)
+        self.test_client = httpx.AsyncClient(
+            timeout=10.0, trust_env=False, headers=dict(_TEST_TAG_HEADERS))
         self._sidecars: list = []
 
     async def asyncTearDown(self):
@@ -1053,12 +1095,16 @@ class TestSidecarKeepaliveExpiry(unittest.IsolatedAsyncioTestCase):
     预算取 120 s 的实测依据：同一请求节奏下 30 s 预算要新建 6 条上游连接、每次停顿后
     多付约 400 ms，而 120 s 只需 2 条；上游本身在 240 s 空闲后仍在同一条 socket 上回
     200（所以窗口内拿到的是活连接，不是尸体）。
+
+    第四条是这组的前提条件：连接计数必须只算我们自己的流量（tag 过滤），否则本机
+    端口扫描器一探就会把「复用」断言打红（见文件顶部 `_TEST_TAG` 的说明）。
     """
 
     async def asyncSetUp(self):
-        self.mock = MockUpstream()
+        self.mock = MockUpstream(tag=_TEST_TAG)
         await self.mock.start()
-        self.client = httpx.AsyncClient(timeout=10.0, trust_env=False)
+        self.client = httpx.AsyncClient(
+            timeout=10.0, trust_env=False, headers=dict(_TEST_TAG_HEADERS))
         self._sidecars = []
 
     async def asyncTearDown(self):
@@ -1114,8 +1160,16 @@ class TestSidecarKeepaliveExpiry(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(1.5)
         self.assertEqual(await self._get(sidecar), 200)
         self.assertEqual(self.mock.connection_count, 1,
-                         "预算内的空闲把连接丢了（accepted=%d）"
+                         "预算内的空闲把连接丢了（served=%d）"
                          % self.mock.connection_count)
+        # 计数之外再加一条身份判据：两条请求必须来自**同一个源端口**。
+        # 计数只能说明「同一个连接跑完了两条请求」，源端口相同才直接证明
+        # 这条 socket 没被换过（上游换了连接但计数恰好为 1 的情形它拦得住）。
+        ports = {p[1] for p in self.mock.request_peers}
+        self.assertEqual(len(self.mock.request_peers), 2)
+        self.assertEqual(len(ports), 1,
+                         "两次请求来自不同源端口 %r——连接确实被重建了"
+                         % ([p[1] for p in self.mock.request_peers],))
 
     async def test_gap_beyond_expiry_reconnects_without_error(self):
         """超出预算只是剔除过期连接：重连、两条都 200，errors 计数保持 0。"""
@@ -1124,8 +1178,53 @@ class TestSidecarKeepaliveExpiry(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(1.0)
         self.assertEqual(await self._get(sidecar), 200)
         self.assertEqual(self.mock.connection_count, 2,
-                         "过期连接没被剔除，空闲预算形同虚设")
+                         "过期连接没被剔除，空闲预算形同虚设"
+                         "（served=%d）" % self.mock.connection_count)
         self.assertEqual(sidecar.metrics()["stats"]["errors"], 0)
+
+    async def test_connection_count_ignores_foreign_probes(self):
+        """本机其它进程探到 mock 端口时，连接计数与请求记录都不能被它带偏。
+
+        环回端口是共享资源：实测（2026-10-12）开发机上的 agent 工具链每几秒全段
+        扫一遍，会发出「没有 Host 的 HEAD /」（h11 直接拒）和普通 GET。两类外来
+        流量都不该进 ``connection_count`` / ``received_*``，否则「两次请求只建一条
+        连接」的断言就变成看本机装了什么软件的脸色。
+        """
+        sidecar = await self._start_sidecar(expiry=300.0)
+        self.assertEqual(await self._get(sidecar), 200)
+
+        # 1) 畸形探测（真实观察到的那种：没有 Host）
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.mock.port)
+        writer.write(b"HEAD / HTTP/1.1\r\nUser-Agent: port-probe\r\n"
+                     b"Connection: close\r\n\r\n")
+        await writer.drain()
+        await reader.read(4096)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+        # 2) 合法但与我们无关的 HTTP 请求（没有测试标记头）
+        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as probe:
+            await probe.get(self.mock.url + "/probe")
+
+        self.assertEqual(await self._get(sidecar), 200)
+        self.assertEqual(self.mock.received_targets, ["/get", "/get"],
+                         "外来探测混进了 mock 的请求记录")
+        self.assertEqual(self.mock.connection_count, 1,
+                         "外来探测被算进了连接计数（served=%d）"
+                         % self.mock.connection_count)
+        # 反向自证：两条探测真的要落在 mock 上（否则这条用例就是空跑），
+        # 且它们被归到了 foreign 一侧而不是被默默当成我们的流量。
+        for _ in range(50):
+            if self.mock.foreign_connections >= 2:
+                break
+            await asyncio.sleep(0.02)
+        self.assertGreaterEqual(
+            self.mock.foreign_connections, 2,
+            "外来探测没被记到 foreign_connections（实际 %d）——探测可能根本没到 mock"
+            % self.mock.foreign_connections)
 
 
 if __name__ == "__main__":

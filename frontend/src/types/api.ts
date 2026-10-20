@@ -161,6 +161,12 @@ export interface ProxyStatus {
   needs_ca: boolean
   wizard_recommended: boolean
   last_error: string
+  /** 局域网访问：config 里的用户意图 */
+  lan_access?: boolean
+  /** 本进程实际绑定地址。与 lan_access 不一致 = 开关改了但还没重启 */
+  panel_host?: string
+  /** 局域网访问地址（仅远程模式下有值），供设置页展示 */
+  lan_urls?: string[]
   /** MASKIT_PANEL_TOKEN 太短/非 ASCII 被忽略（面板改用随机 token），前端弹一次性提醒 */
   panel_token_env_rejected?: boolean
 }
@@ -457,6 +463,11 @@ export interface ShieldConfig {
   response_scan: boolean
   /** 控制面 Origin 校验开关（默认 true）。反代/CDN 回源 Origin 不匹配致面板 403 时可关 */
   origin_check?: boolean
+  /**
+   * 局域网访问（默认 false）。开启后面板与代理端口绑 0.0.0.0，同一局域网的
+   * 其它设备可访问；**需重启引擎生效**。容器/无头部署请用 MASKIT_PANEL_HOST。
+   */
+  lan_access?: boolean
   /** 敏感词统计是否记录明文（默认 true）。关闭后 daily_words 只存打码形态 */
   record_plaintext_words: boolean
   stream_response: boolean

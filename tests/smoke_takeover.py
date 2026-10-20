@@ -7,9 +7,14 @@
 sidecar 单测用 mock 上游，路由单测根本不连 mitmproxy。
 
 判据全部不经网关：
-- 上游实例自己记录的 TCP 连接数（对照组与接管组各起一个独立实例，互不污染）
+- 上游实例自己记录的「真实请求来自几个源端口」（连接复用）
 - mitmdump 日志里的 sidecar 启动行
 - 客户端收到的还原文本（接管不能把脱敏/还原改坏）
+
+为什么不用上游 accept 计数：环回端口是**共享资源**，本机任何进程都能连进来。实测
+（2026-10-12）开发机上的 agent 工具链每几秒把端口段扫一遍，向新监听端口发 `HEAD /`，
+accept 计数把外来探测一起算进「连接复用失败」（同一脚本 2 跑 1 红，与产品无关）。
+改用「POST 请求的源端口集合」：只有真正跑完我们请求的连接才会进去。
 
 跑两遍：takeover=false（对照）与 takeover=true（接管），各 3 次请求。
 """
@@ -40,22 +45,24 @@ CHUNKS = 5
 REQUESTS = 3
 ENTITY = "王大锤"
 # 形如真实 SSE 的响应块数固定，便于客户端按块校验
-STATE = {"conns": 0, "bodies": []}
+STATE = {"conns": 0, "post_conns": [], "bodies": []}
 
 
 class FakeUpstream(BaseHTTPRequestHandler):
-    """假上游：慢速吐 SSE，并记录 TCP 连接数与收到的请求体。"""
+    """假上游：慢速吐 SSE，并记录「真实请求来自哪些源端口」与请求体。"""
 
     protocol_version = "HTTP/1.1"
 
     def setup(self):
         super().setup()
-        STATE["conns"] += 1
+        STATE["conns"] += 1   # accept 数，仅作诊断：含本机端口扫描等外来连接
 
     def log_message(self, *a):
         pass
 
     def do_POST(self):
+        # 连接复用的判据：同一个源端口 = 同一条上游 TCP 连接。
+        STATE["post_conns"].append(self.client_address[1])
         length = int(self.headers.get("content-length") or 0)
         body = self.rfile.read(length)
         STATE["bodies"].append(body.decode("utf-8", errors="replace"))
@@ -161,8 +168,10 @@ def run_pass(takeover, upstream_port):
             proc.kill()
 
 
-def check_pass(label, texts, bodies, conns, logs, expect_takeover):
+def check_pass(label, texts, bodies, conns, post_conns, logs, expect_takeover):
     ok = True
+    # 我们自己的请求实际用过几条上游连接（外来探测不会产生 POST，所以污染不进来）
+    used = len(set(post_conns))
     for i, text in enumerate(texts):
         if ENTITY not in text:
             print("FAIL [%s] 第 %d 条响应未还原：%r" % (label, i + 1, text))
@@ -186,17 +195,18 @@ def check_pass(label, texts, bodies, conns, logs, expect_takeover):
         else:
             print("FAIL [takeover] 日志里没有 sidecar 启动行 —— 接管没生效")
             ok = False
-        if conns <= 2:
+        if used <= 2:
             print("PASS [takeover] %d 次请求只建了 %d 条上游连接（池已复用）"
-                  % (len(bodies), conns))
+                  % (len(bodies), used))
         else:
             print("FAIL [takeover] %d 次请求建了 %d 条上游连接 —— 连接池没复用"
-                  % (len(bodies), conns))
+                  "（accept 计数 %d，含外来探测）" % (len(bodies), used, conns))
             ok = False
     else:
-        print("INFO [baseline] %d 次请求建了 %d 条上游连接（对照组，不作断言："
-              "mitmproxy 自身的复用行为不在本脚本保护范围）" % (len(bodies), conns))
-        if conns <= 2:
+        print("INFO [baseline] %d 次请求用了 %d 条上游连接（accept 计数 %d；"
+              "对照组不作断言：mitmproxy 自身的复用行为不在本脚本保护范围）"
+              % (len(bodies), used, conns))
+        if used <= 2:
             print("WARN [baseline] 对照组也复用了上游连接，本机 run 下 C1 的收益"
                   "无法从对比中体现（判据仍成立：接管组必须 ≤ 2）")
     return ok
@@ -206,6 +216,7 @@ def main():
     ok = True
     for takeover, label in ((False, "baseline"), (True, "takeover")):
         STATE["conns"] = 0
+        STATE["post_conns"] = []
         STATE["bodies"] = []
         upstream_port = UPSTREAM_PORT_BASE + (1 if takeover else 0)
         srv = ThreadingHTTPServer(("127.0.0.1", upstream_port), FakeUpstream)
@@ -218,7 +229,7 @@ def main():
                 print("FAIL: 代理端口未监听\n" + "".join(logs[-30:]))
                 return 1
             ok &= check_pass(label, texts, STATE["bodies"], STATE["conns"],
-                             logs, takeover)
+                             STATE["post_conns"], logs, takeover)
         finally:
             srv.shutdown()
             srv.server_close()

@@ -108,6 +108,7 @@
   "fail_closed": true,
   "response_scan": true,
   "origin_check": true,
+  "lan_access": false,
   "record_plaintext_words": true,
   "ext_bridge_enabled": false,
   "ext_token": "",

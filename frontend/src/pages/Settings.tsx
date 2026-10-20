@@ -2003,6 +2003,52 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
             </CardContent>
           </Card>
 
+          {/* 局域网访问。绑定地址在 app.run 时确定，改开关必须重启引擎才生效，
+              所以这里只保存配置 + 提示，不在前端假装“已生效”。 */}
+          <Card className="border bg-card">
+            <CardHeader>
+              <CardTitle className="text-sm font-semibold">{t('settings.advanced.lanAccess')}</CardTitle>
+              <p className="mt-1 text-xs text-muted-foreground">{t('settings.advanced.lanAccessHint')}</p>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              <SettingToggle
+                label={t('settings.advanced.lanAccessToggle')}
+                desc={t('settings.advanced.lanAccessToggleDesc')}
+                checked={!!cfg?.lan_access}
+                onChange={(v) => save({ lan_access: v }, t('settings.toast.lanAccessSaved'))}
+              />
+              {!!cfg?.lan_access && (
+                <>
+                  <p className="text-[11px] leading-snug text-amber-600 dark:text-amber-400">
+                    {t('settings.advanced.lanAccessSecurity')}
+                  </p>
+                  {!!status?.lan_urls?.length && (
+                    <div>
+                      <div className="text-[11px] text-muted-foreground">{t('settings.advanced.lanAccessUrls')}</div>
+                      <div className="mt-1 flex flex-wrap gap-1.5">
+                        {status.lan_urls.map((u) => (
+                          <code key={u} className="rounded border bg-muted/40 px-1.5 py-0.5 font-mono text-[11px]">{u}</code>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {/* 配置已开但仍绑在回环：说明本进程启动时开关还是关的 */}
+                  {(status?.panel_host ?? '').startsWith('127.') && (
+                    <p className="text-[11px] text-muted-foreground">{t('settings.advanced.lanAccessRestart')}</p>
+                  )}
+                  {/* 局域网用户没有本机 token，必须告诉用户令牌存在哪；
+                      不给路径的话这个开关等于摆设（其它设备进不去面板）。 */}
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <Button size="sm" variant="outline" className="h-7 text-[11px]" onClick={doOpenDataDir}>
+                      {t('settings.security.openDataDir')}
+                    </Button>
+                    <span className="text-[11px] text-muted-foreground">{t('settings.advanced.lanAccessToken')}</span>
+                  </div>
+                </>
+              )}
+            </CardContent>
+          </Card>
+
           {/* 开关按功能分类：代理行为 / 日志与隐私 / 系统 */}
           <div className="grid gap-3 lg:grid-cols-3">
             {/* 代理行为 */}
