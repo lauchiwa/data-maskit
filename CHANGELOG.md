@@ -4,6 +4,32 @@
 
 每个版本章节的**开头**必须有 `### 更新摘要 / Summary`（中英各一至三条）—— 它会被原样用作用户能看到的「版本介绍」（GitHub Release 首屏与更新弹窗），所以只写用户能感知到的变化，不写实现细节。技术条目写在摘要下面的分节里。
 
+## [0.11.4] - 2026-10-20
+
+### 更新摘要 / Summary
+- 客户端名称现在支持空格，不再出现输入空格导致配置重置为默认客户端的问题。
+- 敏感词库支持一键导出备份与导入，方便跨设备迁移与词条管理。
+- 敏感词库增加大小写自动覆盖与中文整词匹配指引，词条匹配更清晰。
+- Client names now support spaces without resetting your configured clients to defaults.
+- Sensitive words can now be exported and imported for easier backups and multi-device setup.
+- Word lists now include case-insensitive matching tips and clearer guidance for Chinese words.
+
+### 修复
+- 客户端名称支持空格：输入包含空格的客户端名称时不再被忽略，更不会因所有客户端失效而误把配置重置为默认客户端。
+- 客户端修改校验：保存客户端时对名称与目标地址进行前置检查，非法输入即时提示，避免配置损坏。
+
+### 新增
+- 词库导入导出：设置页敏感词库新增一键导出备份，支持通过文件或粘贴导入，提供增量合并与完全覆盖两种模式。
+- 词条变体提示：同分类下录入大小写变体时主动提醒已自动覆盖，并补充中文独立词正则用法说明。
+
+### Fixed
+- Client names with spaces are now accepted and no longer trigger an accidental reset to default clients.
+- Added preflight checks for client name and target URL to catch invalid input before saving.
+
+### Added
+- Word list export and import: backup custom sensitive words as a JSON file, or import via file or paste with merge and overwrite options.
+- Case-variant duplicate hints and clearer guidance on regex patterns for isolated Chinese words.
+
 ## [0.11.3] - 2026-10-20
 
 ### 更新摘要 / Summary

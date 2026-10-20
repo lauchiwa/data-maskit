@@ -232,6 +232,38 @@ class ConfigPatchEndpointTests(unittest.TestCase):
             0,
         )
 
+    def test_upstream_name_with_spaces_allowed_and_normalized(self):
+        """客户端名称允许中英文+空格+数字，两端自动strip，且slug转下划线。"""
+        new_upstream = {
+            "name": "  My OpenAI Proxy  ",
+            "target": "https://api.openai.com",
+            "port": 18705,
+            "paths": ["/v1"],
+        }
+        res = self.patch({"key": "upstreams", "op": "list_upsert", "value": new_upstream})
+        self.assertEqual(res.status_code, 200)
+        cfg = self.cfg()
+        names = [u["name"] for u in cfg["upstreams"]]
+        self.assertIn("My OpenAI Proxy", names)
+        u = next(x for x in cfg["upstreams"] if x["name"] == "My OpenAI Proxy")
+        self.assertEqual(u["base_path"], "/my_openai_proxy")
+
+    def test_upstream_invalid_or_pure_whitespace_name_rejected_without_reset(self):
+        """非法名称（纯空格或特殊字符）在patch时立即400拦截，绝不重置为默认客户端。"""
+        initial_upstreams = self.cfg()["upstreams"]
+        res = self.patch({"key": "upstreams", "op": "list_upsert", "value": {"name": "   ", "target": "https://api.openai.com"}})
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(self.cfg()["upstreams"], initial_upstreams)
+
+        res2 = self.patch({"key": "upstreams", "op": "list_upsert", "value": {"name": "bad<script>", "target": "https://api.openai.com"}})
+        self.assertEqual(res2.status_code, 400)
+        self.assertEqual(self.cfg()["upstreams"], initial_upstreams)
+
+    def test_empty_upstreams_list_does_not_reset_to_defaults(self):
+        """当upstreams明确为空数组时，不得静默重置为3个默认客户端。"""
+        normalized = panel.normalize_config({"upstreams": []})
+        self.assertEqual(normalized["upstreams"], [])
+
 
 class DefaultConfigKeyParityTests(unittest.TestCase):
     """default_config() 是「合法配置键」的唯一真相来源，必须与归一化输出对齐。

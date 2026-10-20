@@ -11061,6 +11061,7 @@ def _read_settings():
             if k in builtin:
                 builtin[k] = bool(v)
     # 反向代理 upstream 路由表
+    has_upstreams = "upstreams" in cfg and cfg.get("upstreams") is not None
     ups = []
     raw_ups = cfg.get("upstreams")
     if isinstance(raw_ups, list):
@@ -11080,7 +11081,8 @@ def _read_settings():
                 continue
             seen_names.add(name_key)
 
-            slug = re.sub(r"[^A-Za-z0-9_\-]", "", name).lower()[:40]
+            slug = re.sub(r"[^A-Za-z0-9_\-]", "", name.replace(" ", "_")).lower()[:40]
+            slug = re.sub(r"_+", "_", slug).strip("_")
             if not base or not re.fullmatch(r"/[A-Za-z0-9_\-/]{1,60}", base):
                 base = "/" + (slug or f"up_{len(ups) + 1}")
             if not base.startswith("/"):
@@ -11128,7 +11130,7 @@ def _read_settings():
                         "takeover": is_true(u.get("takeover")),
                         "extra_headers": extra_headers,
                         **({"connection_policy": u["connection_policy"]} if "connection_policy" in u else {})})
-    if not ups:
+    if not ups and not has_upstreams:
         ups = list(DEFAULT_UPSTREAMS)
     # 出口代理：enabled 关闭时直接置 None，省得 request() 每次都判两个字段。
     # 地址非法同样返回 None（panel 侧 normalize_config 已给过 warning）。

@@ -36,6 +36,8 @@ import {
   Search,
   ChevronRight,
   Globe,
+  Download,
+  Upload,
 } from 'lucide-react'
 import { getConfig, saveConfig, saveBuiltinRules, patchConfig, testUpstream, openDataDir, restoreNetwork, getHealth, getConfigBackups, restoreConfigBackup, getPriceSyncStatus, syncPricesNow, getPriceList, getMappingStats, clearMappings, type ConfigBackup, type ConfigPatch, type SaveConfigResponse } from '@/api/settings'
 import { runAudit, cancelAudit, getAuditJob, getAuditReport } from '@/api/audit'
@@ -79,6 +81,7 @@ import dayjs from 'dayjs'
 import { useI18n } from '@/lib/i18n'
 import { AboutUpdateCard } from '@/components/settings/AboutUpdateCard'
 import { EnvImportDialog } from '@/components/settings/EnvImportDialog'
+import { WordsImportDialog } from '@/components/settings/WordsImportDialog'
 
 import { BackgroundCard } from '@/components/settings/BackgroundCard'
 import { ExtBridgeCard } from '@/components/settings/ExtBridgeCard'
@@ -286,6 +289,20 @@ function UpstreamForm({
   // 预设已不再预填凭据头，这里兜住手输与历史配置。
   const PLACEHOLDER_HEADER_VAL = /^\s*(?:Bearer\s+)?<[^<>]{1,64}>\s*$/i
   const saveChecked = () => {
+    const trimmedName = String(form.name ?? '').trim()
+    if (!trimmedName) {
+      toast(t('settings.upstream.nameRequired'), 'error')
+      return
+    }
+    if (!/^[A-Za-z0-9_\-\u4e00-\u9fff ]{1,40}$/.test(trimmedName)) {
+      toast(t('settings.upstream.nameInvalid'), 'error')
+      return
+    }
+    const trimmedTarget = String(form.target ?? '').trim()
+    if (!trimmedTarget) {
+      toast(t('settings.upstream.targetRequired'), 'error')
+      return
+    }
     // 空值的行不算违规：onSaveUpstream 会把它整行丢掉，效果等同「删行」，
     // 否则用户清空值（而不是点删除）时会被永久卡在弹窗里，改不动也退不出。
     const cred = Object.keys(extraHeaders).find(
@@ -300,7 +317,11 @@ function UpstreamForm({
       toast(tf('settings.upstream.headerPlaceholder', { k: bad[0], v: bad[1] }), 'error')
       return
     }
-    onSave(form)
+    onSave({
+      ...form,
+      name: trimmedName,
+      target: trimmedTarget,
+    })
   }
 
   return (
@@ -709,6 +730,8 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
   const [newCatName, setNewCatName] = useState('')
   // 从 .env 导入对话框
   const [envImportOpen, setEnvImportOpen] = useState(false)
+  // 敏感词库导入对话框
+  const [wordsImportOpen, setWordsImportOpen] = useState(false)
   const [newPrefix, setNewPrefix] = useState('')
   const [newDomain, setNewDomain] = useState('')
   const [newPath, setNewPath] = useState('')
@@ -992,7 +1015,12 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
     // 清理空 header（Key 为空或 Value 为空的条目不发后端）
     const extra = u.extra_headers ?? {}
     const cleanExtra = Object.fromEntries(Object.entries(extra).filter(([, v]) => v.trim() !== ''))
-    const clean: UpstreamConfig = { ...u, extra_headers: Object.keys(cleanExtra).length ? cleanExtra : undefined }
+    const clean: UpstreamConfig = {
+      ...u,
+      name: String(u.name ?? '').trim(),
+      target: String(u.target ?? '').trim(),
+      extra_headers: Object.keys(cleanExtra).length ? cleanExtra : undefined,
+    }
     // 编辑：按原 name 匹配（改名/改端口都更新而非新增）；新增：无匹配则添加
     const isEdit = editing != null
     // 只提交这一个客户端，由服务端在锁内按 name 就地更新/追加。
@@ -1049,6 +1077,13 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
     if (v.length < 3 && !v.startsWith('re:')) {
       toast(tf('settings.toast.wordTooShort', { word: v, n: v.length }), 'error')
     }
+    // 大小写变体友好提示（不阻断）：系统默认忽略大小写
+    if (!v.startsWith('re:')) {
+      const caseMatch = existing.find((x) => !x.startsWith('re:') && x.toLowerCase() === v.toLowerCase())
+      if (caseMatch) {
+        toast(tf('settings.words.caseVariantExists', { word: caseMatch }))
+      }
+    }
     save(() => patchConfig({ key: 'sensitive', op: 'list_add', path: [cat], value: [v] }), t('settings.toast.added'))
     setAddWordVal('')
     setAddWordCat(null)
@@ -1062,6 +1097,28 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
     if (!name.trim()) return
     save(() => patchConfig({ key: 'sensitive', op: 'set', path: [name.trim()], value: [] }), t('settings.toast.catAdded'))
     setNewCatName('')
+  }
+
+  const exportWords = () => {
+    const data = {
+      version: 1,
+      exported_at: new Date().toISOString(),
+      sensitive: cfg?.sensitive ?? {},
+      sensitive_disabled: cfg?.sensitive_disabled ?? [],
+      sensitive_word_disabled: cfg?.sensitive_word_disabled ?? {},
+      sensitive_word_whole: cfg?.sensitive_word_whole ?? [],
+    }
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    const dateStr = new Date().toISOString().slice(0, 10)
+    a.href = url
+    a.download = `maskit-words-${dateStr}.json`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+    toast(t('settings.words.exportSuccess'))
   }
 
   const removeCategory = (cat: string) => {
@@ -1482,6 +1539,12 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
               <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => setEnvImportOpen(true)}>
                 <FileText className="mr-1 h-3 w-3" /> {t('settings.words.envImport')}
               </Button>
+              <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => setWordsImportOpen(true)}>
+                <Upload className="mr-1 h-3 w-3" /> {t('settings.words.import')}
+              </Button>
+              <Button size="sm" variant="outline" className="h-7 text-xs" onClick={exportWords}>
+                <Download className="mr-1 h-3 w-3" /> {t('settings.words.export')}
+              </Button>
             </div>
           </div>
 
@@ -1509,8 +1572,13 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
             )
           })()}
           {/* 分类词表：卡片式（每分类一张卡，网格布局） */}
-          <div className="rounded-lg border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
-            {t('settings.words.regexHint').split('{n}')[0]}<code className="font-mono">re:</code>{t('settings.words.regexHint').split('{n}').slice(1).join('{n}')}
+          <div className="rounded-lg border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground space-y-1">
+            <div>
+              {t('settings.words.regexHint').split('{n}')[0]}<code className="font-mono">re:</code>{t('settings.words.regexHint').split('{n}').slice(1).join('{n}')}
+            </div>
+            <div>
+              {t('settings.words.caseInsensitiveHint')}
+            </div>
           </div>
           {/* 词条搜索：词库多时快速定位 */}
           {Object.values(words).reduce((n, l) => n + l.length, 0) > 15 && (
@@ -1638,6 +1706,9 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                         } else {
                           // 正常 → 整词
                           toggleWordWhole(w)
+                          if (/[\u4e00-\u9fff]/.test(w)) {
+                            toast(t('settings.words.cjkWholeHint'))
+                          }
                         }
                       }
                       return (
@@ -1741,6 +1812,18 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
               }
               return patchSequence(steps)
             }, msg)}
+          />
+
+          <WordsImportDialog
+            open={wordsImportOpen}
+            onOpenChange={setWordsImportOpen}
+            currentSensitive={words}
+            currentSensitiveDisabled={cfg?.sensitive_disabled ?? []}
+            currentSensitiveWordDisabled={wordDisabled}
+            currentSensitiveWordWhole={wordWhole}
+            onImport={(payload, msg) => {
+              save(payload, msg)
+            }}
           />
             </TabsContent>
 

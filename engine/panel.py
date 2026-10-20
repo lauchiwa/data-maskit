@@ -15,7 +15,7 @@ Data Maskit 控制面板 - 本地 Flask 服务
 # 本程序基于「希望有用」的目的分发，但不附带任何担保；亦无对适销性或特定用途
 # 适用性的默示担保。详见 GNU Affero 通用公共许可证。
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
-__version__ = '0.11.3'
+__version__ = '0.11.4'
 import json
 import codecs
 import copy
@@ -4261,8 +4261,9 @@ def normalize_config(raw, warnings=None, *, validate_controls=True):
         prefixes = _uniq(prefixes)[:100] or list(DEFAULT_SECRET_PREFIXES)
 
     # 反向代理 upstream 路由表
+    has_upstreams_field = "upstreams" in raw and raw.get("upstreams") is not None
     ups = []
-    raw_ups = raw.get("upstreams", base["upstreams"])
+    raw_ups = raw.get("upstreams", base["upstreams"]) if has_upstreams_field else base["upstreams"]
     if isinstance(raw_ups, list):
         seen_names = set()
         seen_base = set()
@@ -4273,9 +4274,9 @@ def normalize_config(raw, warnings=None, *, validate_controls=True):
             name = str(u.get("name") or "").strip()
             base_path = str(u.get("base_path") or "").strip()
             target = str(u.get("target") or "").strip()
-            # name 限安全字符集（防 DOM XSS，允许中英文字母、数字、下划线、减号）
-            if not name or not re.fullmatch(r"[A-Za-z0-9_\-\u4e00-\u9fff]{1,40}", name):
-                warn.append(f"客户端名称「{name[:20] or '(空)'}」含不支持的字符（只能中英文、数字、_ 和 -），该条已忽略")
+            # name 限安全字符集（防 DOM XSS，允许中英文字母、数字、空格、下划线、减号）
+            if not name or not re.fullmatch(r"[A-Za-z0-9_\-\u4e00-\u9fff ]{1,40}", name):
+                warn.append(f"客户端名称「{name[:20] or '(空)'}」含不支持的字符（只能中英文、数字、空格、_ 和 -），该条已忽略")
                 continue
             if not target:
                 warn.append(f"客户端「{name}」未填真实上游地址，该条已忽略")
@@ -4292,7 +4293,8 @@ def normalize_config(raw, warnings=None, *, validate_controls=True):
             # user_base 记录「用户显式填过且合法」的值：只有它被改名才告警——单端口前缀
             # 模式下 base_path 就是客户端 base_url 的路径，改名等于改契约，用户必须同步改
             # 客户端配置；静默改名会让他对着 404 找不到原因。自动生成的 /up_N 不告警（本就没契约）。
-            slug = re.sub(r"[^A-Za-z0-9_\-]", "", name).lower()[:40]
+            slug = re.sub(r"[^A-Za-z0-9_\-]", "", name.replace(" ", "_")).lower()[:40]
+            slug = re.sub(r"_+", "_", slug).strip("_")
             user_base = base_path
             if not base_path or not re.fullmatch(r"/[A-Za-z0-9_\-/]{1,60}", base_path):
                 base_path = "/" + (slug or f"up_{len(ups) + 1}")
@@ -4384,7 +4386,7 @@ def normalize_config(raw, warnings=None, *, validate_controls=True):
                     if _CONNECTION_POLICY_LOAD_WARNING not in warn:
                         warn.append(_CONNECTION_POLICY_LOAD_WARNING)
             ups.append(upstream)
-    if not ups:
+    if not ups and not has_upstreams_field:
         ups = list(DEFAULT_UPSTREAMS)
 
     try:
@@ -5120,12 +5122,13 @@ def api_set_config():
         # 整个「读当前配置 → 合并字段 → 校验写盘 → 同步内存」必须在 cfg_lock 临界区内原子完成！
         # 避免并发请求各自拿到旧快照后互相覆盖（实测两个并发 POST 各改一字段会丢掉一个更新）。
         with cfg_lock:
+            allow_shrink = bool(incoming.pop("_allow_shrink", False) or incoming.pop("allow_shrink", False))
             merged = _load_config_locked()
             if isinstance(merged, dict):
                 for k, v in incoming.items():
                     merged[k] = v
                 incoming = merged
-            cfg = save_config(incoming, warnings)
+            cfg = save_config(incoming, warnings, allow_shrink=allow_shrink)
             # 接管预检放在 save 之后、且用**规整后的** cfg：那时 target 已补过 scheme、
             # takeover 已是真 bool、capture_mode 是合并后的最终值——判据才对得上引擎
             # 真正会读到的东西（用 incoming 判会把「没提交的字段」当成默认值）。
@@ -5275,13 +5278,21 @@ def _apply_config_patch(cfg, key, op, path, value, match=None):
             raise ValueError("match 必须是字符串")
         val_name = value.get("name")
         target_name = match if match is not None else val_name
-        if not isinstance(target_name, str) or not target_name:
-            raise ValueError("list_upsert 需要 name 或 match 指明要更新的条目")
+        if not isinstance(target_name, str) or not target_name.strip():
+            raise ValueError("list_upsert 需要非空 name 或 match 指明要更新的条目")
+        target_name = target_name.strip()
         if val_name is None:
             # 带 match 但 value 没传 name 时自动继承目标名，防止成为无名对象在 normalize 时被丢弃
             value = dict(value, name=target_name)
-        elif not isinstance(val_name, str) or not val_name:
+        elif not isinstance(val_name, str) or not val_name.strip():
             raise ValueError("list_upsert 的条目必须包含非空字符串 name")
+        else:
+            value = dict(value, name=val_name.strip())
+
+        if key == "upstreams" and not path:
+            u_name = value["name"]
+            if not re.fullmatch(r"[A-Za-z0-9_\-\u4e00-\u9fff ]{1,40}", u_name):
+                raise ValueError(f"客户端名称「{u_name[:20]}」不合法（只能中英文、数字、空格、_ 和 -，长度 1-40）")
         for i, item in enumerate(node):
             if isinstance(item, dict) and item.get("name") == target_name:
                 if (key == "upstreams" and not path and
@@ -5298,9 +5309,15 @@ def _apply_config_patch(cfg, key, op, path, value, match=None):
                 # 那会让「已经开着接管的上游」在一次无关编辑后静默退回 mitmproxy 直连。
                 if key == "upstreams" and not path and "takeover" not in value and "takeover" in item:
                     value = dict(value, takeover=item["takeover"])
+                if key == "upstreams" and not path:
+                    if not str(value.get("target") or "").strip():
+                        raise ValueError("客户端真实上游地址（target）不能为空")
                 node[i] = value
                 break
         else:
+            if key == "upstreams" and not path:
+                if not str(value.get("target") or "").strip():
+                    raise ValueError("客户端真实上游地址（target）不能为空")
             node.append(value)
     else:  # list_del
         if not isinstance(node, list) or not isinstance(value, str) or not value:
