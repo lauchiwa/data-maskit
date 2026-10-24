@@ -4,6 +4,16 @@
 
 每个版本章节的**开头**必须有 `### 更新摘要 / Summary`（中英各一至三条）—— 它会被原样用作用户能看到的「版本介绍」（GitHub Release 首屏与更新弹窗），所以只写用户能感知到的变化，不写实现细节。技术条目写在摘要下面的分节里。
 
+## [Unreleased]
+
+### 更新摘要 / Summary
+- 「关于」页给出的容器更新命令改为拉取本分支镜像，不会再被换成上游版本。
+- The container update command on the About page now pulls this fork's image instead of the upstream one.
+
+### 修复 / Bug Fixes
+- 「关于」页 Docker 更新命令与 `docker-compose.yml` 镜像改指本分支，此前会拉回上游构建并丢失本分支改动；桌面端发布日志请求的访问白名单同步改为本分支仓库。
+  *The About page's Docker update command and the `docker-compose.yml` image now point to this fork instead of pulling upstream builds that drop fork changes; the desktop HTTP allowlist for release notes now targets this fork too.*
+
 ## [0.106.0] - 2026-10-24
 
 基于上游 v0.11.4（`xiaYuTian11/maskit`）。

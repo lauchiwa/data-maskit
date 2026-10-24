@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.io/xiayutian11/maskit:latest
+    image: ghcr.io/lauchiwa/data-maskit:latest
     container_name: maskit
     restart: unless-stopped
     ports:

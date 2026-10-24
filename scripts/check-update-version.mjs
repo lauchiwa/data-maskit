@@ -84,9 +84,9 @@ t('模板 `v{v}` + 三条来源，都必须渲染成 v0.11.0（不得出现 vv�
 
 t('Release 链接需要 tag 形态：显式拼 v 后为 /tag/v0.11.0', () => {
   const url = (v) =>
-    `https://github.com/xiaYuTian11/maskit/releases/tag/v${normalizeVersion(v) ?? ''}`
-  assert.equal(url('v0.11.0'), 'https://github.com/xiaYuTian11/maskit/releases/tag/v0.11.0')
-  assert.equal(url('0.11.0'), 'https://github.com/xiaYuTian11/maskit/releases/tag/v0.11.0')
+    `https://github.com/lauchiwa/data-maskit/releases/tag/v${normalizeVersion(v) ?? ''}`
+  assert.equal(url('v0.11.0'), 'https://github.com/lauchiwa/data-maskit/releases/tag/v0.11.0')
+  assert.equal(url('0.11.0'), 'https://github.com/lauchiwa/data-maskit/releases/tag/v0.11.0')
 })
 
 let failed = 0

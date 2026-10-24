@@ -35,6 +35,22 @@ class ForkContractTests(unittest.TestCase):
         self.assertIn("https://github.com/lauchiwa/data-maskit/releases/tag/", text)
         self.assertNotIn("xiaYuTian11/maskit/releases/tag/", text)
 
+    def test_docker_update_path_uses_fork_image(self):
+        # 照上游镜像拉 = 静默换成上游构建，丢掉本分支改动
+        image = "ghcr.io/lauchiwa/data-maskit:latest"
+        for name in ("frontend/src/components/settings/AboutUpdateCard.tsx", "docker-compose.yml"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            self.assertIn(image, text, name)
+            self.assertNotIn("ghcr.io/xiayutian11/maskit", text, name)
+
+    def test_desktop_http_scope_allows_fork_release_api(self):
+        # 关于页桌面端经 plugin-http 拉本分支 Release；scope 指向上游则每次被拒后才回退服务端
+        caps = json.loads((ROOT / "src-tauri/capabilities/default.json").read_text(encoding="utf-8"))
+        urls = [a["url"] for p in caps["permissions"] if isinstance(p, dict)
+                and p.get("identifier") == "http:allow-fetch" for a in p["allow"]]
+        self.assertIn("https://api.github.com/repos/lauchiwa/data-maskit/**", urls)
+        self.assertNotIn("https://api.github.com/repos/xiaYuTian11/maskit/**", urls)
+
     def test_update_public_key_keeps_fork_identity(self):
         config = json.loads((ROOT / "src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
         pubkey = config["plugins"]["updater"]["pubkey"]

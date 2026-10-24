@@ -202,7 +202,7 @@ export function AboutUpdateCard({ version, upstreamBase, dataRoot, running, auto
                   <div className="text-[10px] text-muted-foreground"># Docker Compose:</div>
                   <div>docker compose pull && docker compose up -d</div>
                   <div className="mt-1.5 text-[10px] text-muted-foreground"># Docker CLI:</div>
-                  <div>docker pull ghcr.io/xiayutian11/maskit:latest</div>
+                  <div>docker pull ghcr.io/lauchiwa/data-maskit:latest</div>
                 </div>
                 <div className="flex items-start gap-1.5 rounded-md border border-amber-500/20 bg-amber-500/10 p-2 text-[11px] text-amber-600 dark:text-amber-400">
                   <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
