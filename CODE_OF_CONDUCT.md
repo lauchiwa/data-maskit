@@ -10,8 +10,8 @@
 
 ## 执行
 
-违反准则的行为可向维护者 [@xiaYuTian11](https://github.com/xiaYuTian11) 私下报告。维护者会审查并采取其认为适当的措施，包括警告、临时或永久禁止参与。
+违反准则的行为可向本分支维护者 [@lauchiwa](https://github.com/lauchiwa) 私下报告。维护者会审查并采取其认为适当的措施，包括警告、临时或永久禁止参与。
 
 ---
 
-This project follows the [Contributor Covenant 2.1](https://www.contributor-covenant.org/version/2/1/code_of_conduct/). Report unacceptable behavior privately to the maintainer [@xiaYuTian11](https://github.com/xiaYuTian11).
+This project follows the [Contributor Covenant 2.1](https://www.contributor-covenant.org/version/2/1/code_of_conduct/). Report unacceptable behavior privately to this fork's maintainer [@lauchiwa](https://github.com/lauchiwa).

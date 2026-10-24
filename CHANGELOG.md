@@ -4,15 +4,26 @@
 
 每个版本章节的**开头**必须有 `### 更新摘要 / Summary`（中英各一至三条）—— 它会被原样用作用户能看到的「版本介绍」（GitHub Release 首屏与更新弹窗），所以只写用户能感知到的变化，不写实现细节。技术条目写在摘要下面的分节里。
 
-## [Unreleased]
+## [0.106.1] - 2026-10-24
+
+基于上游 v0.11.4（`xiaYuTian11/maskit`）。
+*Based on upstream v0.11.4 (`xiaYuTian11/maskit`).*
 
 ### 更新摘要 / Summary
 - 「关于」页给出的容器更新命令改为拉取本分支镜像，不会再被换成上游版本。
+- 帮助中心与顶栏的项目链接改为打开本分支仓库与文档。
 - The container update command on the About page now pulls this fork's image instead of the upstream one.
+- Help center and top-bar project links now open this fork's repository and docs.
 
 ### 修复 / Bug Fixes
 - 「关于」页 Docker 更新命令与 `docker-compose.yml` 镜像改指本分支，此前会拉回上游构建并丢失本分支改动；桌面端发布日志请求的访问白名单同步改为本分支仓库。
   *The About page's Docker update command and the `docker-compose.yml` image now point to this fork instead of pulling upstream builds that drop fork changes; the desktop HTTP allowlist for release notes now targets this fork too.*
+- 帮助中心教程/设置文档链接、顶栏 GitHub 入口改指本分支仓库。
+  *Help-center tutorial and settings links and the top-bar GitHub entry now point to this fork.*
+
+### 文档 / Docs
+- README、教程与推广文案明确声明本仓库 fork 自 `xiaYuTian11/maskit`（同一 AGPL-3.0、归功上游），下载、镜像与问题反馈改指本仓库，上游社群标注为上游；安全、行为准则与 issue 模板的维护者改为本分支，并开启私密漏洞报告。
+  *README, tutorial and promo copy now state this repository is a fork of `xiaYuTian11/maskit` (same AGPL-3.0, credit to upstream); downloads, images and issue reporting point here, upstream community channels are labelled as upstream; security, conduct and issue templates name this fork's maintainer, with private vulnerability reporting enabled.*
 
 ## [0.106.0] - 2026-10-24
 

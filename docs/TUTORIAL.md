@@ -2,6 +2,8 @@
 
 > 本教程带你 3 分钟搞定 Data Maskit 的安装、配置与主流 AI 工具（Cursor、Claude Code、Codex、Pi 等）接入，实现代码与提示词中的敏感数据**出网自动打码、回答毫秒级无感流式还原**。
 
+> 本教程以本分支（[lauchiwa/data-maskit](https://github.com/lauchiwa/data-maskit)，fork 自 [xiaYuTian11/maskit](https://github.com/xiaYuTian11/maskit)）为准，下载链接与镜像均指向本仓库。
+
 ---
 
 ## 目录
@@ -55,7 +57,7 @@
 
 ### 形态 A：Windows 桌面客户端（最推荐）
 
-1. 打开 GitHub Releases 下载页：[https://github.com/xiaYuTian11/maskit/releases](https://github.com/xiaYuTian11/maskit/releases)；
+1. 打开 GitHub Releases 下载页：[https://github.com/lauchiwa/data-maskit/releases](https://github.com/lauchiwa/data-maskit/releases)；
 2. 下载最新的 `Maskit_x.x.x_x64-setup.exe` 安装包；
 3. 双击直接安装运行。启动后它会常驻系统托盘，并弹出管理主控制台：
 
@@ -81,7 +83,7 @@ docker run -d \
   -p 18701:18701 \
   -v maskit_data:/data \
   -e MASKIT_PANEL_TOKEN="YourSecretToken123456" \
-  ghcr.io/xiayutian11/maskit:latest
+  ghcr.io/lauchiwa/data-maskit:latest
 ```
 
 > 💡 **提示**：若前置配合 Nginx 反代或仅供本机使用，建议加上 `127.0.0.1:` 保护端口（`-p 127.0.0.1:5801:5801`）；大模型端口（如 `18701`）按需映射即可，用几个大模型就映射几个端口。
@@ -232,7 +234,7 @@ print(response.choices[0].message.content)
 网页版 AI 无法修改 API Base URL，使用 Maskit 专属浏览器扩展即可实现网页原生流式打码与还原：
 
 1. **安装扩展**：
-   - 从 [GitHub Releases](https://github.com/xiaYuTian11/maskit/releases/latest) 下载 `Maskit_<版本>_extension.zip` 并解压；
+   - 从 [GitHub Releases](https://github.com/lauchiwa/data-maskit/releases/latest) 下载 `Maskit_<版本>_extension.zip` 并解压；
    - 打开 Chrome 或 Edge，访问 `chrome://extensions`，右上角开启**「开发者模式」**；
    - 点击**「加载已解压的扩展程序」**，选择刚刚解压出的扩展目录。
 2. **授权配对**：
@@ -307,4 +309,4 @@ print(response.choices[0].message.content)
 
 ---
 
-> 💬 如有更多配置疑问，欢迎加入官方交流 QQ 群：**`489926214`**，或前往 [GitHub Discussions](https://github.com/xiaYuTian11/maskit/discussions) 交流反馈！
+> 💬 本分支的问题请提交到[本仓库 Issues](https://github.com/lauchiwa/data-maskit/issues)；关于原项目的交流可加入上游 QQ 群 **`489926214`**。

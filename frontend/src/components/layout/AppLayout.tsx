@@ -507,7 +507,7 @@ export function AppLayout({ children }: { children: ReactNode }) {
               size="sm"
               variant="ghost"
               onClick={async () => {
-                const url = 'https://github.com/xiaYuTian11/maskit'
+                const url = 'https://github.com/lauchiwa/data-maskit'
                 try {
                   const r = await shieldFetch('/api/open-url', {
                     method: 'POST',

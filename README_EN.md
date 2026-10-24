@@ -10,16 +10,20 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" alt="License: AGPL-3.0"></a>
-  <a href="https://github.com/xiaYuTian11/maskit/releases"><img src="https://img.shields.io/github/v/release/xiaYuTian11/maskit?display_name=tag&color=emerald" alt="Release"></a>
-  <a href="https://github.com/xiaYuTian11/maskit/actions/workflows/ci.yml"><img src="https://github.com/xiaYuTian11/maskit/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/lauchiwa/data-maskit/releases"><img src="https://img.shields.io/github/v/release/lauchiwa/data-maskit?display_name=tag&color=emerald" alt="Release"></a>
+  <a href="https://github.com/lauchiwa/data-maskit/actions/workflows/ci.yml"><img src="https://github.com/lauchiwa/data-maskit/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://linux.do/"><img src="https://img.shields.io/badge/Community-LINUX%20DO-2563eb?logo=linux&logoColor=white" alt="LINUX DO"></a>
-  <a href="https://github.com/xiaYuTian11/maskit"><img src="https://img.shields.io/badge/QQ%20Group-489926214-12B7F5.svg" alt="QQ Group"></a>
+  <a href="https://github.com/xiaYuTian11/maskit"><img src="https://img.shields.io/badge/Upstream%20QQ%20Group-489926214-12B7F5.svg" alt="Upstream QQ Group"></a>
   <img src="https://img.shields.io/badge/Desktop-Windows%20%7C%20macOS-blueviolet.svg" alt="Desktop: Windows | macOS">
   <img src="https://img.shields.io/badge/Docker-amd64%20%7C%20arm64-2496ED.svg?logo=docker&logoColor=white" alt="Docker">
   <a href="README.md"><img src="https://img.shields.io/badge/Language-%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-lightgrey.svg" alt="Chinese README"></a>
 </p>
 
 <p align="center"><a href="README.md">简体中文</a> | English</p>
+
+> **About this repository**: `lauchiwa/data-maskit` is a **fork** of [xiaYuTian11/maskit](https://github.com/xiaYuTian11/maskit) (the original Data Maskit project by TMW & Contributors), maintained by [@lauchiwa](https://github.com/lauchiwa) and distributed under the same AGPL-3.0 license.
+> It regularly merges upstream releases and adds its own changes, such as per-model request header/body rewriting (`model_rules`) and a configurable semantic-recognition thread count. It uses its own version range (`0.1xx.x`) and update-signing key; installers, Docker images and updates all come from this repository. The upstream version it is based on is shown under Settings → About and in the [CHANGELOG](CHANGELOG.md).
+> Please report issues with this fork to [this repository's Issues](https://github.com/lauchiwa/data-maskit/issues); credit for the design and core implementation belongs to the upstream project.
 
 ---
 
@@ -170,7 +174,7 @@ print(response.choices[0].message.content)
 
 Web-based AI platforms cannot configure an API Base URL. Use Maskit's browser extension for fully automated masking and stream unmasking:
 
-1. **Install Extension**: Download `Maskit_<version>_extension.zip` from [Releases](https://github.com/xiaYuTian11/maskit/releases/latest) and extract it. In Chrome/Edge, open `chrome://extensions` → toggle **Developer mode** → click **Load unpacked** and select the extracted folder (source users can directly load the `extension/` directory);
+1. **Install Extension**: Download `Maskit_<version>_extension.zip` from [Releases](https://github.com/lauchiwa/data-maskit/releases/latest) and extract it. In Chrome/Edge, open `chrome://extensions` → toggle **Developer mode** → click **Load unpacked** and select the extracted folder (source users can directly load the `extension/` directory);
 2. **Connect to Engine**: In Maskit desktop dashboard `Settings → Browser Extension`, enable the extension bridge and copy your **Access Token** into the extension's settings popup;
 3. **Enable Sites**: `chatgpt.com`, `claude.ai`, and `deepseek.com` are pre-authorized out of the box; the other 14 preset sites can be granted with one click in the extension settings (unverified ones are labeled), and custom sites are supported.
 
@@ -186,7 +190,7 @@ Web-based AI platforms cannot configure an API Base URL. Use Maskit's browser ex
 
 ### Option A: Desktop Client (Windows / macOS, Recommended for Personal Use)
 
-Download the latest release package for your operating system from **[GitHub Releases](https://github.com/xiaYuTian11/maskit/releases)**:
+Download the latest release package for your operating system from **[GitHub Releases](https://github.com/lauchiwa/data-maskit/releases)**:
 
 - **Windows Users**: Download `Maskit_<version>_x64-setup.exe` installer. Control from system tray with automated Minisign-verified updates;
 - **macOS Users (Apple Silicon M-Series)**: Download `Maskit_<version>_aarch64.dmg`, open it, and drag `Maskit.app` into your `Applications` folder.
@@ -208,7 +212,7 @@ docker run -d \
   -p 127.0.0.1:18701:18701 \
   -v maskit_data:/data \
   -e MASKIT_PANEL_TOKEN="change-me-to-a-strong-token" \
-  ghcr.io/xiayutian11/maskit:latest
+  ghcr.io/lauchiwa/data-maskit:latest
 ```
 
 > 💡 **Port Mapping & Network Guide**:
@@ -259,7 +263,7 @@ docker run -d \
   -p 127.0.0.1:5802:5802 \
   -v maskit_data:/data \
   -e MASKIT_PANEL_TOKEN="YourSecretToken123456" \
-  ghcr.io/xiayutian11/maskit:latest
+  ghcr.io/lauchiwa/data-maskit:latest
 ```
 
 Given two clients (path prefixes `/openai` and `/anthropic`), point external tools at:
@@ -330,8 +334,8 @@ Since 0.6.0 every 503 is attributed. Open the event detail, or run **Settings �
 ### Option C: Run from Source
 
 ```bash
-git clone https://github.com/xiaYuTian11/maskit.git
-cd maskit
+git clone https://github.com/lauchiwa/data-maskit.git
+cd data-maskit
 
 # 1. Install dependencies
 pip install -r requirements.txt
@@ -350,10 +354,9 @@ cd frontend && npm run dev
 
 ## 💬 Community & Support
 
-- **Official QQ Group**: **`489926214`** (Discussion, rule feedback & release updates);
-- Forum: **[LINUX DO Community](https://linux.do/t/topic/2884715)**;
-- Feedback: [GitHub Issues](https://github.com/xiaYuTian11/maskit/issues) & [GitHub Discussions](https://github.com/xiaYuTian11/maskit/discussions);
-- Security Vulnerabilities: see [SECURITY.md](SECURITY.md).
+- **Issues with this fork**: [this repository's Issues](https://github.com/lauchiwa/data-maskit/issues);
+- Security vulnerabilities: see [SECURITY.md](SECURITY.md) for the private reporting channel;
+- **Upstream community** (run by the upstream maintainers, about the original project): QQ group **`489926214`**, [LINUX DO Community](https://linux.do/t/topic/2884715), [upstream repository](https://github.com/xiaYuTian11/maskit). Please do not report fork-only changes there.
 
 ---
 
@@ -361,6 +364,8 @@ cd frontend && npm run dev
 
 Data Maskit is released under the **[GNU AGPL-3.0](LICENSE)**. Free for personal developers, researchers, and open-source projects. For commercial redistribution or embedding into closed-source products, please comply with AGPL-3.0 terms.
 
+This fork is a modified version of the original project, also released under AGPL-3.0; copyright in the original project remains with its authors. Changes made in this fork are recorded in the [CHANGELOG](CHANGELOG.md) and the commit history.
+
 <p align="center">
-  Made with ❤️ by TMW & Contributors.
+  Made with ❤️ by TMW & Contributors · fork maintained by <a href="https://github.com/lauchiwa">@lauchiwa</a>.
 </p>

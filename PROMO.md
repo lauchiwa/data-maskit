@@ -1,6 +1,8 @@
-# 【开源首发】Data Maskit：专为大模型打造的本地隐私脱敏与还原网关（Cursor / Claude Code / Codex / Pi 即插即用）
+# Data Maskit（lauchiwa/data-maskit 分支）：专为大模型打造的本地隐私脱敏与还原网关（Cursor / Claude Code / Codex / Pi 即插即用）
 
 各位开发者们好！
+
+> 本文介绍的是 [lauchiwa/data-maskit](https://github.com/lauchiwa/data-maskit)，它是 [xiaYuTian11/maskit](https://github.com/xiaYuTian11/maskit)（Data Maskit 原项目）的二次开发分支；核心设计与实现归功于原项目作者。
 
 在日常开发中使用 **Cursor、Claude Code（配合 cc-switch）、Codex、Pi、OpenCode、ChatGPT 或各类 AI 编码助手** 时，大家经常需要将大段代码、报错日志和配置文件发给外部大模型分析。在这个过程中，你可能在不知不觉中将以下敏感信息发送给了外部大模型或中转服务商：
 
@@ -36,7 +38,7 @@
 ### 🚀 快速上手
 
 #### 方式 A：Windows 桌面客户端（推荐个人日常使用）
-1. 前往 **[GitHub Releases 下载页面](https://github.com/xiaYuTian11/maskit/releases)**；
+1. 前往 **[GitHub Releases 下载页面](https://github.com/lauchiwa/data-maskit/releases)**；
 2. 下载最新的 `Maskit_<版本>_x64-setup.exe` 安装包；
 3. 双击安装运行，系统托盘常驻，支持全自动数字签名（Minisign）无缝在线更新。
 
@@ -50,7 +52,7 @@ docker run -d \
   -p 127.0.0.1:18701-18710:18701-18710 \
   -v maskit_data:/data \
   -e MASKIT_PANEL_TOKEN="请设置你的随机控制台访问密码" \
-  ghcr.io/xiayutian11/maskit:latest
+  ghcr.io/lauchiwa/data-maskit:latest
 ```
 浏览器打开 `http://<服务器IP>:5801/?token=<你的密码>` 即可直接管理！
 
@@ -70,8 +72,9 @@ docker run -d \
 
 ### 💬 开源地址与交流反馈
 
-* 🔗 **GitHub 开源地址**：[https://github.com/xiaYuTian11/maskit](https://github.com/xiaYuTian11/maskit)
-* 🐧 **官方交流 QQ 群**：**`489926214`**（欢迎进群交流规则建议、Bug 反馈与最新进展）
+* 🔗 **本分支地址**：[https://github.com/lauchiwa/data-maskit](https://github.com/lauchiwa/data-maskit)（问题反馈请提 Issues）
+* 🧬 **上游原项目**：[https://github.com/xiaYuTian11/maskit](https://github.com/xiaYuTian11/maskit)
+* 🐧 **上游交流 QQ 群**：**`489926214`**（由上游维护者运营）
 * 🌐 **论坛讨论**：**[LINUX DO 社区讨论专区](https://linux.do/)**
 
 如果 Data Maskit 对你的日常开发隐私保护有帮助，欢迎来 GitHub 点个 **Star 🌟** 支持一下！感谢大家！

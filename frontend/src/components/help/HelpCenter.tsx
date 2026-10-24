@@ -11,8 +11,8 @@ import {
 import { useI18n } from '@/lib/i18n'
 import { shieldFetch } from '@/lib/shield-fetch'
 
-const TUTORIAL_URL = 'https://github.com/xiaYuTian11/maskit/blob/master/docs/TUTORIAL.md'
-const SETTINGS_DOC_URL = 'https://github.com/xiaYuTian11/maskit/blob/master/docs/SETTINGS.md'
+const TUTORIAL_URL = 'https://github.com/lauchiwa/data-maskit/blob/master/docs/TUTORIAL.md'
+const SETTINGS_DOC_URL = 'https://github.com/lauchiwa/data-maskit/blob/master/docs/SETTINGS.md'
 
 /** i18n key 必须写成字面量：`t(`help.page.${x}.title`)` 这种拼接形态
  *  `scripts/check-i18n.mjs` 扫不到，key 漏了或拼错只会静默显示裸 key。 */

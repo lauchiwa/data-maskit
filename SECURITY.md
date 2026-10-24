@@ -11,8 +11,10 @@
 
 请**不要**在 GitHub Issues 公开披露漏洞细节。通过以下方式私密报告：
 
-1. GitHub Security Advisories（推荐）：仓库 → Security → Report a vulnerability
-2. 或在 GitHub 上私信维护者 [@xiaYuTian11](https://github.com/xiaYuTian11)
+1. GitHub Security Advisories（推荐）：[本仓库 → Security → Report a vulnerability](https://github.com/lauchiwa/data-maskit/security/advisories/new)
+2. 或在 GitHub 上联系本分支维护者 [@lauchiwa](https://github.com/lauchiwa)
+
+本仓库是 [xiaYuTian11/maskit](https://github.com/xiaYuTian11/maskit) 的 fork。若漏洞同样存在于上游代码，我们会在修复后与上游维护者协调披露；你也可以直接按上游仓库的安全政策向其报告。
 
 请在报告中包含：
 

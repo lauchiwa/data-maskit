@@ -43,6 +43,16 @@ class ForkContractTests(unittest.TestCase):
             self.assertIn(image, text, name)
             self.assertNotIn("ghcr.io/xiayutian11/maskit", text, name)
 
+    def test_public_docs_disclose_fork_and_point_downloads_here(self):
+        # 开源 fork 必须公开声明来源；合并上游 README 时最容易被整段覆盖回去
+        upstream = "https://github.com/xiaYuTian11/maskit"
+        for name in ("README.md", "README_EN.md", "docs/TUTORIAL.md"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            self.assertIn(f"[xiaYuTian11/maskit]({upstream})", text, name)
+            self.assertIn("ghcr.io/lauchiwa/data-maskit:latest", text, name)
+            for stale in (f"{upstream}/releases", "ghcr.io/xiayutian11/maskit", f"{upstream}/discussions"):
+                self.assertNotIn(stale, text, f"{name}: {stale}")
+
     def test_desktop_http_scope_allows_fork_release_api(self):
         # 关于页桌面端经 plugin-http 拉本分支 Release；scope 指向上游则每次被拒后才回退服务端
         caps = json.loads((ROOT / "src-tauri/capabilities/default.json").read_text(encoding="utf-8"))

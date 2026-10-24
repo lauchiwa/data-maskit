@@ -1,10 +1,10 @@
 [package]
 name = "maskit"
-version = "0.106.0"
+version = "0.106.1"
 description = "数据面具 Maskit — 本地 LLM 敏感信息脱敏代理（Tauri 壳 + Python 引擎 sidecar）"
 authors = ["TMW"]
 license = "AGPL-3.0-only"
-repository = "https://github.com/xiaYuTian11/maskit"
+repository = "https://github.com/lauchiwa/data-maskit"
 edition = "2021"
 rust-version = "1.77.2"
 

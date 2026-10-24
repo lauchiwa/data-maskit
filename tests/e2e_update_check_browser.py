@@ -38,7 +38,7 @@ BROWSER_FIRST_JS = """
 async () => {
   const out = {};
   try {
-    const r = await fetch('https://api.github.com/repos/xiaYuTian11/maskit/releases/latest',
+    const r = await fetch('https://api.github.com/repos/lauchiwa/data-maskit/releases/latest',
                           { headers: { Accept: 'application/vnd.github.v3+json' } });
     out.browser = { ok: r.ok, status: r.status };
     if (r.ok) { const d = await r.json(); out.version = d.tag_name; }

@@ -10,16 +10,20 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" alt="License: AGPL-3.0"></a>
-  <a href="https://github.com/xiaYuTian11/maskit/releases"><img src="https://img.shields.io/github/v/release/xiaYuTian11/maskit?display_name=tag&color=emerald" alt="Release"></a>
-  <a href="https://github.com/xiaYuTian11/maskit/actions/workflows/ci.yml"><img src="https://github.com/xiaYuTian11/maskit/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/lauchiwa/data-maskit/releases"><img src="https://img.shields.io/github/v/release/lauchiwa/data-maskit?display_name=tag&color=emerald" alt="Release"></a>
+  <a href="https://github.com/lauchiwa/data-maskit/actions/workflows/ci.yml"><img src="https://github.com/lauchiwa/data-maskit/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://linux.do/"><img src="https://img.shields.io/badge/Community-LINUX%20DO-2563eb?logo=linux&logoColor=white" alt="LINUX DO"></a>
-  <a href="https://github.com/xiaYuTian11/maskit"><img src="https://img.shields.io/badge/QQ%E7%BE%A4-489926214-12B7F5.svg" alt="QQ Group"></a>
+  <a href="https://github.com/xiaYuTian11/maskit"><img src="https://img.shields.io/badge/%E4%B8%8A%E6%B8%B8QQ%E7%BE%A4-489926214-12B7F5.svg" alt="Upstream QQ Group"></a>
   <img src="https://img.shields.io/badge/Desktop-Windows%20%7C%20macOS-blueviolet.svg" alt="Desktop: Windows | macOS">
   <img src="https://img.shields.io/badge/Docker-amd64%20%7C%20arm64-2496ED.svg?logo=docker&logoColor=white" alt="Docker">
   <a href="README_EN.md"><img src="https://img.shields.io/badge/Language-English-lightgrey.svg" alt="English README"></a>
 </p>
 
 <p align="center">简体中文 | <a href="README_EN.md">English</a></p>
+
+> **关于本仓库**：`lauchiwa/data-maskit` 是 [xiaYuTian11/maskit](https://github.com/xiaYuTian11/maskit)（Data Maskit 原项目，作者 TMW & Contributors）的**二次开发分支（fork）**，由 [@lauchiwa](https://github.com/lauchiwa) 维护，与原项目继续采用同一 AGPL-3.0 许可证。
+> 本分支定期合并上游发布版，在此基础上增加按模型改写请求头/请求体（`model_rules`）、语义识别线程数控制等改动，使用独立版本号（`0.1xx.x`）与独立的自动更新签名，安装包、Docker 镜像与更新都来自本仓库。当前所基于的上游版本见「设置 → 关于」或 [CHANGELOG](CHANGELOG.md)。
+> 本分支的问题请提交到[本仓库 Issues](https://github.com/lauchiwa/data-maskit/issues)；功能设计与核心实现归功于上游项目。
 
 ---
 
@@ -171,7 +175,7 @@ print(response.choices[0].message.content)
 
 网页版 AI 无法配置 API Base URL，可通过 Maskit 专属浏览器扩展实现全自动打码与还原：
 
-1. **安装扩展**：从 [Releases](https://github.com/xiaYuTian11/maskit/releases/latest) 下载 `Maskit_<版本>_extension.zip` 并解压，在 Chrome/Edge 打开 `chrome://extensions` → 开启「开发者模式」→ 点击「加载已解压的扩展程序」选择解压目录（源码用户可直接加载 `extension/` 目录）；
+1. **安装扩展**：从 [Releases](https://github.com/lauchiwa/data-maskit/releases/latest) 下载 `Maskit_<版本>_extension.zip` 并解压，在 Chrome/Edge 打开 `chrome://extensions` → 开启「开发者模式」→ 点击「加载已解压的扩展程序」选择解压目录（源码用户可直接加载 `extension/` 目录）；
 2. **连接面板**：在 Maskit 桌面面板「设置 → 浏览器扩展」开启扩展链路并复制**访问令牌**，填入扩展的设置弹窗中；
 3. **启用站点**：`chatgpt.com`、`claude.ai`、`deepseek.com` 三站已内置授权、无需手动添加；其余 14 个预设站点在扩展设置中一键授权添加（未实测的会标注），也支持自定义站点。
 
@@ -187,7 +191,7 @@ print(response.choices[0].message.content)
 
 ### 方式 A：桌面客户端（Windows / macOS，推荐个人日常使用）
 
-前往 **[GitHub Releases 发布页面](https://github.com/xiaYuTian11/maskit/releases)** 下载对应平台的最新安装包：
+前往 **[GitHub Releases 发布页面](https://github.com/lauchiwa/data-maskit/releases)** 下载对应平台的最新安装包：
 
 - **Windows 用户**：下载 `Maskit_<版本>_x64-setup.exe`，双击安装运行，系统托盘右键即可启停，支持全自动数字签名（Minisign）无缝在线更新；
 - **macOS 用户（Apple Silicon M系列）**：下载 `Maskit_<版本>_aarch64.dmg`，双击打开后将 `Maskit.app` 拖入“应用程序（Applications）”文件夹。
@@ -210,7 +214,7 @@ docker run -d \
   -p 127.0.0.1:18701:18701 \
   -v maskit_data:/data \
   -e MASKIT_PANEL_TOKEN="YourSecretToken123456" \
-  ghcr.io/xiayutian11/maskit:latest
+  ghcr.io/lauchiwa/data-maskit:latest
 ```
 
 > 💡 **端口映射与网络访问说明**：
@@ -261,7 +265,7 @@ docker run -d \
   -p 127.0.0.1:5802:5802 \
   -v maskit_data:/data \
   -e MASKIT_PANEL_TOKEN="YourSecretToken123456" \
-  ghcr.io/xiayutian11/maskit:latest
+  ghcr.io/lauchiwa/data-maskit:latest
 ```
 
 假设你配置了两个客户端（路径前缀分别为 `/openai` 与 `/anthropic`），外部工具的 Base URL 填：
@@ -328,8 +332,8 @@ Maskit 的脱敏**只在你本机算**——每个请求都要花本地 CPU。�
 ### 方式 C：从源码运行与开发
 
 ```bash
-git clone https://github.com/xiaYuTian11/maskit.git
-cd maskit
+git clone https://github.com/lauchiwa/data-maskit.git
+cd data-maskit
 
 # 1. 安装核心依赖
 pip install -r requirements.txt
@@ -348,10 +352,9 @@ cd frontend && npm run dev
 
 ## 💬 社区与交流
 
-- **官方 QQ 交流群**：**`489926214`**（欢迎加入交流讨论，获取最新规则与版本动态）；
-- 论坛交流：**[LINUX DO 社区讨论专区](https://linux.do/t/topic/2884715)**；
-- 建议反馈：[GitHub Issues](https://github.com/xiaYuTian11/maskit/issues) 与 [GitHub Discussions](https://github.com/xiaYuTian11/maskit/discussions)；
-- 安全漏洞：私密反馈渠道见 [SECURITY.md](SECURITY.md)。
+- **本分支问题反馈**：[本仓库 Issues](https://github.com/lauchiwa/data-maskit/issues)；
+- 安全漏洞：私密反馈渠道见 [SECURITY.md](SECURITY.md)；
+- **上游项目社区**（由上游维护者运营，讨论的是原项目）：QQ 交流群 **`489926214`**、[LINUX DO 社区讨论专区](https://linux.do/t/topic/2884715)、[上游仓库](https://github.com/xiaYuTian11/maskit)。本分支独有的改动请不要到上游社区反馈。
 
 ---
 
@@ -359,6 +362,8 @@ cd frontend && npm run dev
 
 Data Maskit 基于 **[GNU AGPL-3.0](LICENSE)** 许可证发布。个人开发者、研究人员及开源项目均可完全免费使用。如需在闭源商业产品中分发或集成，请遵循 AGPL-3.0 相关条款。
 
+本分支是对原项目的修改版本，同样以 AGPL-3.0 发布，原项目版权归其作者所有；本分支的改动记录见 [CHANGELOG](CHANGELOG.md) 与提交历史。
+
 <p align="center">
-  Made with ❤️ by TMW & Contributors.
+  Made with ❤️ by TMW & Contributors · fork maintained by <a href="https://github.com/lauchiwa">@lauchiwa</a>.
 </p>

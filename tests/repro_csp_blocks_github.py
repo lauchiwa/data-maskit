@@ -44,7 +44,7 @@ NEW_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inli
 PROBE_JS = """
 async () => {
   try {
-    const r = await fetch('https://api.github.com/repos/xiaYuTian11/maskit/releases/latest',
+    const r = await fetch('https://api.github.com/repos/lauchiwa/data-maskit/releases/latest',
                           { headers: { Accept: 'application/vnd.github.v3+json' } });
     return { ok: true, status: r.status };
   } catch (e) {

@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: 安全漏洞 / Security vulnerability
-    url: https://github.com/xiaYuTian11/maskit/security/advisories/new
+    url: https://github.com/lauchiwa/data-maskit/security/advisories/new
     about: 请勿在公开 issue 里披露漏洞细节，走私密 advisory（见 SECURITY.md）
-  - name: 使用交流 / Discussions
-    url: https://github.com/xiaYuTian11/maskit/discussions
-    about: 使用问题、配置咨询、经验分享
+  - name: 上游原项目 / Upstream project
+    url: https://github.com/xiaYuTian11/maskit
+    about: 本仓库是 xiaYuTian11/maskit 的 fork；与本分支改动无关的原项目问题可到上游交流

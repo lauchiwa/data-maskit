@@ -224,5 +224,5 @@ Write-Host "Tag $tag 推送完成！" -ForegroundColor Green
 Write-Host "`n=================================================" -ForegroundColor Green
 Write-Host "🎉 发布完成！v$targetVer 已成功推送！" -ForegroundColor Green
 Write-Host "GitHub Release Actions 正在云端自动构建多架构 Docker 镜像与发布页面。" -ForegroundColor Green
-Write-Host "查看进度: https://github.com/xiaYuTian11/maskit/actions" -ForegroundColor Cyan
+Write-Host "查看进度: https://github.com/lauchiwa/data-maskit/actions" -ForegroundColor Cyan
 Write-Host "=================================================" -ForegroundColor Green
