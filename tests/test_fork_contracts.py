@@ -29,6 +29,12 @@ class ForkContractTests(unittest.TestCase):
             self.assertIn(api, text, name)
             self.assertNotIn("repos/xiaYuTian11/maskit/releases/latest", text, name)
 
+    def test_about_release_link_uses_fork_tags(self):
+        # 链接拼的是本分支版本号（v0.1xx.x），指向上游仓库必然 404
+        text = (ROOT / "frontend/src/components/settings/AboutUpdateCard.tsx").read_text(encoding="utf-8")
+        self.assertIn("https://github.com/lauchiwa/data-maskit/releases/tag/", text)
+        self.assertNotIn("xiaYuTian11/maskit/releases/tag/", text)
+
     def test_update_public_key_keeps_fork_identity(self):
         config = json.loads((ROOT / "src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
         pubkey = config["plugins"]["updater"]["pubkey"]

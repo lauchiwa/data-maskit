@@ -341,7 +341,7 @@ v0.6.0 后，即使 v0.102.0 存在，普通 `describe` 仍优先选更近的 v0
 - `engine/panel.py` 的 `__upstream_base__` 及其在 `/api/status`、诊断导出里的两处透出；
 - `frontend/src/components/settings/AboutUpdateCard.tsx` 的「上游基线」行与 `about.upstreamBase*` 两个 i18n key；
 - `scripts/generate-latest-json.py` 的 `--repo` 默认值（空串 → 回退环境变量 → 兜底本分支仓库）；
-- Web/服务端更新检查与关于页发布日志的默认仓库（`frontend/src/lib/tauri.ts`、`Settings.tsx`、`panel.py` 的 `DEFAULT_UPDATE_*`），都必须指向本分支；
+- Web/服务端更新检查与关于页发布日志的默认仓库（`frontend/src/lib/tauri.ts`、`Settings.tsx`、`AboutUpdateCard.tsx` 的 Docker 发版说明链接、`panel.py` 的 `DEFAULT_UPDATE_*`），都必须指向本分支；
 - `model_rules` 必须在异步脱敏 worker 内、脱敏之后注入；缓存字段按协议路径保护，NER 默认最多 2 线程且兼容 `intra_op_num_threads` 状态字段；
 - `AGENTS.md` / `CLAUDE.md` 继续跟踪，不能跟随上游删除或忽略；`tests/test_fork_contracts.py` 为分支约束提供回归保护。
 

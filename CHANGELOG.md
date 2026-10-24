@@ -14,6 +14,10 @@
 - 同步上游 v0.8.1–v0.11.4：上游连接接管池、建连预算与内部重试、日志结论列、帮助入口、词库导入导出、局域网访问开关；保留本分支模型规则与更新签名。
   *Synced upstream v0.8.1–v0.11.4: upstream connection takeover pool, connect budgets and retries, log outcome column, help center, word-list import/export, LAN access toggle; keeps this fork's model rules and update signing.*
 
+### 修复 / Bug Fixes
+- 「关于」页 Docker 更新提示的发版说明链接改指本分支仓库，此前指向上游会打不开。
+  *The release-notes link in the About page's Docker update hint now points to this fork; it used to open a missing upstream page.*
+
 ## [0.105.0] - 2026-10-07
 
 基于上游 v0.8.0（`xiaYuTian11/maskit`）。
