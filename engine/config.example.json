@@ -47,7 +47,14 @@
   },
   "secret_prefixes": [
     "sk-",
-    "ah-"
+    "ah-",
+    "ghp_",
+    "glpat-",
+    "xoxb-",
+    "xoxp-",
+    "pypi-",
+    "npm_",
+    "dify-"
   ],
   "debug": false,
   "ner_enabled": false,
@@ -68,7 +75,8 @@
         "/v1/responses"
       ],
       "use_proxy": false,
-      "extra_headers": {}
+      "extra_headers": {},
+      "takeover": false
     },
     {
       "name": "deepseek",
@@ -80,7 +88,8 @@
         "/v1/completions"
       ],
       "use_proxy": false,
-      "extra_headers": {}
+      "extra_headers": {},
+      "takeover": false
     },
     {
       "name": "anthropic",
@@ -91,13 +100,15 @@
         "/v1/messages"
       ],
       "use_proxy": false,
-      "extra_headers": {}
+      "extra_headers": {},
+      "takeover": false
     }
   ],
   "filter_enabled": true,
   "fail_closed": true,
   "response_scan": true,
   "origin_check": true,
+  "lan_access": false,
   "record_plaintext_words": true,
   "ext_bridge_enabled": false,
   "ext_token": "",

@@ -438,6 +438,8 @@ class ResponseSideSharedRuleTests(ContractTestBase):
         self.assertIn(self.token, details[1]["data"], "密文推理块不得还原")
         self.assertIn(PHONE, details[2]["summary"], "对照：无签名的摘要仍要还原")
         self.assertIn(PHONE, out["choices"][0]["message"]["content"], "对照：正文仍要还原")
+        self.assertEqual(int(tr.sessions[self.SID].get("restore_signed_skipped") or 0), 2,
+                         "reasoning.text + reasoning.encrypted 两块必须计数")
 
     def test_whole_body_restore_skips_litellm_thinking_blocks(self):
         body = {"choices": [{"message": {

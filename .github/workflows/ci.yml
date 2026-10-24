@@ -42,11 +42,12 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests
 
-      - name: Smoke tests (stream, egress & transport)
+      - name: Smoke tests (stream, egress, transport & takeover)
         run: |
           python tests/smoke_stream.py
           python tests/smoke_egress.py
           python tests/smoke_transport.py
+          python tests/smoke_takeover.py
 
   frontend:
     name: frontend
@@ -82,6 +83,27 @@ jobs:
       # 这些规则一旦被改坏（比如漏剥引号、误判凭据分类），脱敏会静默失效而不报错。
       - name: .env import parser cases
         run: node --experimental-strip-types ../scripts/check-env-import.mjs
+
+      # 复制工具的回退失败语义：execCommand 返回 false 表示复制没生效，必须抛错，
+      # 否则调用方会提示「已复制」而剪贴板里还是旧内容（issue #38）。纯函数 + DOM 桩。
+      - name: Copy helper failure contract
+        run: node --experimental-strip-types ../scripts/check-copy-text.mjs
+
+      # 日志「结论」推导 + MASK/终态折叠的用例：列表里一眼看到的是「成功还是失败」，
+      # 而它靠的是字段组合判据（terminal/http_status/unresolved/decision…）。
+      # 判据写错不会报错，只会静默地把「已取消」显示成「成功」。
+      - name: Log outcome & merge cases
+        run: node --experimental-strip-types ../scripts/check-log-outcome.mjs
+
+      # 版本号归一化：更新检查的三条来源形态不一（Tauri 的 latest.json 是纯 semver，
+      # GitHub 的 tag_name 带 v），模板统一写 `v{v}` —— 漏归一化就渲染出「vv0.11.0」。
+      - name: Version normalization cases
+        run: node --experimental-strip-types ../scripts/check-update-version.mjs
+
+      # 更新说明摘要提取：Web / Docker 端的 notes 来自 GitHub Release 的整章 body，
+      # 原样渲染会让用户在更新卡片里读到 `###` 与双语技术日志（issue #40）。
+      - name: Release notes summary cases
+        run: node --experimental-strip-types ../scripts/check-release-notes.mjs
 
       # 浏览器扩展（extension/）的静态门禁：i18n 键集一致性、shared.js 加载顺序、
       # 驼峰 runAt、静态站点清单与 manifest 对齐、安全红线扫描。
@@ -178,6 +200,12 @@ jobs:
       # CI 不 lint workflow，YAML 或 run 块写坏只在推送后（最坏是发版时）才炸
       - name: Workflow YAML and shell syntax must be valid
         run: python scripts/check-workflows.py
+
+      # 版本说明必须是人话（issue #40）。CHANGELOG 同时是 Release body 与桌面更新弹窗的
+      # 文案来源，而它原本是写给开发者的技术日志。要求每个受检版本开头有
+      # 「更新摘要 / Summary」、中英各一条、不含硬术语/反引号/源码文件名/状态码。
+      - name: CHANGELOG has a user-facing summary
+        run: python scripts/check-changelog.py
 
       # 扩展 zip 是 Release 上唯一的「网页版 AI」入口（ChatGPT / Claude 没有 Base URL 可配），
       # 打包脚本坏掉＝用户下载不到扩展。这里只验证能打出来，产物由 release.yml 上传。

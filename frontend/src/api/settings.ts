@@ -106,6 +106,8 @@ export interface StatsModel {
   cost_usd: number
   priced: boolean
   errors?: number
+  cache_read?: number
+  cache_write?: number
 }
 
 export function getStatsModels(days = 7): Promise<{ ok: boolean; days: number; models: StatsModel[] }> {

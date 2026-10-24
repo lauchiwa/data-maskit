@@ -19,16 +19,27 @@ import os
 import sys
 from pathlib import Path
 
+# 与 check-changelog.py 共用同一套「更新摘要」解析（scripts/release_notes.py）。
+# 脚本按路径运行时 sys.path[0] 就是 scripts/，但单测用 importlib 按路径加载本文件时
+# 不会 —— 显式插入，两种执行方式都成立。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import release_notes as rn  # noqa: E402
+
 
 def _release_notes(tag: str, changelog_path: Path | None = None) -> str:
     """从 CHANGELOG 的对应版本章节生成**简短**中英双语更新说明。
 
-    为什么不用整章：更新器弹窗只有几行高度，0.4.0 的章节有 2509 字节双语条目，
-    全部塞进去用户得滚半天才看完，反而没人读。所以只取「新增/修复/优化」的条数做
-    摘要，细节留给 Release 页（那里的 body 由 render-release-notes.py 切出全文）。
+    优先取 `### 更新摘要 / Summary`：那是写给用户的一两句话，直接放进更新弹窗。
+    此前这里只数条数（「修复 2 项」），用户点更新等于什么都没看到 —— issue #40
+    的原话是「版本介绍写的是人类能读的东西吗」。
 
-    找不到章节/文件时（例如刚建的仓库或手工打的 tag）回退到通用文案 ——
-    说明文案不完整可以接受，但绝不能因此让发版流程失败。
+    老版本（没写摘要）或章节缺失时回退到条数统计，最差回退到通用文案 ——
+    文案不完整可以接受，但绝不能因此让发版流程失败。
+
+    为什么不用整章：更新器弹窗只有几行高度，0.4.0 的章节有 2509 字节双语条目，
+    全部塞进去用户得滚半天才看完，反而没人读。细节留给 Release 页（那里的 body
+    由 render-release-notes.py 切出全文）。
     """
     fallback = f"Data Maskit {tag} 发布更新。"
     try:
@@ -38,15 +49,20 @@ def _release_notes(tag: str, changelog_path: Path | None = None) -> str:
     except OSError:
         return fallback
 
-    import re as _re
     ver = tag.lstrip("v")
-    sec = _re.search(
-        rf"^##\s*\[{_re.escape(ver)}\][^\n]*\n(.*?)(?=^##\s*\[|\Z)",
-        text, _re.S | _re.M,
-    )
-    if not sec:
+    sec = dict(rn.split_versions(text)).get(ver)
+    if sec is None:
         return fallback
-    body = sec.group(1)
+
+    # ① 人话摘要：最多 3 条、总长 600 字符（弹窗高度有限，见 user_notes 的 docstring）
+    human = rn.user_notes(sec, max_items=3, max_chars=600)
+    if human:
+        return f"Data Maskit {tag}\n{human}"
+
+    # ② 回退：老版本没有摘要时，保留原来的条数统计
+    body = sec
+
+    import re as _re
 
     # 分节标题要**中英都能认**：CHANGELOG 用的是「### 新增 / Added」这种双语标题，
     # 但只带英文（### Added）或只带中文的写法也可能出现，因此两者任意命中即可。

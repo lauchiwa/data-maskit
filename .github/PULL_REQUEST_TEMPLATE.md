@@ -17,4 +17,4 @@ Closes #
 - [ ] 提交信息符合 Conventional Commits（`feat:` / `fix:` / `docs:` …）
 - [ ] 我确认所提交的代码为本人原创，并遵循本项目开源协议
 
-> CI 会自动跑 Python 单测 + 冒烟、前端类型/Lint/i18n 对齐、Rust 编译与单测、版本号一致性。全绿后维护者审阅合并。
+> CI 会自动跑 Python 单测 + 冒烟、前端类型/Lint/i18n 对齐、Rust 编译与单测、版本号一致性，以及 CHANGELOG 版本说明的「人话摘要」校验。全绿后维护者审阅合并。

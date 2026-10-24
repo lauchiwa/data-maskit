@@ -199,7 +199,9 @@ class LongSegmentTests(unittest.TestCase):
             return []
 
         body = "甲" * (ner.MAX_TEXT_CHARS * 2 + 500)
-        with mock.patch.object(ner, "extract_entities", fake):
+        # mock 推理主体（`_extract_entities_raw`）：`_extract_long` 分段时调的就是它，
+        # 公共入口那层多了代码标识符过滤，在这里 mock 会被绕过去。
+        with mock.patch.object(ner, "_extract_entities_raw", fake):
             ner._extract_long(body)
         self.assertGreater(len(calls), 1)
         self.assertEqual(calls, self._segments(body), "分段结果与切点不一致")

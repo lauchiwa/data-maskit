@@ -39,12 +39,35 @@ GATES = [
     {"group": "python", "name": "Smoke tests (stream)", "cwd": ".", "argv": ["{python}", "tests/smoke_stream.py"]},
     {"group": "python", "name": "Smoke tests (egress)", "cwd": ".", "argv": ["{python}", "tests/smoke_egress.py"]},
     {"group": "python", "name": "Smoke tests (transport)", "cwd": ".", "argv": ["{python}", "tests/smoke_transport.py"]},
+    # C1 接管的端到端验证：真实 mitmdump + takeover 上游，验「接管组上游连接数
+    # 明显少于请求数」——单测证明不了这条链路（sidecar 单测用 mock 上游，路由单测
+    # 不连 mitmproxy），而它正是 C1 声称的那份收益。
+    {"group": "python", "name": "Smoke tests (takeover)", "cwd": ".", "argv": ["{python}", "tests/smoke_takeover.py"]},
     # ---- frontend（ci.yml: frontend job，工作目录 frontend/）----
     {"group": "frontend", "name": "Typecheck & build", "cwd": "frontend", "argv": ["{npm}", "run", "build"]},
     {"group": "frontend", "name": "Lint", "cwd": "frontend", "argv": ["{npm}", "run", "lint"]},
     {"group": "frontend", "name": "i18n dictionary parity", "cwd": "frontend", "argv": ["{node}", "../scripts/check-i18n.mjs"]},
     {"group": "frontend", "name": ".env import parser cases", "cwd": "frontend",
      "argv": ["{node}", "--experimental-strip-types", "../scripts/check-env-import.mjs"]},
+    # 复制工具（lib/utils.ts copyText）的回退失败语义。前端没有单测框架，用例走 Node：
+    # execCommand('copy') 返回 false 表示复制没生效，必须抛错 —— 旧实现丢弃返回值，
+    # 调用方据此提示「已复制」，而剪贴板里还是上一次的内容（issue #38）。
+    {"group": "frontend", "name": "Copy helper failure contract", "cwd": "frontend",
+     "argv": ["{node}", "--experimental-strip-types", "../scripts/check-copy-text.mjs"]},
+    # 日志「结论」推导 + MASK/终态折叠的用例。列表里一眼看到的是「成功还是失败」，
+    # 而它靠的是字段组合判据（terminal/http_status/unresolved/decision…）——
+    # 判据写错不会报错，只会静默地把「已取消」显示成「成功」。
+    {"group": "frontend", "name": "Log outcome & merge cases", "cwd": "frontend",
+     "argv": ["{node}", "--experimental-strip-types", "../scripts/check-log-outcome.mjs"]},
+    # 版本号归一化的用例。更新检查的三条来源形态不一（Tauri 的 latest.json 是纯 semver，
+    # GitHub 的 tag_name 带 v），界面模板统一写 `v{v}` —— 漏归一化就渲染出「更新到 vv0.11.0」。
+    {"group": "frontend", "name": "Version normalization cases", "cwd": "frontend",
+     "argv": ["{node}", "--experimental-strip-types", "../scripts/check-update-version.mjs"]},
+    # 更新说明的摘要提取（pickUserNotes）。Web / Docker 端的 notes 来自 GitHub Release
+    # 的整章 body（`### 修复` 双语 + Markdown），旧实现原样塞进 <p> —— 用户读到的是
+    # 技术日志（issue #40）。正则被改坏只会静默退回「又是一块 Markdown」，不报错。
+    {"group": "frontend", "name": "Release notes summary cases", "cwd": "frontend",
+     "argv": ["{node}", "--experimental-strip-types", "../scripts/check-release-notes.mjs"]},
     # 浏览器扩展的静态门禁。放在 frontend 组（ci.yml 的 frontend job）只是因为
     # 那个 job 已经把 node 装好了；扩展与前端是两套东西，别被分组名误导。
     # 为什么必须有：extension/ 原先**没有任何自动化门禁**——python 单测碰不到它，
@@ -59,6 +82,11 @@ GATES = [
     {"group": "version", "name": "Version numbers agree", "cwd": ".", "argv": ["{python}", "scripts/check-version.py"]},
     {"group": "version", "name": "Public release audit", "cwd": ".", "argv": ["{python}", "scripts/audit-public-release.py"]},
     {"group": "version", "name": "Workflow YAML and shell syntax", "cwd": ".", "argv": ["{python}", "scripts/check-workflows.py"]},
+    # 版本说明必须是人话（issue #40）。CHANGELOG 被直接当用户更新说明用：
+    # `render-release-notes.py` 切整章作 Release body，`generate-latest-json.py`
+    # 取它作桌面弹窗 notes。光靠 AGENTS.md 的约定不够（条目里照样堆术语），
+    # 所以要求每个受检版本开头有「更新摘要 / Summary」、双语、不含硬术语与状态码。
+    {"group": "version", "name": "CHANGELOG user-facing summary", "cwd": ".", "argv": ["{python}", "scripts/check-changelog.py"]},
     # 扩展 zip 是 Release 上唯一的「网页版 AI」入口：ChatGPT / Claude 没有 Base URL 可配，
     # 只能靠扩展把页面请求送进引擎。打包脚本坏掉＝用户下载不到扩展，且要等发版才暴露。
     {"group": "version", "name": "Browser extension package builds", "cwd": ".", "argv": ["{python}", "scripts/pack-extension.py", "--check"]},

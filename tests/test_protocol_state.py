@@ -187,6 +187,23 @@ class ResponseSideSignedBlockTests(ProtocolStateTestBase):
         tr._restore_sse_data(ev, self.SID)
         self.assertIn(self.token, ev["delta"]["thinking"], "思考增量不得还原")
 
+    def test_thinking_deltas_do_not_inflate_block_count(self):
+        """块内增量不重复计块数：一个思考块报出几百次等于没信息。"""
+        for _ in range(5):
+            tr._restore_sse_data(
+                {"type": "content_block_delta", "index": 0,
+                 "delta": {"type": "thinking_delta", "thinking": "看 " + self.token}},
+                self.SID)
+        self.assertEqual(int(tr.sessions[self.SID].get("restore_signed_skipped") or 0), 0,
+                         "thinking_delta 是块内增量，不单独计块")
+        # 块起始快照（content_block_start）才是「一块」的计数点
+        tr._restore_sse_data(
+            {"type": "content_block_start", "index": 0,
+             "content_block": {"type": "thinking", "thinking": "", "signature": "Aq=="}},
+            self.SID)
+        self.assertEqual(int(tr.sessions[self.SID].get("restore_signed_skipped") or 0), 1,
+                         "content_block_start 快照必须计 1 块")
+
     def test_text_delta_is_restored(self):
         """对照组：正文通道必须照常还原，证明还原管线本身是活的。"""
         ev = {"type": "content_block_delta", "index": 0,
@@ -226,6 +243,8 @@ class ResponseSideSignedBlockTests(ProtocolStateTestBase):
         self.assertIn(self.token, blocks[0]["signature"])
         self.assertIn(self.token, blocks[1]["data"])
         self.assertIn(PHONE, blocks[2]["text"], "对照：整包里 text 块仍要还原")
+        self.assertEqual(int(tr.sessions[self.SID].get("restore_signed_skipped") or 0), 2,
+                         "两块契约豁免必须计数进会话（屏幕可见与统计不能脱节）")
 
     def test_signature_delta_has_no_restore_slot(self):
         slots = tr._sse_text_slots({"type": "content_block_delta", "index": 0,

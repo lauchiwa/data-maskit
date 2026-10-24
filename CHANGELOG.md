@@ -2,10 +2,26 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+每个版本章节的**开头**必须有 `### 更新摘要 / Summary`（中英各一至三条）—— 它会被原样用作用户能看到的「版本介绍」（GitHub Release 首屏与更新弹窗），所以只写用户能感知到的变化，不写实现细节。技术条目写在摘要下面的分节里。
+
+## [Unreleased]
+
+### 更新摘要 / Summary
+- 同步上游 v0.11.4：流式回复不再中途断掉，启动失败会说明原因，日志页一眼看出请求成败，敏感词库支持导入导出。
+- Synced upstream v0.11.4: streaming replies no longer break near the end, failed starts explain why, logs show request outcomes at a glance, and sensitive words can be imported and exported.
+
+### 新增 / Added
+- 同步上游 v0.8.1–v0.11.4：上游连接接管池、建连预算与内部重试、日志结论列、帮助入口、词库导入导出、局域网访问开关；保留本分支模型规则与更新签名。
+  *Synced upstream v0.8.1–v0.11.4: upstream connection takeover pool, connect budgets and retries, log outcome column, help center, word-list import/export, LAN access toggle; keeps this fork's model rules and update signing.*
+
 ## [0.105.0] - 2026-10-07
 
 基于上游 v0.8.0（`xiaYuTian11/maskit`）。
 *Based on upstream v0.8.0 (`xiaYuTian11/maskit`).*
+
+### 更新摘要 / Summary
+- 同步上游 v0.8.0：处置结论更统一，新增接入验证与本地试验台，长对话优先识别最新消息。
+- Synced upstream v0.8.0: clearer verdicts, onboarding checks and a local lab, and newest-first recognition in long chats.
 
 ### 新增 / Added
 - 同步上游 v0.8.0：统一处置结论与检测完整度、接入验证与本地试验台、签名思考块只读、长会话最新消息优先识别、容器按实际可用核数限流、NAS 容器 uid 1001；保留本分支 NER 默认最多 2 线程。
@@ -15,6 +31,10 @@
 
 基于上游 v0.7.0（`xiaYuTian11/maskit`）。
 *Based on upstream v0.7.0 (`xiaYuTian11/maskit`).*
+
+### 更新摘要 / Summary
+- 同步上游 v0.7.0：取消请求更可靠，语义识别更快，新增 Linux 桌面安装包；修复 macOS 自动更新失败。
+- Synced upstream v0.7.0: more reliable cancellation, faster recognition, Linux desktop packages; fixes failed auto-updates on macOS.
 
 ### 新增 / Added
 - 同步上游 v0.7.0：真实流取消与响应配额修复、连接策略诊断、词表 `re:` 单词失效修复、无汉字窗口跳过语义模型（识别耗时 -74%）、分段粒度收紧至 4000 字、事件库死空间回收、`linux-<arch>-deb` 更新载体独立签名。
@@ -33,6 +53,10 @@
 基于上游 v0.6.0（`xiaYuTian11/maskit`）。
 *Based on upstream v0.6.0 (`xiaYuTian11/maskit`).*
 
+### 更新摘要 / Summary
+- 同步上游 v0.6.0：新增危险命令审计与一键自检；更新检查改用本分支发布。
+- Synced upstream v0.6.0: dangerous-command auditing and one-click self-check; update checks now follow this fork's releases.
+
 ### 新增 / Added
 - 同步上游 v0.5.0–v0.6.0 的并发治理、危险命令审计与一键自检，保留本分支更新签名、模型规则和缓存字段修复。
   *Synced upstream v0.5.0–v0.6.0 concurrency controls, dangerous-command auditing and self-checks, preserving fork update signing, model rules and cache-field fixes.*
@@ -47,6 +71,10 @@
 
 基于上游 v0.4.0（`xiaYuTian11/maskit`）。上游 `0.4.0` 的全部变更见下方对应章节，本节只记录本分支自身的处理。
 *Based on upstream v0.4.0 (`xiaYuTian11/maskit`). All upstream `0.4.0` changes are listed in their own section below; this section records only what this fork did.*
+
+### 更新摘要 / Summary
+- 同步上游 v0.4.0：浏览器扩展可保护更多网页上传方式，老版 Office 文件也能脱敏。
+- Synced upstream v0.4.0: the browser extension covers more web uploads, and legacy Office files can be masked.
 
 ### 新增 / Added
 - 同步上游 `v0.4.0`：浏览器扩展新增 XHR 与单文件/Blob 直传拦截、老版 Office（.doc / .xls）转码脱敏开关，拦截日志新增「浏览器扩展」筛选大类与徽标，并修复扩展还原链路、超大响应还原阻塞与 Office 重压缩兜底等一批问题。
@@ -63,6 +91,10 @@
 基于上游 v0.3.2（`xiaYuTian11/maskit`），仅本分支自身修复，无上游同步。
 *Based on upstream v0.3.2 (`xiaYuTian11/maskit`); fork-only fix, no upstream sync.*
 
+### 更新摘要 / Summary
+- 语义识别默认少占一些处理器核心，与其它服务同机部署时不再把对方挤垮。
+- Semantic recognition now uses fewer processor cores by default, so it no longer starves services on the same machine.
+
 ### 修复 / Bug Fixes
 - NER 推理线程数由写死的 `4` 改为可配置环境变量 `MASKIT_NER_THREADS`（默认 `2`，下限 `1`）。此前 onnxruntime 会占满 `intra_op_num_threads` 个核到 100%，当 maskit 与读「整机 CPU」做过载保护的服务（如 new-api）同机时，占满全核会触发对方对所有请求返回 503。默认降到 2 给同机邻居留核；部署方可按机器核数与容器 `cpus` 配额自行覆盖，二者对齐可免 CFS 调度停顿。
   *NER inference thread count changed from a hardcoded `4` to the configurable env var `MASKIT_NER_THREADS` (default `2`, floor `1`). Previously onnxruntime saturated `intra_op_num_threads` cores to 100%; when maskit shares a host with a service whose overload guard reads system-wide CPU (e.g. new-api), pegging all cores tripped that guard into returning 503 for every request. The default is lowered to 2 to leave cores for co-located neighbours; deployers can override it to match the host core count and the container `cpus` quota (aligning the two avoids CFS throttling stalls).*
@@ -75,6 +107,10 @@
 
 基于上游 v0.3.2（`xiaYuTian11/maskit`）。上游 `0.3.x` 的全部变更见下方对应章节，本节只记录本分支自身的处理。
 *Based on upstream v0.3.2 (`xiaYuTian11/maskit`). All upstream `0.3.x` changes are listed in their own sections below; this section records only what this fork did.*
+
+### 更新摘要 / Summary
+- 同步上游 v0.3.2：新增本地语义识别与浏览器扩展，可保护网页版 AI 对话。
+- Synced upstream v0.3.2: local semantic recognition and a browser extension that protects web AI chats.
 
 ### 新增 / Added
 - 同步上游 `0.3.0`–`0.3.2`：本地 ONNX 语义实体识别（NER，配置项 `ner_enabled`，默认关）、浏览器扩展桥接（保护 ChatGPT / Claude 等网页版 AI）、毛玻璃界面重构、透传兜底层加固与 IPv6/USCC 内置规则。
@@ -91,6 +127,10 @@
 基于上游 v0.2.12（`xiaYuTian11/maskit`）。本分支自此启用独立版本段 `0.100.x`，与上游 `0.2.x` 永不相撞。
 *Based on upstream v0.2.12 (`xiaYuTian11/maskit`). This fork now uses its own version range `0.100.x`, which can never collide with upstream's `0.2.x`.*
 
+### 更新摘要 / Summary
+- 本分支开始独立发布与自动更新，上游发布不会再覆盖本分支安装。
+- This fork now ships and auto-updates on its own; upstream releases can no longer overwrite it.
+
 ### 变更 / Changed
 - 自动更新端点改为本分支仓库（`lauchiwa/data-maskit`），并换用本分支自有的更新签名密钥对；上游发布不再可能覆盖本分支构建。
   *Updater endpoint switched to this fork's repository (`lauchiwa/data-maskit`) with its own update-signing keypair; upstream releases can no longer overwrite this fork's builds.*
@@ -100,6 +140,230 @@
 ### 新增 / Added
 - 上游血缘基线元数据 `__upstream_base__`，经 `/api/status` 与诊断导出暴露（字段 `upstream_base`），用于确认运行中的实例基于哪个上游版本；只读，不参与版本比较。
   *Upstream lineage baseline `__upstream_base__`, exposed via `/api/status` and diagnostics export (field `upstream_base`), to identify which upstream version a running instance is based on; read-only, never used in version comparison.*
+## [0.11.4] - 2026-10-20
+
+### 更新摘要 / Summary
+- 客户端名称现在支持空格，不再出现输入空格导致配置重置为默认客户端的问题。
+- 敏感词库支持一键导出备份与导入，方便跨设备迁移与词条管理。
+- 敏感词库增加大小写自动覆盖与中文整词匹配指引，词条匹配更清晰。
+- Client names now support spaces without resetting your configured clients to defaults.
+- Sensitive words can now be exported and imported for easier backups and multi-device setup.
+- Word lists now include case-insensitive matching tips and clearer guidance for Chinese words.
+
+### 修复
+- 客户端名称支持空格：输入包含空格的客户端名称时不再被忽略，更不会因所有客户端失效而误把配置重置为默认客户端。
+- 客户端修改校验：保存客户端时对名称与目标地址进行前置检查，非法输入即时提示，避免配置损坏。
+
+### 新增
+- 词库导入导出：设置页敏感词库新增一键导出备份，支持通过文件或粘贴导入，提供增量合并与完全覆盖两种模式。
+- 词条变体提示：同分类下录入大小写变体时主动提醒已自动覆盖，并补充中文独立词正则用法说明。
+
+### Fixed
+- Client names with spaces are now accepted and no longer trigger an accidental reset to default clients.
+- Added preflight checks for client name and target URL to catch invalid input before saving.
+
+### Added
+- Word list export and import: backup custom sensitive words as a JSON file, or import via file or paste with merge and overwrite options.
+- Case-variant duplicate hints and clearer guidance on regex patterns for isolated Chinese words.
+
+## [0.11.3] - 2026-10-20
+
+### 更新摘要 / Summary
+- 流式回复不会再中途断掉：模型最后那段回答以前可能整段丢失，客户端还会误报成网络异常。
+- Windows 安装装得更干净：不再弹一段红色报错，桌面上也不会多出一个重复图标。
+- 同一局域网的其它设备现在也能打开控制台，需要先在设置里手动开启。
+- Streaming replies no longer break near the end — the model's final chunk used to vanish and clients reported a network error.
+- The Windows installer is cleaner: no red error output, and no duplicate desktop icon.
+- Other devices on your network can now open the console, after you turn it on in settings.
+
+### 修复
+- 流式回复不再整段丢失：响应里出现对象或数组形态的字段时还原会中断，客户端只收到后半截数据。
+- Windows 安装与卸载不再弹 PowerShell 报错；那条终止旧进程的命令此前每次都语法失败，进程实际没被杀掉。
+- 安装不再多出一个桌面快捷方式：改由安装程序按「创建桌面快捷方式」勾选与升级模式决定。
+- 反馈模板里的诊断包入口改回真实路径。
+
+### 新增
+- 局域网访问开关：设置 → 高级选项，开启后同一局域网的其它设备可访问控制台与代理端口（重启引擎生效）。
+
+### Fixed
+- Streaming replies are no longer truncated when a response field holds an object or array instead of a string.
+- The Windows installer and uninstaller no longer throw a PowerShell syntax error; that command had never actually terminated the old processes.
+- The installer no longer creates a duplicate desktop shortcut — creation follows the checkbox and the update mode.
+- The diagnostics-bundle entry in the bug report template now points at the real path.
+
+### Added
+- LAN access toggle under Settings → Advanced; other devices on the same network can reach the console and proxy ports (engine restart required).
+
+## [0.11.2] - 2026-10-19
+
+### 更新摘要 / Summary
+- 更新弹窗和「关于」页现在直接告诉你这次改了什么，不再只有一句「修复 2 项」或一整段技术日志。
+- Windows 桌面版不会再出现「点了启动却起不来」：端口探测多了一条兜底，不再单靠系统命令。
+- 启动失败时不再只有一句「未就绪」：端口被占用、旧引擎残留、令牌没写出来会分开说明，日志也不会再因为进程被杀而整片丢失。
+- The update card and About page now tell you what actually changed, instead of a bare count or a wall of technical text.
+- Windows desktop no longer fails to start: port detection has a fallback when the system command reports nothing.
+- A failed start now says why — port taken, stuck engine, or missing token — and engine logs survive a force-kill.
+
+### 修复
+- Windows 启动：端口探测不再只依赖系统命令，命令被拦截或超时返空时改用连接探测兜底。此前该命令一旦失灵，就绪判定永远认为端口未监听，点启动会等满 60 秒后报失败，常驻守护还会反复重启正常工作的代理。
+- 引擎日志：壳层强杀引擎时，`engine-stdout.log` 的块缓冲来不及 flush，内存里的诊断行随进程一起消失（引擎存活期间该文件恒为空）。现由壳层注入 `PYTHONUNBUFFERED`，并把 `[panel]` / `[engine]` / `[proxy]` 诊断行落盘到数据目录 `engine.log`（2MB 轮转）；`SHIELD` 事件行携带原文预览，仍然只进内存。
+- 引擎启动：守护线程的假死判定（6 轮 × 2s ≈ 12s）比就绪预算（20s）更早，会把**正在初始化**的引擎强杀重拉，慢机上表现为「永远起不来 / 反复重启」；现加与就绪预算同值的启动宽限。就绪超时也不再只报一句「未就绪」：区分端口被第三方进程 / 本产品残留引擎占用、系统查不到占用 PID、令牌未写出，并把启动失败现场补写进 `crash-dumps`。
+
+### 优化
+- 版本说明：更新弹窗与「关于」页只展示「更新摘要」，不再把整章 CHANGELOG（含 `###` 标记与双语技术条目）原样渲染给用户；桌面端 `latest.json` 的 notes 也从「修复 N 项」改为摘要正文。
+- 版本说明：新增 `scripts/check-changelog.py` 门禁（已进 `scripts/verify-all.py` 的 version 组与 `ci.yml`），强制每个版本章节开头有中英双语「更新摘要」，并拦截反引号、源码文件名、`文件:行号`、4xx/5xx 状态码与硬技术术语。历史版本（0.10.1 之前）不回溯。
+
+### Fixed
+- Windows start: port detection no longer relies solely on the system command; when it is blocked or returns nothing, a connection probe takes over. A failing command previously made the readiness check see no listeners forever — start waited the full 60 s and reported failure, and the resident watchdog kept restarting a healthy proxy.
+- Engine log: a force-killed engine never got to flush its block-buffered stdout, so `engine-stdout.log` stayed empty for the engine's whole lifetime and every diagnostic line died with the process. The shell now injects `PYTHONUNBUFFERED` and persists `[panel]` / `[engine]` / `[proxy]` lines to `engine.log` in the data directory (2 MB rotation); `SHIELD` event lines carry plaintext previews and stay in memory only.
+- Engine start: the watchdog's hang detection (6 rounds × 2 s ≈ 12 s) fired before the 20 s readiness budget and killed engines that were still initialising, which on slow machines looked like "never starts / restarts forever"; a start grace period now matches the readiness budget. A readiness timeout also reports *why* (port held by a third-party process, a stuck engine of ours, an unidentifiable listener, or a token that was never written) and dumps the failure scene into `crash-dumps`.
+
+### Improvements
+- Update notes: the update card and About page now render only the user-facing summary instead of the whole CHANGELOG section (raw `###` markers and bilingual technical entries); the desktop `latest.json` notes carry the summary body instead of an "N fixed" count.
+- Update notes: new `scripts/check-changelog.py` gate (added to `scripts/verify-all.py`'s version group and `ci.yml`) requires a bilingual summary section at the top of every version section and rejects backticks, source filenames, `file:line` refs, 4xx/5xx status codes and hard jargon. Versions before 0.10.1 are exempt.
+
+## [0.11.1] - 2026-10-16
+
+### 更新摘要 / Summary
+- 面板上的「还原失败」不再把不属于你的占位符也算进去，那个数字现在可信了。
+- 代码里的变量名、方法名不再被误当成人名打码，模型看到的代码和你写的一样。
+- The dashboard's "restore failures" no longer counts placeholders this machine never issued, so the number is trustworthy.
+- Code identifiers such as variable and method names are no longer masked as people's names, so the model sees your code unchanged.
+
+### 修复
+- 引擎：还原失败不再把「本机从未签发过」的占位符算进去（客户端历史携带的外部 token / 对话里的文档示例 / 模型自造），新增「外部占位符」独立计数，面板与详情页分开显示。
+- 引擎：语义识别不再把代码标识符（`JSON.parse`、`FSPAGE_9105` 这类）判成人名/机构名掩码，模型看到的代码不再被改写（真机当日 NAME 命中里六成是变量名/方法名）。
+
+### Fixed
+- Engine: restore failures no longer include placeholder-shaped strings this instance never issued (foreign tokens from client history / doc examples / model-invented); a separate "foreign tokens" counter is shown apart from restore failures on the dashboard and in the detail dialog.
+- Engine: NER no longer masks code identifiers (`JSON.parse`, `FSPAGE_9105`, …) as person/organization names, so the code a model sees is no longer rewritten (six in ten of the day's NAME hits were variable or method names).
+
+## [0.11.0] - 2026-10-14
+
+### 更新摘要 / Summary
+- 日志页现在一眼能看出每条请求是成功还是失败，一次请求只占一行。
+- 列表更清爽：状态列直接告诉你是你这边断了、上游没回音，还是网络没连上。
+- 设置页复制失败会如实提示，版本号也不会再显示成两个 v。
+- Logs now show at a glance whether each request succeeded or failed, and one request is one row.
+- The list is tidier: the status column tells you whether the client, the upstream or the network is at fault.
+- A failed copy now says so, and the version number no longer shows a doubled "v".
+
+### 新增
+- 面板日志：新增「结论」列（成功 / 有告警 / 失败 / 已取消 / 进行中 / 未完成 / 未处理 / 安全告警），一眼能看出请求成败；事件类型降为小图标。
+- 面板日志：取消与错误事件按会话折进对应的脱敏行，一次请求只占一行，不再只看到半条链路。
+
+### 优化
+- 面板日志：列表由 9 列收到 8 列（入口并入上游列）；状态列显示 HTTP 码或失败归因（客户端断开 / 上游静默 / 域名解析失败），不再显示截断的英文状态码。
+- 面板日志：耗时列区分端到端与仅脱敏耗时；类型筛选改为「按结论」优先，底层原语收进高级分组；图例改为结论颜色说明。
+- 面板日志：显式选择筛选条件时不再被「隐藏噪声」吞掉（此前选「用户取消」只会得到空列表）。
+
+### Added
+- Panel logs: new Outcome column (success / warnings / failed / canceled / in progress / incomplete / not processed / security alert) so request success is visible at a glance; the event type is now a small icon.
+- Panel logs: cancel and error events are folded into their masking row per session, so one request is one row instead of half a chain.
+
+### Improvements
+- Panel logs: 9 columns reduced to 8 (ingress merged into the upstream column); the status column now shows the HTTP code or the failure attribution (client disconnected / upstream silent / DNS failure) instead of a truncated English status.
+- Panel logs: the duration column distinguishes end-to-end from masking-only time; the type filter is now outcome-first with raw primitives tucked into an advanced group; the legend explains outcome colours.
+- Panel logs: an explicit filter selection is no longer swallowed by "hide noise" (previously picking "user canceled" returned an empty list).
+
+### 修复
+- 前端：复制回退失败时不再谎报「已复制」，设置页会正确提示复制失败。
+- 前端：更新提示的版本号不再重复 `v` 前缀（Web / Docker 端 GitHub tag 自带 `v`，与模板叠加后实测显示成 `vv0.11.0`）。
+- 引擎：还原详情区分「模型回显但未还原」与「模型未回显」，不再把后者渲染成「未还原」告警；未还原计数不再被日期串等正常文本误触发；签名/密文思考块的契约豁免在还原侧也计数可见。
+
+### Fixed
+- Frontend: a failed clipboard fallback no longer reports "copied"; the settings page now shows a copy-failed toast.
+- Frontend: the update prompt no longer doubles the `v` prefix on the version (on Web/Docker the GitHub tag already carries `v`, which stacked with the template and rendered `vv0.11.0`).
+- Engine: restore details now distinguish "echoed but not restored" from "not echoed"; unresolved counting no longer fires on ordinary text such as date strings; restore-side contract skips of signed/encrypted thinking blocks are counted and visible.
+
+## [0.10.1] - 2026-10-13
+
+### 更新摘要 / Summary
+- 上游偶尔不按规范收尾时，流式回复不再丢掉还原记录，也不会被误记成「你取消了请求」。
+- 换过上游地址后，连接会自动跟着换到新地址，不再把配好的地址拒掉。
+- When an upstream ends a stream sloppily, the restore record is no longer lost and the request is not mislabelled as a cancel.
+- After you change an upstream address, connections follow it instead of being rejected.
+
+### 修复
+- 引擎：上游发完 `[DONE]` 后未按规范收尾响应体时，流式请求不再丢失还原记录，正常结束也不会被误记为「客户端取消」。
+- 引擎：上游 target 变更后，接管连接池按新目标白名单自动换代，不再对配置内的合法目标返回 403。
+
+### Fixed
+- Engine: when an upstream omits the closing chunk after `[DONE]`, streaming requests no longer lose their restore record or get misreported as a client cancel.
+- Engine: after an upstream target change, the takeover pool now rebuilds against the new target allowlist instead of rejecting configured targets with 403.
+
+## [0.10.0] - 2026-10-11
+
+### 新增
+- 统计：支持各大模型 Token 缓存采集与日摘要聚合，费用估算按厂商口径支持缓存折扣。
+
+### Added
+- Stats: support token cache extraction and daily aggregation, with vendor-specific discount support in cost estimation.
+
+### 优化
+- 引擎：接管连接池空闲保留由 30 秒提到 120 秒，建连超时放宽至 20 秒并细化 502/504 错误归因，减少冷握手超时与假报错。
+- 脱敏：默认凭据前缀安全扩充常见供应商识别（仅对未自行配置过的用户生效，已自定义保存过的请手动添加）。
+
+### Improvements
+- Engine: takeover pool keepalive budget extended to 120s, connect timeout relaxed to 20s with refined 502/504 attribution to reduce false connect failures.
+- Masking: expanded default credential prefixes for common providers (applies only when not customized; manual addition needed for existing custom configs).
+
+## [0.9.0] - 2026-10-10
+
+### 修复
+- 日志：上游首包后长时间静默、被 mitmproxy 空闲看门狗（默认 600 秒）掐断的请求，此前写成「客户端断开」，把排查方向带向客户端；现改判为 `upstream_idle`（责任方上游）并给出连续静默秒数。`docs/SETTINGS.md` 同步说清三条互不相同的静默时间线。
+- 引擎：接管旁路只转发配置里声明过的上游目标，其余目标回 403 并断开——本机环回端口不再能被同机任意进程当通用中继用。
+- 引擎：修复开启接管后的三处静默失效：出口代理配置使旁路进程启动即抛异常、解压后的响应仍带着 `Content-Encoding`、打包清单漏掉该模块导致生产包里根本没有它。
+- 面板：布尔开关统一改用严格判据，手改 config.json 写成 `"false"`、`[]`、`{}` 的值不再被当成「开启」。
+- 面板：`takeover` 在当前模式下永远不会生效时，保存会给出可见提示；客户端编辑页也只在反向代理模式显示这个开关。
+
+### Fixed
+- Logs: a request whose upstream fell silent after the first byte and was killed by mitmproxy's inactivity watchdog (600s by default) used to be written as a client disconnect, pointing triage at the wrong side; it is now attributed as `upstream_idle` (owner: upstream) with the idle seconds. `docs/SETTINGS.md` spells out the three distinct silence timelines.
+- Engine: the takeover relay now forwards only upstream targets declared in the config and answers 403 to anything else, so the loopback port can no longer be used as an open relay by any local process.
+- Engine: fixed three silent failures that appeared once takeover was enabled — an egress proxy config made the relay crash on startup, decompressed responses still carried `Content-Encoding`, and the module was missing from the packaging manifest so released builds did not contain it at all.
+- Panel: boolean switches now share one strict predicate, so values hand-edited into config.json as `"false"`, `[]` or `{}` are no longer read as "enabled".
+- Panel: saving `takeover` in a capture mode where it can never take effect now shows a warning, and the client editor only renders the switch in reverse proxy mode.
+
+### 新增
+- 引擎：新增可选开关 `upstreams[].takeover`（默认关闭）。开启后该上游的连接由引擎进程级连接池跨客户端复用，把「每请求一次 TCP+TLS 握手」换成「按连接复用」；`takeover=false` 时转发路径与原来完全一致。
+- 引擎：接管路径沿用原来的安全边界——TLS 校验不放宽、32 MiB 请求体上限仍守（超限 413）、客户端凭据头原样透传，且只转发配置里声明过的上游目标。
+- 面板：客户端编辑页新增「接管上游连接」开关；此前 `takeover` 只能手改 config.json，且面板任何一次保存都会把它静默抹掉。
+- 引擎：运行指标（metrics）暴露 `c1_sidecar` 状态字段（enabled/port/stats/pool），便于面板观测连接池效果。
+- 引擎：新增响应流空闲闸 `MASKIT_SSE_IDLE_S`（默认 120 秒，`0` 或 `MASKIT_SSE_IDLE_KILL=0` 退回纯观测）：首包之后连续静默到点即取消这条客户端连接并归因 `upstream_idle`，不再替客户端握着一头已死的连接等到 mitmproxy 默认的 600 秒。判据是相邻数据块的间隔而非总时长，跑满 646 秒的长生成不受影响。
+
+### Added
+- Engine: optional `upstreams[].takeover` (off by default) — the upstream's connections are reused across clients by a process-level pool, replacing one TCP+TLS handshake per request with per-connection reuse; with `takeover=false` the forwarding path is exactly as before.
+- Engine: the takeover path keeps the same security boundaries — TLS verification is not relaxed, the 32 MiB body limit still applies (413 over limit), client credential headers pass through untouched, and only upstream targets declared in the config are forwarded.
+- Panel: the client editor gains a "take over upstream connection" switch; previously `takeover` could only be set by editing config.json by hand, and every panel save silently wiped it.
+- Engine: metrics now expose a `c1_sidecar` status field (enabled/port/stats/pool) for pool-effect observability.
+- Engine: new response-stream idle gate `MASKIT_SSE_IDLE_S` (120s by default; `0` or `MASKIT_SSE_IDLE_KILL=0` keeps it observation-only) — after the first byte, a stream that produces no bytes for that long gets its client connection cancelled and attributed as `upstream_idle`, instead of Maskit holding a dead connection open for the client until mitmproxy's 600s watchdog fires. The measure is the gap between chunks, not total duration, so a 646s generation is unaffected.
+
+## [0.8.1] - 2026-10-09
+
+### 修复
+- 引擎：卡住的上游建连 / TLS 握手改为有预算（默认 20 秒，`MASKIT_CONNECT_STALL_S`），超预算时取消正在建立这一跳的任务并立即回 502，客户端不再空等约 127 秒的内核重传；事件归因为 `handshake_timeout`（上游、可重试）。这只治「死等多久」，链路丢包本身仍需系统层处理。
+
+### Fixed
+- Engine: a stalled upstream connect / TLS handshake is now budgeted (20s by default, `MASKIT_CONNECT_STALL_S`); over budget the task establishing that hop is cancelled and the client gets a clean 502 instead of waiting out the ~127s kernel retransmit ladder, attributed as `handshake_timeout` (upstream, retryable). This bounds the dead wait and makes it retryable — the packet loss itself is a link-layer problem.
+
+### 新增
+- 面板：顶栏新增常驻「帮助」入口（页面导览、快速上手、常见问题、教程跳转）与三步首次引导；引导仅在尚未配置任何客户端时自动弹出，老用户升级不会被打断。
+- 文档：新增 `docs/SETTINGS.md`，按页面与开关逐项解释配置口径。
+
+### Added
+- Panel: the top bar gains a permanent Help entry (page guide, quick start, FAQ, tutorial links) and a three-step first-run guide that auto-opens only while no client is configured, so upgrades never interrupt existing users.
+- Docs: added `docs/SETTINGS.md`, explaining each page and switch.
+
+### 优化
+- 日志：「隐藏噪声」默认开启（实测取消记录与脱敏记录约 1:1，列表一半被取消行占据），并记住开关选择——刷新或重开客户端后仍生效；开关说明改为列出实际隐藏的五类事件（透传/跳过/绕过/取消/DNS 错误）。
+- 版本号：面板连不上时侧栏与「关于」卡回退显示客户端版本并标注来源（此前 502 这类故障截图上根本没有版本号，报障无从判断），面板启动日志首行也带上版本。
+- 设置：上游连接策略的「连接复用 / 空闲期限 / 建连预算 / TLS 预算」四项补上悬停说明，明确它们是建连与握手预算，不是模型请求或 SSE 流的时长。
+
+### Changed
+- Logs: hide noise events by default (cancelled rows were ~1:1 with mask rows) and remember the toggle across sessions; the tooltip now names the five hidden event types.
+- Version: when the panel is unreachable, the sidebar and About card fall back to the client version with an explicit source note (such failure screenshots previously carried no version at all); the panel startup log line now prints it too.
+- Settings: the four upstream connection-policy fields now explain on hover that they budget connection setup and the TLS handshake, not model requests or SSE streams.
+
 ## [0.8.0] - 2026-10-05
 
 ### 修复

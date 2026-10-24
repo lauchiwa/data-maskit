@@ -1765,11 +1765,11 @@ class ShieldEngineTests(unittest.TestCase):
             orig = tr._restore_sse_event
             calls = {"n": 0}
 
-            def boom(block, sid_, final=False):
+            def boom(block, sid_, final=False, **kw):
                 calls["n"] += 1
                 if calls["n"] >= 2:
                     raise RuntimeError("boom-injected")
-                return orig(block, sid_, final=final)
+                return orig(block, sid_, final=final, **kw)
 
             tr._restore_sse_event = boom
             try:
@@ -4123,6 +4123,45 @@ class TodayStatsTests(unittest.TestCase):
         # 无缓存无覆盖 → 内置表兜底
         cost, _ = estimate_cost("gpt-4o", 0, 1_000_000)
         self.assertAlmostEqual(cost, 10.0)
+
+        # 缓存 Token 折扣计费验证：cache_read 价格生效
+        cache_with_discount = {
+            "gpt-4o": {
+                "input": 2.5,
+                "output": 10.0,
+                "cache_read": 1.25,
+                "cache_write": 3.75,
+            }
+        }
+        # 100 万输入中，80 万为缓存命中（cache_read），20 万为全价输入
+        # 预期成本：(200_000/1e6 * 2.5) + (800_000/1e6 * 1.25) = 0.5 + 1.0 = 1.5 美元
+        cost_disc, _ = estimate_cost(
+            "gpt-4o",
+            1_000_000,
+            0,
+            price_catalog=cache_with_discount,
+            cache_read_tokens=800_000,
+        )
+        self.assertAlmostEqual(cost_disc, 1.5)
+
+        # Anthropic 语义验证：input_tokens 不含 cache_read，不作减法
+        claude_catalog = {
+            "claude-3-5-sonnet": {
+                "input": 3.0,
+                "output": 15.0,
+                "cache_read": 0.3,
+            }
+        }
+        # 20 万常态输入 + 80 万缓存读
+        # 预期成本：(200_000/1e6 * 3.0) + (800_000/1e6 * 0.3) = 0.6 + 0.24 = 0.84 美元
+        cost_claude, _ = estimate_cost(
+            "claude-3-5-sonnet",
+            200_000,
+            0,
+            price_catalog=claude_catalog,
+            cache_read_tokens=800_000,
+        )
+        self.assertAlmostEqual(cost_claude, 0.84)
 
     def test_today_stats_aggregates_by_local_day(self):
         import tempfile

@@ -5,6 +5,8 @@
  */
 import { invoke } from '@tauri-apps/api/core'
 import { isTauri, shieldFetch, ShieldApiError } from './shield-fetch'
+import { normalizeVersion } from './utils'
+import { pickUserNotes } from './releaseNotes'
 
 export interface EngineState {
   ready: boolean
@@ -21,6 +23,28 @@ export async function getShieldToken(): Promise<string> {
 
 export async function getEngineState(): Promise<EngineState> {
   return await invoke<EngineState>('engine_state')
+}
+
+/** 客户端（壳）版本；非 Tauri 环境（浏览器 / Docker WebUI）返回空串。
+ *
+ * 用途只有一个：**面板不可达时的版本兜底**。引擎版本（/api/status.version）是
+ * 唯一真相来源，但面板连不上时它必然取不到，而“报障先问对方是什么版本”恰恰
+ * 最需要这个数字（502 这类故障现场连侧栏版本徽标都是空的）。
+ *
+ * 壳版本与引擎版本由 `scripts/check-version.py` 钉住同源（tauri.conf.json /
+ * panel.py / Cargo.toml / package.json 四处必须一致），因此可作兜底；但本地
+ * dev 部署只替换引擎目录时两者可能不同，调用方**必须标注来源**，不得冒充引擎版本。
+ * 单次进程生命周期内版本不变，取一次即缓存。 */
+let shellVersionPromise: Promise<string> | null = null
+
+export function getShellVersion(): Promise<string> {
+  if (!isTauri()) return Promise.resolve('')
+  if (!shellVersionPromise) {
+    shellVersionPromise = import('@tauri-apps/api/app')
+      .then((m) => m.getVersion())
+      .catch(() => '')
+  }
+  return shellVersionPromise
 }
 
 export async function restartEngine(): Promise<{ ok: boolean; error?: string }> {
@@ -100,7 +124,9 @@ async function fetchLatestFromGitHub(): Promise<{ version?: string; notes?: stri
     })
     if (!resp.ok) throw new Error(`更新服务返回 HTTP ${resp.status}`)
     const d = (await resp.json()) as { tag_name?: string; body?: string; published_at?: string }
-    return { version: d.tag_name, notes: d.body, pub_date: d.published_at }
+    // body 是整章 CHANGELOG（含 `### 修复` 双语条目与原样 Markdown），只取「更新摘要」
+    // 那一段再交给弹窗 —— 否则用户在更新卡片里读到的是带 `###` 的技术日志（issue #40）。
+    return { version: d.tag_name, notes: pickUserNotes(d.body || ''), pub_date: d.published_at }
   } finally {
     clearTimeout(timeout)
   }
@@ -116,7 +142,10 @@ async function fetchLatestFromGitHub(): Promise<{ version?: string; notes?: stri
 export async function checkUpdate(currentVersion?: string): Promise<UpdateCheck> {
   if (isTauri()) {
     try {
-      return await invoke<UpdateCheck>('check_update')
+      const r = await invoke<UpdateCheck>('check_update')
+      // 归一化版本形态：Rust 侧来自 latest.json（纯 semver），但显示模板统一写 `v{v}`，
+      // 统一成不带 v 才能保证渲染出「更新到 v0.11.0」而不是「vv0.11.0」。
+      return { ...r, version: normalizeVersion(r.version), current_version: normalizeVersion(r.current_version) }
     } catch (e) {
       return { ok: false, has_update: false, error: String(e) }
     }
@@ -176,8 +205,9 @@ export async function checkUpdate(currentVersion?: string): Promise<UpdateCheck>
     return {
       ok: true,
       has_update: hasUpdate,
-      version: latestTag,
-      current_version: curVer ? `v${cleanCur}` : undefined,
+      // 归一化为纯 semver：GitHub 的 tag_name 带 v，与 Tauri 侧形态对齐（见 normalizeVersion）
+      version: normalizeVersion(latestTag),
+      current_version: normalizeVersion(curVer),
       notes: data.notes || '',
       pub_date: data.pub_date,
     }

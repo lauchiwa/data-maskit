@@ -209,7 +209,9 @@ def _connect(schema=False):
         CREATE TABLE IF NOT EXISTS daily_tokens (
             day TEXT PRIMARY KEY,
             prompt INTEGER DEFAULT 0,
-            completion INTEGER DEFAULT 0
+            completion INTEGER DEFAULT 0,
+            cache_read INTEGER DEFAULT 0,
+            cache_write INTEGER DEFAULT 0
         )
         """
     )
@@ -224,15 +226,26 @@ def _connect(schema=False):
             prompt INTEGER DEFAULT 0,
             completion INTEGER DEFAULT 0,
             errors INTEGER DEFAULT 0,
+            cache_read INTEGER DEFAULT 0,
+            cache_write INTEGER DEFAULT 0,
             PRIMARY KEY (day, model)
         )
         """
     )
-    # daily_models 补充 errors 失败统计列（已有库平滑迁移）
+    # daily_models 与 daily_tokens 补充新列（已有库平滑迁移）
     try:
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(daily_models)").fetchall()]
-        if "errors" not in cols:
+        m_cols = [r[1] for r in conn.execute("PRAGMA table_info(daily_models)").fetchall()]
+        if "errors" not in m_cols:
             conn.execute("ALTER TABLE daily_models ADD COLUMN errors INTEGER DEFAULT 0")
+        if "cache_read" not in m_cols:
+            conn.execute("ALTER TABLE daily_models ADD COLUMN cache_read INTEGER DEFAULT 0")
+        if "cache_write" not in m_cols:
+            conn.execute("ALTER TABLE daily_models ADD COLUMN cache_write INTEGER DEFAULT 0")
+        t_cols = [r[1] for r in conn.execute("PRAGMA table_info(daily_tokens)").fetchall()]
+        if "cache_read" not in t_cols:
+            conn.execute("ALTER TABLE daily_tokens ADD COLUMN cache_read INTEGER DEFAULT 0")
+        if "cache_write" not in t_cols:
+            conn.execute("ALTER TABLE daily_tokens ADD COLUMN cache_write INTEGER DEFAULT 0")
     except Exception:
         pass
     # 前缀保真度日摘要：只收 MASK 事件（只有它带 body_rewritten /
@@ -539,6 +552,9 @@ _SUMMARY_KEEP_FIELDS = frozenset({
     # （引擎/上游/客户端/DNS/出口代理），后者让同一类断开能聚合计数。
     # 两者都是短枚举字符串，不含正文。
     "failure_owner", "error_type",
+    # 上游连续静默秒数：`reason=upstream_idle` 的证据（纯数字时长，不含正文与远端标识）。
+    # 没它的话 summary 模式下这条归因只剩一个标签，用户无法核对判据。
+    "upstream_idle_s",
     "upstream_may_have_executed", "engine_busy", "engine_queue_bytes", "engine_queue_depth",
     # 还原结果计数
     "restored_unique", "unresolved", "degraded", "success", "usage",
@@ -683,31 +699,47 @@ def _update_stats(conn, rec, replay=False):
                 "ON CONFLICT(day,status) DO UPDATE SET cnt=cnt+1",
                 (day, str(rec.get("status"))),
             )
+        # 外来/示例占位符单独记一行（status='foreign'）：它们不是本机签发的，
+        # **不进「还原失败」告警**，但用户需要知道今天有多少「看着像占位符、
+        # 其实不是我们签的」字符串混在响应里。与主状态行并存：一条事件可以同时
+        # 命中 `unresolved` 与 `foreign`（两类 token 出现在同一个响应里）。
+        if typ == "RESTORE" and (_int_or_none(rec.get("foreign")) or 0) > 0:
+            conn.execute(
+                "INSERT INTO daily_status(day, status, cnt) VALUES(?,?,1) "
+                "ON CONFLICT(day,status) DO UPDATE SET cnt=cnt+1",
+                (day, "foreign"),
+            )
         # 敏感词明细只收 MASK 事件（避免 RESTORE 重复计数）
         # Token 用量与模型统计：收 RESTORE 与带 usage 的 PASS 事件（透传直连）
         if typ in ("RESTORE", "PASS"):
             usage = rec.get("usage")
             p = 0
             c = 0
+            cr = 0
+            cw = 0
             if isinstance(usage, dict):
                 p = _int_or_none(usage.get("prompt_tokens")) or 0
                 c = _int_or_none(usage.get("completion_tokens")) or 0
-                if p or c:
+                cr = _int_or_none(usage.get("cache_read_tokens")) or 0
+                cw = _int_or_none(usage.get("cache_write_tokens")) or 0
+                if p or c or cr or cw:
                     conn.execute(
-                        "INSERT INTO daily_tokens(day, prompt, completion) VALUES(?,?,?) "
+                        "INSERT INTO daily_tokens(day, prompt, completion, cache_read, cache_write) VALUES(?,?,?,?,?) "
                         "ON CONFLICT(day) DO UPDATE SET "
-                        "prompt=prompt+excluded.prompt, completion=completion+excluded.completion",
-                        (day, p, c),
+                        "prompt=prompt+excluded.prompt, completion=completion+excluded.completion, "
+                        "cache_read=cache_read+excluded.cache_read, cache_write=cache_write+excluded.cache_write",
+                        (day, p, c, cr, cw),
                     )
             # 模型使用摘要：请求数 + token 数同源（RESTORE 或带 usage 的 PASS 事件），
             # 失败请求（无 RESTORE/PASS 错误）不计——口径=「成功完成的调用」
             model = str(rec.get("model") or "").strip()
-            if model and (typ == "RESTORE" or p > 0 or c > 0):
+            if model and (typ == "RESTORE" or p > 0 or c > 0 or cr > 0 or cw > 0):
                 conn.execute(
-                    "INSERT INTO daily_models(day, model, requests, prompt, completion, errors) VALUES(?,?,1,?,?,0) "
+                    "INSERT INTO daily_models(day, model, requests, prompt, completion, errors, cache_read, cache_write) VALUES(?,?,1,?,?,0,?,?) "
                     "ON CONFLICT(day, model) DO UPDATE SET "
-                    "requests=requests+1, prompt=prompt+excluded.prompt, completion=completion+excluded.completion",
-                    (day, model, p, c),
+                    "requests=requests+1, prompt=prompt+excluded.prompt, completion=completion+excluded.completion, "
+                    "cache_read=cache_read+excluded.cache_read, cache_write=cache_write+excluded.cache_write",
+                    (day, model, p, c, cr, cw),
                 )
             return
         if typ == "ERR":
@@ -715,7 +747,7 @@ def _update_stats(conn, rec, replay=False):
             model = str(rec.get("model") or "").strip()
             if model:
                 conn.execute(
-                    "INSERT INTO daily_models(day, model, requests, prompt, completion, errors) VALUES(?,?,0,0,0,1) "
+                    "INSERT INTO daily_models(day, model, requests, prompt, completion, errors, cache_read, cache_write) VALUES(?,?,0,0,0,1,0,0) "
                     "ON CONFLICT(day, model) DO UPDATE SET errors=errors+1",
                     (day, model),
                 )
@@ -2305,7 +2337,7 @@ def today_stats(now=None):
             "SELECT label, word, cnt, ingress FROM daily_words WHERE day=?", (day,)
         ).fetchall()
         token_row = conn.execute(
-            "SELECT prompt, completion FROM daily_tokens WHERE day=?", (day,)
+            "SELECT prompt, completion, cache_read, cache_write FROM daily_tokens WHERE day=?", (day,)
         ).fetchone()
         prefix_row = conn.execute(
             "SELECT masks, rewritten, reused, diff_sum, diff_n FROM daily_prefix WHERE day=?",
@@ -2313,7 +2345,15 @@ def today_stats(now=None):
         ).fetchone()
     tokens = {}
     if token_row:
-        tokens = {"prompt": int(token_row[0] or 0), "completion": int(token_row[1] or 0)}
+        tokens = {
+            "prompt": int(token_row[0] or 0),
+            "completion": int(token_row[1] or 0),
+        }
+        cr = int(token_row[2] or 0)
+        cw = int(token_row[3] or 0)
+        if cr or cw:
+            tokens["cache_read"] = cr
+            tokens["cache_write"] = cw
     if not rows:
         return _today_stats_legacy(now=now, day_start=day_start)
 
@@ -2337,6 +2377,9 @@ def today_stats(now=None):
     # 审计高危并入告警口径（口径与审计页一致，见 _audit_high_count）
     audit_high = _audit_high_count(day_start)
     alerts += audit_high
+    # 外来/示例占位符只随 restore_by_status 下发（键 'foreign'），**不进 alerts**：
+    # 它们不是本机签发的，算成告警会让指标长期虚高（真机实测：当天 4 条「还原
+    # 失败」里 0 条是本机签发过的 token，69 个历史样本 0 个命中已签发集合）。
     restore_by_status = dict(status_map)
     by_label, by_label_words, top_list, words_by_ingress = _word_groups(word_rows)
     return {
@@ -2393,7 +2436,7 @@ def stats_range(days=1, now=None):
             days_list,
         ).fetchall()
         token_row = conn.execute(
-            f"SELECT SUM(prompt), SUM(completion) FROM daily_tokens WHERE day IN ({placeholders})",
+            f"SELECT SUM(prompt), SUM(completion), SUM(cache_read), SUM(cache_write) FROM daily_tokens WHERE day IN ({placeholders})",
             days_list,
         ).fetchone()
         prefix_row = conn.execute(
@@ -2401,7 +2444,15 @@ def stats_range(days=1, now=None):
             f"FROM daily_prefix WHERE day IN ({placeholders})",
             days_list,
         ).fetchone()
-    tokens = {"prompt": int(token_row[0] or 0), "completion": int(token_row[1] or 0)}
+    tokens = {
+        "prompt": int(token_row[0] or 0),
+        "completion": int(token_row[1] or 0),
+    }
+    cr = int(token_row[2] or 0)
+    cw = int(token_row[3] or 0)
+    if cr or cw:
+        tokens["cache_read"] = cr
+        tokens["cache_write"] = cw
     by_type = {
         str(typ): {"events": int(events or 0), "count_sum": int(count_sum or 0)}
         for typ, events, count_sum, _restored in rows
@@ -2566,7 +2617,7 @@ def stats_history(days=30, granularity="day"):
                 days_list,
             ).fetchall()
             token_rows = conn.execute(
-                f"SELECT day, prompt, completion FROM daily_tokens WHERE day IN ({placeholders})",
+                f"SELECT day, prompt, completion, cache_read, cache_write FROM daily_tokens WHERE day IN ({placeholders})",
                 days_list,
             ).fetchall()
             # 审计信号事件（audit_events 表）按天聚合：注入审计/投毒检测信号数
@@ -2590,8 +2641,13 @@ def stats_history(days=30, granularity="day"):
             if typ in ("BLOCK", "ERR", "SCAN_WARN"):
                 b["alerts"] += int(ev or 0)
         token_map = {}
-        for d, p, c in token_rows:
-            token_map[d] = {"prompt": int(p or 0), "completion": int(c or 0)}
+        for d, p, c, cr, cw in token_rows:
+            token_map[d] = {
+                "prompt": int(p or 0),
+                "completion": int(c or 0),
+                "cache_read": int(cr or 0),
+                "cache_write": int(cw or 0),
+            }
         # audit_events 按天聚合（0点边界）
         audit_map = {}
         for ts, sev in audit_rows:
@@ -2602,7 +2658,7 @@ def stats_history(days=30, granularity="day"):
                 b["audit_high"] += 1
         for d in sorted(days_list, reverse=False):
             b = day_buckets.get(d, {"requests": 0, "mask_events": 0, "restored": 0, "alerts": 0})
-            tk = token_map.get(d, {"prompt": 0, "completion": 0})
+            tk = token_map.get(d, {"prompt": 0, "completion": 0, "cache_read": 0, "cache_write": 0})
             ab = audit_map.get(d, {"audit_signals": 0, "audit_high": 0})
             # 与 today_stats/stats_range 同口径：审计高危计入当日「告警」
             b["alerts"] += ab["audit_high"]
@@ -2612,7 +2668,7 @@ def stats_history(days=30, granularity="day"):
                 ts = int(time.mktime(t_struct))
             except Exception:
                 ts = 0
-            result.append({
+            day_item = {
                 "ts": ts,
                 "label": d[5:],  # MM-DD
                 "day": d,
@@ -2621,7 +2677,11 @@ def stats_history(days=30, granularity="day"):
                 "tokens_completion": tk["completion"],
                 "audit_signals": ab["audit_signals"],
                 "audit_high": ab["audit_high"],
-            })
+            }
+            if tk.get("cache_read") or tk.get("cache_write"):
+                day_item["tokens_cache_read"] = tk.get("cache_read", 0)
+                day_item["tokens_cache_write"] = tk.get("cache_write", 0)
+            result.append(day_item)
     return {"ok": True, "granularity": granularity, "days": days, "data": result}
 
 
@@ -2784,6 +2844,11 @@ def _today_stats_legacy(now=None, day_start=None):
                 continue
             tokens["prompt"] += int(u.get("prompt_tokens") or 0)
             tokens["completion"] += int(u.get("completion_tokens") or 0)
+            cr = int(u.get("cache_read_tokens") or 0)
+            cw = int(u.get("cache_write_tokens") or 0)
+            if cr or cw:
+                tokens["cache_read"] = tokens.get("cache_read", 0) + cr
+                tokens["cache_write"] = tokens.get("cache_write", 0) + cw
     except Exception:
         pass
     return {
@@ -2861,20 +2926,27 @@ def stats_models(days=7, now=None):
     placeholders = ",".join("?" * len(days_list))
     with closing(_connect()) as conn:
         rows = conn.execute(
-            "SELECT model, SUM(requests) AS req, SUM(prompt) AS p, SUM(completion) AS c, SUM(errors) AS err "
+            "SELECT model, SUM(requests) AS req, SUM(prompt) AS p, SUM(completion) AS c, SUM(errors) AS err, "
+            "SUM(cache_read) AS cr, SUM(cache_write) AS cw "
             "FROM daily_models WHERE day IN (" + placeholders + ") GROUP BY model "
             "ORDER BY req DESC, err DESC, model",
             days_list,
         ).fetchall()
     out = []
-    for model, req, p, c, err in rows:
-        out.append({
+    for model, req, p, c, err, cr, cw in rows:
+        item = {
             "model": model,
             "requests": int(req or 0),
             "prompt": int(p or 0),
             "completion": int(c or 0),
             "errors": int(err or 0),
-        })
+        }
+        cr_val = int(cr or 0)
+        cw_val = int(cw or 0)
+        if cr_val or cw_val:
+            item["cache_read"] = cr_val
+            item["cache_write"] = cw_val
+        out.append(item)
     return out
 
 

@@ -32,9 +32,11 @@ import re
 import time
 import secrets
 import uuid
+import weakref
 from pathlib import Path
 from mitmproxy import http, ctx, exceptions
 from connection_policy import ConnectionGovernance, validate_connection_policy
+import upstream_retry as _upstream_retry
 from body_buffer import decode_body
 import inspection
 import onboarding
@@ -51,6 +53,8 @@ from shield_defaults import (
     KNOWN_PUBLIC_DNS,
     validate_command_regex,
     parse_egress_proxy,
+    egress_proxy_url,
+    is_true,
     extract_usage as _extract_usage,
 )
 from event_store import enqueue_event
@@ -69,8 +73,18 @@ _CONNECTION_STATS = {}
 _HEARTBEAT = {}
 _HEARTBEAT_TASK = None
 _METRICS_POOL = None
+_CONNECT_STALL = {}
+_CONNECT_KILL_TOTAL = {"killed": 0, "ambiguous": 0, "no_conn": 0, "no_task": 0}
 _MASK_CANCEL_BY_CLIENT = {}
 _MASK_WORK_CONTEXT = threading.local()
+
+# C1 上游传输接管：跨客户端共享的 httpx keep-alive 连接池。
+# sidecar 在 takeover=true 的上游首次出现时惰性启动，跑在 mitmproxy 事件循环上。
+_C1_SIDECAR = None
+_C1_SIDECAR_TASK = None
+# 启动失败后不再每条请求重试：一次失败要么来自配置（改完热重载会重置），
+# 要么来自端口（重试也不会好），而每条请求都付一次 import + 建池的代价不值。
+_C1_SIDECAR_FAILED = False
 
 
 class _ClientFlowCancelled(asyncio.CancelledError):
@@ -191,6 +205,69 @@ _DNS_FAILURE_HINTS = ("getaddrinfo", "name or service not known",
                       "nodename nor servname", "temporary failure in name resolution")
 _FAILURE_OWNERS = frozenset({"client", "dns", "proxy", "engine", "upstream"})
 
+# 上游静默在本机只有一个兜底：mitmproxy 的连接空闲看门狗 `tcp_timeout`
+# （12.2.3 默认 600 s，mitmproxy/options.py 的 add_option）。它 `on_timeout` 里
+# 取消的是**客户端**读任务（proxy/server.py:344-354），随后 mitmproxy 把这条
+# 连接上的失败写成 `Client disconnected.` —— 也就是说「上游首包后彻底没声」和
+# 「客户端主动挂断」在现场证据上一模一样，`_CLIENT_FAILURE_HINTS` 会把责任判给
+# client。2026-10-09 实测：当天 6 例 605~676 s 的 client_disconnected 只收到
+# 1~9 个数据块（最少 569 字节），全是这一类；另有 4 例 646~1066 s 是
+# 195~876 块的真·长生成，那种是客户端先放弃，判 client 没错。
+# 数字向库要而不写死：mitmproxy 升版改了默认值也不会对不上。
+try:  # pragma: no cover - 取决于 mitmproxy 是否可导入（单测环境可导入）
+    from mitmproxy.options import Options as _MxOptions
+    _UPSTREAM_INACTIVITY_BOUND_S = float(_MxOptions().tcp_timeout)
+except Exception:
+    _UPSTREAM_INACTIVITY_BOUND_S = 600.0
+# 看门狗到点即杀，实测误差在秒级；15 s 余量只为不把「我们自己打点的滞后」当成
+# 没到点。落进这个窗口的断开，无论谁先动的手，「上游已连续静默约 tcp_timeout
+# 秒」都是真话，而这句话对排查更有用（该查上游/链路，不是催客户端别急）。
+_UPSTREAM_IDLE_MARGIN_S = 15.0
+
+
+def _upstream_idle_seconds(flow, phase):
+    """响应流已开、上游连续静默了多久（秒）。前提不成立时返回 None。
+
+    阶段由调用方给（`_record_client_cancel` 的 `phase` 形参），不从 transport 快照
+    里再取一次：快照取不到时会退化成 `{"phase": "unknown"}`，拿它当判据等于让这条
+    归因在诊断链路自己出问题时静默失效。
+    前提：① `phase == "response_stream"`（响应头已到、流正在走）；② 有可比锚点
+    ——最后一次收到上游字节的时刻；一个字节都没收到时退回「请求即将出网」的时刻
+    （`shield_mask_done_at`），那种情况静默时长即上游首包超时。
+    """
+    if phase != "response_stream":
+        return None
+    md = getattr(flow, "metadata", None) or {}
+    anchor = md.get("shield_last_byte_at")
+    if anchor is None:
+        anchor = md.get("shield_mask_done_at")
+    if anchor is None:
+        return None
+    try:
+        return time.time() - float(anchor)
+    except (TypeError, ValueError):
+        return None
+
+
+def _upstream_idle_killed(flow, phase):
+    """这次失败是否该判成「上游静默被掐」。
+
+    判据只写这一处：`_flow_failure_owner` 与 `_record_client_cancel` 都要用，
+    各写一遍必然漂移（同 `_response_concluded` 的理由）。
+
+    两种来路，结论相同但确定度不同：
+    ① 引擎空闲闸主动落的刀（`_act_stream_idle` 在 flow 上留了 `shield_idle_killed`）——
+       动手的人是自己，不必反推，直接认定；
+    ② 没人动手却断了，且距最后一次上游字节已满 `tcp_timeout` —— 那是 mitmproxy 的
+       连接空闲看门狗掐掉了静默上游，文案却长成 `Client disconnected.`。
+    """
+    md = getattr(flow, "metadata", None) or {}
+    if md.get("shield_idle_killed") is not None:
+        return True
+    idle = _upstream_idle_seconds(flow, phase)
+    return (idle is not None
+            and idle >= _UPSTREAM_INACTIVITY_BOUND_S - _UPSTREAM_IDLE_MARGIN_S)
+
 
 def _flow_failure_owner(flow, raw):
     """判一次失败的**责任方**（见上方 `_FAILURE_OWNERS`）。只取已有事实，不猜。
@@ -200,6 +277,11 @@ def _flow_failure_owner(flow, raw):
     """
     low = (raw or "").lower()
     if any(h in low for h in _CLIENT_FAILURE_HINTS):
+        # 「客户端断开」有两种：真客户端，和上游静默到 `tcp_timeout` 被看门狗掐掉
+        # ——后者是 mitmproxy 取消了客户端读任务，文案才长成这样。
+        transport = (getattr(flow, "metadata", None) or {}).get("transport") or {}
+        if _upstream_idle_killed(flow, transport.get("phase")):
+            return "upstream"
         return "client"
     if any(h in low for h in _DNS_FAILURE_HINTS):
         return "dns"
@@ -255,14 +337,25 @@ def _record_client_cancel(flow, phase):
     detail, _raw = _flow_error_detail(flow)
     up_name = flow.metadata.get("shield_upstream") or (session or {}).get("upstream_name") or ""
     model = flow.metadata.get("shield_model") or (session or {}).get("model") or ""
+    reason = getattr(flow, "_shield_cancel_reason", "client_disconnected")
+    idle_s = _upstream_idle_seconds(flow, phase)
+    # CANCEL 的归因默认恒为 client（事件本身就是客户端断开）；`error_type` 仍然带上，
+    # 好把「SDK 超时」与「协议错」分开统计。唯一例外：上游静默到 `tcp_timeout` 被
+    # mitmproxy 的看门狗掐掉时，它取消的是客户端读任务、文案也是 `Client
+    # disconnected.`，此时判 client 等于把方向带偏（该查上游/链路，不是催客户端）。
+    # 只改 `client_disconnected` 这一种签名：`client_cancelled` 是我们真的看到了
+    # 客户端取消，不跟着翻案。
+    idle_killed = reason == "client_disconnected" and _upstream_idle_killed(flow, phase)
+    if idle_killed:
+        reason = "upstream_idle"
     _emit("CANCEL", sid=sid,
           host=getattr(req, "host", ""), method=getattr(req, "method", ""),
           path=str(getattr(req, "path", "")).split("?", 1)[0],
-          reason=getattr(flow, "_shield_cancel_reason", "client_disconnected"),
+          reason=reason,
           failure_phase=phase, transport=_transport_snapshot(flow),
-          # CANCEL 的归因恒为 client（事件本身就是客户端断开）；`error_type` 仍然带上，
-          # 好把「SDK 超时」与「协议错」分开统计。
-          failure_owner="client", error_type=_flow_error_type(flow),
+          failure_owner="upstream" if idle_killed else "client",
+          upstream_idle_s=(round(idle_s, 1) if idle_s is not None else None),
+          error_type=_flow_error_type(flow),
           msg="flow_error:" + detail, upstream=up_name, model=model, **source)
 
 
@@ -308,12 +401,74 @@ def configure(updated):
         raise exceptions.OptionsError("Maskit requires stream_large_bodies to remain unset")
 
 
+def _hop_task_candidates(tasks, address, peername):
+    """The mitmproxy task(s) establishing exactly this hop.
+
+    mitmproxy names them ``server connection handler <address>`` and tags the task with
+    the owning client peername (`utils/asyncio_utils.set_task_debug_info`), so this
+    resolves the hop from outside without holding any mitmproxy object. Anything but
+    exactly one hit is left alone: a *second* handshake to the same address from the
+    same client connection is a fact we do not have, and guessing would kill a healthy
+    request. A rename upstream degrades to "no match" = today's behaviour, not to a
+    wrong cancel.
+    """
+    want = f"server connection handler {address}"
+    return [task for task in tasks
+            if task.get_name() == want and getattr(task, "client", None) == peername
+            and not task.done()]
+
+
+def _act_handshake_kills(stalled):
+    """Bound a pre-send handshake by cancelling exactly the task that owns that hop.
+
+    mitmproxy's `open_connection` catches the resulting CancelledError, records
+    `connection.error`, fires `server_connect_error` and completes the command with the
+    error, so the flow dies through mitmproxy's own path and the client gets a clean 502
+    instead of a 127 s silence. We never fabricate a response here: nothing was sent
+    upstream, so nothing unscanned or un-restored is being passed on.
+
+    `stalled` is per hop (see `ConnectionGovernance.stalled_before_send`), which is also
+    how the flows sharing a pending connection die: together, via mitmproxy, once.
+    """
+    counters = {"killed": 0, "ambiguous": 0, "no_conn": 0, "no_task": 0}
+    if not _CONNECT_KILL or not stalled:
+        return counters
+    tasks = list(asyncio.all_tasks())
+    for conn_id, _phase, address, peer in stalled:
+        if not address or not peer:
+            counters["no_conn"] += 1
+            continue
+        if not _CONNECTIONS.claim_handshake_kill(conn_id):
+            continue
+        hits = _hop_task_candidates(tasks, address, peer)
+        if len(hits) > 1:
+            counters["ambiguous"] += 1
+        elif not hits:
+            counters["no_task"] += 1
+        else:
+            hits[0].cancel()
+            _CONNECTIONS.confirm_handshake_kill(conn_id)
+            counters["killed"] += 1
+    return counters
+
+
 async def _heartbeat_loop():
-    global _CONNECTION_STATS, _HEARTBEAT
+    global _CONNECTION_STATS, _HEARTBEAT, _CONNECT_STALL
     loop = asyncio.get_running_loop()
     expected = loop.time()
     while True:
         _CONNECTION_STATS = _CONNECTIONS.stats()
+        # 只能在事件循环上算：_flows/_connections 由循环独占，metrics 线程读它会竞态。
+        stalled = _CONNECTIONS.stalled_before_send(_CONNECT_STALL_S)
+        for key, value in _act_handshake_kills(stalled).items():
+            _CONNECT_KILL_TOTAL[key] += value
+        # 响应流空闲闸：同一把刀，砍在另一个阶段（首包之后的静默，见 `_act_stream_idle`）
+        for key, value in _act_stream_idle().items():
+            _STREAM_IDLE_TOTAL[key] += value
+        _CONNECT_STALL = {
+            "stalled": len(stalled),
+            "phases": sorted({phase for _conn, phase, _addr, _peer in stalled}),
+        }
         _HEARTBEAT = {"generated_at": int(time.time()),
                       "loop_lag_ms": round(max(0, loop.time() - expected) * 1000, 2)}
         # Only one queued write; never use the DNS/default executor or block the loop.
@@ -332,8 +487,217 @@ def running():
     _HEARTBEAT_TASK = asyncio.get_running_loop().create_task(_heartbeat_loop())
 
 
+def _c1_any_takeover_enabled():
+    """检查是否有上游开启了 takeover。"""
+    try:
+        for up in UPSTREAMS:
+            if is_true(up.get("takeover")):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _c1_egress_proxy_url(settings):
+    """从 `_read_settings()` 的结果里取出口代理 URL（httpx 要文本，不是 ServerSpec）。
+
+    只是 `shield_defaults.egress_proxy_url` 的一层薄封装——形状判据归它，本函数只负责
+    从设置字典里挑出那个键。为什么要有这一层：见 `egress_proxy_url` 的 docstring
+    （sidecar 第一版照 config.json 的形状读元组，`start()` 当场 AttributeError）。
+    """
+    return egress_proxy_url((settings or {}).get("egress_proxy"))
+
+
+async def _c1_ensure_started():
+    """惰性启动 C1 sidecar（在 request hook 的 async 上下文里调用）。
+
+    sidecar 只在至少一个上游开启了 takeover 时才启动。
+    首次调用会 await 启动完成；后续调用是 no-op。
+
+    **启动失败绝不让请求跟着炸**：takeover 是「换一条更快的路」，不是「不提供服务的
+    前提」。失败就把 sidecar 摘掉、置起 `_C1_SIDECAR_FAILED` 并记一条日志，本次以及
+    后续请求都退回原直连路径（= 这个特性还没上线时的行为）。
+    """
+    global _C1_SIDECAR, _C1_SIDECAR_TASK, _C1_SIDECAR_FAILED
+    if _C1_SIDECAR is not None or _C1_SIDECAR_FAILED:
+        return
+    if not _c1_any_takeover_enabled():
+        return
+    if _C1_SIDECAR_TASK is not None:
+        # 并发请求：等在建的这一次。失败已由发起方处理，这里只负责不被异常带走。
+        try:
+            await _C1_SIDECAR_TASK
+        except Exception:
+            pass
+        return
+    try:
+        from upstream_sidecar import UpstreamSidecar
+    except Exception as e:
+        _C1_SIDECAR_FAILED = True
+        _log("[C1] 导入 upstream_sidecar 失败（%s）：takeover 已配置但不生效，"
+             "退回直连。打包态缺模块属构建事故，见 tests/test_engine_packaging.py" % e)
+        return
+    sidecar = UpstreamSidecar(_read_settings() or {})
+    task = asyncio.get_running_loop().create_task(sidecar.start())
+    _C1_SIDECAR_TASK = task
+    try:
+        await task
+    except Exception as e:
+        _C1_SIDECAR_TASK = None
+        _C1_SIDECAR_FAILED = True
+        _retire_sidecar(sidecar)
+        # 归因写全：用户只看到「开关开了但没加速」时，这句话是唯一线索。
+        _log("[C1] sidecar 启动失败（%s: %s）：退回直连路径，"
+             "配置热重载后可重试" % (type(e).__name__, e))
+        return
+    _C1_SIDECAR_TASK = None
+    _C1_SIDECAR = sidecar
+    _log("[C1] sidecar started on port %d (httpx cross-client keep-alive pool)" % sidecar.port)
+
+
+def _retire_sidecar(sidecar):
+    """尽力释放一个没启用成功/已被换下的 sidecar（连接池、监听套接字）。"""
+    if sidecar is None:
+        return
+    try:
+        asyncio.get_running_loop().create_task(sidecar.stop())
+    except RuntimeError:
+        pass
+    except Exception:
+        pass
+
+
+def _c1_stop():
+    """同步关闭 C1 sidecar（在 done() 里调用）。"""
+    global _C1_SIDECAR, _C1_SIDECAR_TASK, _C1_SIDECAR_FAILED
+    if _C1_SIDECAR_TASK is not None:
+        _C1_SIDECAR_TASK.cancel()
+        _C1_SIDECAR_TASK = None
+    if _C1_SIDECAR is not None:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(_C1_SIDECAR.stop())
+        else:
+            asyncio.run(_C1_SIDECAR.stop())
+        _C1_SIDECAR = None
+    _C1_SIDECAR_FAILED = False
+
+
+def _c1_expected_origins():
+    """当前路由表声明的上游 origin 集合（= sidecar 白名单应有的内容）。
+
+    与 sidecar 同源（共用 `upstream_sidecar.allowed_origins_for`），读的是热重载后刚
+    发布的 `UPSTREAMS`——与 `_c1_any_takeover_enabled()` 同一份表，避免“按 A 判要不要
+    接管、按 B 判白名单”这种判据分裂。模块缺失时返回 None：那时 sidecar 也起不来，
+    属于另一条已归因的失败路径（`_c1_ensure_started` 会记日志）。
+    """
+    try:
+        from upstream_sidecar import allowed_origins_for
+    except Exception:
+        return None
+    try:
+        return allowed_origins_for(UPSTREAMS)
+    except Exception:
+        return None
+
+
+def _c1_reconcile(settings):
+    """配置热重载后让 sidecar 与配置对齐。
+
+    不处理就会留下三种「面板说了不算」的状态（②见 2026-10-10 审计，③见 2026-10-13）：
+    ① 用户把 takeover 全关掉——监听与连接池照旧在跑，面板开关和真实数据路径解耦；
+    ② 用户改了出口代理——sidecar 在**构造时**就把 egress 读进了 httpx 客户端，
+       热重载不重读，等于「改了代理但转发照旧」，且没有任何提示；
+    ③ 用户改了上游 target——白名单同样是构造时定型的：热重载不重算，新 origin 就
+       不在白名单里，而 sidecar 对白名单外的 origin 是 **403 拒转**，不是「启动失败」
+       那条会退回直连的路径，于是没有任何回退、也没有提示，用户只看到「开关开着、
+       请求全挂」。比对用**全量 target** 而不是「仅接管中的 target」：白名单本来就是
+       全量构建的，而且用户可能先改 target、随后才给该上游开 takeover——只比接管
+       子集的话，后一步不会触发换代，新 origin 照样 403。
+    这里只负责「摘下来交给循环去关」；重建由下一条请求的 `_c1_ensure_started()`
+    按新配置惰性完成（`_C1_SIDECAR_FAILED` 一并清零，好让此前失败的配置改完能重试）。
+    """
+    global _C1_SIDECAR, _C1_SIDECAR_TASK, _C1_SIDECAR_FAILED
+    if _C1_SIDECAR is None:
+        _C1_SIDECAR_FAILED = False
+        return
+    # 三条判据各自独立归因：只写「配置已变更」的话，用户拿不到「为什么这次要换代」。
+    why = []
+    if not _c1_any_takeover_enabled():
+        why.append("接管已全部关闭")
+    if _c1_egress_proxy_url(settings) != _C1_SIDECAR.egress_url:
+        why.append("出口代理 %s -> %s" % (_C1_SIDECAR.egress_url or "off",
+                                          _c1_egress_proxy_url(settings) or "off"))
+    expected = _c1_expected_origins()
+    if expected is not None and expected != _C1_SIDECAR.allowed_origins:
+        why.append("上游白名单 +[%s] -[%s]" % (
+            ",".join(sorted(expected - _C1_SIDECAR.allowed_origins)[:3]) or "-",
+            ",".join(sorted(_C1_SIDECAR.allowed_origins - expected)[:3]) or "-"))
+    if not why:
+        return
+    old, _C1_SIDECAR = _C1_SIDECAR, None
+    _C1_SIDECAR_TASK = None
+    _C1_SIDECAR_FAILED = False
+    _log("[C1] 配置已变更（%s）：停用旧连接池，下一条请求按新配置重建" % "；".join(why))
+    _retire_sidecar(old)
+
+
+def _upstream_host_of(flow):
+    """这条 flow 的**真实上游** host（不是 mitmproxy 实际连的那个）。
+
+    takeover 把 `flow.request.host` 改成了环回 sidecar，而下游四类判据
+    （`is_target` / `STREAM_EXCLUDE_HOSTS` / 事件里的 host 字段 / 日志）要的是
+    真实上游域名——照 `request.host` 读会把「排除某域名不流式」这类配置整个失效。
+    """
+    md = getattr(flow, "metadata", None) or {}
+    real = md.get("shield_upstream_host")
+    if real:
+        return real
+    return getattr(flow.request, "host", None) or flow.request.pretty_host
+
+
+def _c1_apply_takeover(flow, up, path):
+    """在 apply_reverse_routing 里调用：takeover=true 且 sidecar 就绪时改写到 sidecar。
+
+    返回改写后的最终请求路径（含上游 target 的路径前缀），未接管时返回 None。
+
+    `X-Maskit-Upstream` 只带 **origin**（scheme://host:port），路径前缀与 query 由
+    这里用 `_merge_path_and_query` 拼进 `flow.request.path`——与非接管路径**同一份**
+    拼接逻辑。第一版把 target 整串塞进头里、又不拼前缀，于是 sidecar 的
+    `upstream_url + path` 对 `https://…/v1` 这类 target 会拼出 `/v1/v1/…`，
+    而 target 上的 `?api-version=` 参数会整个丢掉（Azure 式上游必挂）。
+    """
+    if not is_true(up.get("takeover")) or _C1_SIDECAR is None or not _C1_SIDECAR.is_running:
+        return None
+    try:
+        host, port, scheme, path_prefix, query_prefix = _parse_upstream_target(up["target"])
+        if not host:
+            return None
+        final = _merge_path_and_query(path_prefix, query_prefix, path)
+        flow.request.host = "127.0.0.1"
+        flow.request.port = _C1_SIDECAR.port
+        flow.request.scheme = "http"
+        flow.request.path = final
+        flow.request.headers["Host"] = "127.0.0.1:%d" % _C1_SIDECAR.port
+        flow.request.headers["X-Maskit-Upstream"] = "%s://%s:%d" % (scheme, host, port)
+        flow.request.headers["X-Maskit-Upstream-Name"] = up.get("name", "")
+        # 告诉 sidecar 是否走出口代理（sidecar 自己管，避免 mitmproxy 把本地连接也代理了）
+        if is_true(up.get("use_proxy")):
+            flow.request.headers["X-Maskit-Use-Proxy"] = "true"
+            flow.metadata["shield_via_proxy"] = True
+        # 真实上游域名留给下游判据（见 `_upstream_host_of`）
+        flow.metadata["shield_upstream_host"] = host
+        flow.metadata["shield_takeover"] = True
+        return final
+    except Exception as e:
+        # 改写失败不影响转发：退回原直连路径，但必须留痕，否则「没加速」无从归因
+        _log("[C1] 接管改写失败（%s: %s）：本条走直连" % (type(e).__name__, e))
+        return None
+
+
 def done():
     global _HEARTBEAT_TASK, _METRICS_POOL
+    _c1_stop()
     if _HEARTBEAT_TASK is not None:
         _HEARTBEAT_TASK.cancel()
         _HEARTBEAT_TASK = None
@@ -768,6 +1132,21 @@ def _env_float(name, default):
         return float(raw)
     except ValueError:
         return float(default)
+
+
+def _connect_budget(value):
+    """握手预算的口径：`0`（或负数）= 关闸只观测，正数夹到 5 s 下限。
+
+    下限的存在是因为这条预算会真的落刀：设成 1 s 会把「健康但慢」的握手（家里实测
+    最坏一次成功 13.1 s）一起掐掉，等于自己造故障。
+    """
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        seconds = 20.0
+    if seconds != seconds:  # NaN
+        seconds = 20.0
+    return 0.0 if seconds <= 0 else max(5.0, seconds)
 
 
 # 环境变量兜底（容器场景无法开面板时用）；config.json 里的值优先于它们。
@@ -2289,6 +2668,7 @@ def _warmup_recent_from_db():
         # 旧 token 直接不登记，天然不产生 REV/后缀索引孤儿。
         seen_orig = set()
         collected = []
+        issued = set()
         for (payload_str,) in rows:
             try:
                 p = json.loads(payload_str)
@@ -2296,10 +2676,16 @@ def _warmup_recent_from_db():
                     tok = it.get("tok")
                     orig = it.get("original")
                     label = it.get("label") or ""
-                    if not tok or not orig or not _PLACEHOLDER_RX.match(tok):
+                    if not tok or not _PLACEHOLDER_RX.match(tok):
                         continue
-                    # 过滤凭据类与占位符自身
-                    if label in CREDENTIAL_LABELS or _PLACEHOLDER_RX.match(orig):
+                    # 签发台账先登记：凭据类在库里没有 original（只有 digest+preview），
+                    # 会被下面的映射恢复过滤掉，但它同样是「本机签发过」的后缀——
+                    # 不登记的话，凭据类一旦映射丢失就会被误判成「外来占位符」，
+                    # 恰好把最该告警的那一类静默掉。
+                    sfx = _token_suffix(tok)
+                    if sfx:
+                        issued.add(sfx)
+                    if not orig or label in CREDENTIAL_LABELS or _PLACEHOLDER_RX.match(orig):
                         continue
                     if orig in seen_orig:
                         continue
@@ -2312,6 +2698,8 @@ def _warmup_recent_from_db():
         # 曾按倒序直接写入：恢复 >2000 条时反而把最新的映射先删掉，重启后
         # 活跃会话最需要的占位符还原命中率倒挂（审计 P2）。
         with _STATE_LOCK:
+            for sfx in issued:
+                _note_issued_suffix(sfx)
             for tok, orig, label in reversed(collected):
                 _RECENT_FWD[orig] = [tok, label, now]
                 _RECENT_REV[tok] = [orig, label, now]
@@ -2738,6 +3126,14 @@ def apply_reverse_routing(flow):
     port = _listener_port(flow)
     up = _match_upstream_by_port(port)
     if up:
+        # C1 接管：takeover=true 时改写到 sidecar，跳过原上游直连
+        takeover_final = _c1_apply_takeover(flow, up, path)
+        if takeover_final is not None:
+            try:
+                flow.request.path = takeover_final
+            except Exception:
+                pass
+            return up, takeover_final
         host, up_port, scheme, path_prefix, query_prefix = _parse_upstream_target(up["target"])
         try:
             flow.request.host = host
@@ -2756,6 +3152,14 @@ def apply_reverse_routing(flow):
     up, stripped = _match_upstream(path)
     if not up:
         return None, path
+    # C1 接管（单端口模式）：stripped 已去掉 base_path，前缀由 sidecar 头里的 origin 补
+    takeover_final = _c1_apply_takeover(flow, up, stripped)
+    if takeover_final is not None:
+        try:
+            flow.request.path = takeover_final
+        except Exception:
+            pass
+        return up, takeover_final
     host, up_port, scheme, path_prefix, query_prefix = _parse_upstream_target(up["target"])
     try:
         flow.request.host = host
@@ -3063,6 +3467,9 @@ def _apply_egress_proxy(flow, upstream):
     仅 reverse 模式生效；explicit 模式另有 `--mode upstream:` 机制，不在此处理。
     """
     if not EGRESS_PROXY or not isinstance(upstream, dict) or not upstream.get("use_proxy"):
+        return
+    # takeover 模式：出口代理由 sidecar 处理，mitmproxy 只需直连本地 sidecar
+    if upstream.get("takeover") and _C1_SIDECAR is not None and _C1_SIDECAR.is_running:
         return
     try:
         flow.server_conn.via = EGRESS_PROXY
@@ -3822,7 +4229,9 @@ _BRACED_PLACEHOLDER_RX = re.compile(
 # 严格正则匹配不到 → 整个还原被跳过 → 用户拿到一个假 token 去执行。
 #
 # 这条只做兜底修复，且**只替换我们自己发过的 token**（必须能在会话/复用表里查到），
-# 所以不存在误伤：LABEL_后缀 这种组合（6 位纯辅音或存量 hex6）正常文本里不会自然出现，何况还要求查得到。
+# 所以替换面上不存在误伤。但「LABEL_后缀 正常文本不会自然出现」只对**带花括号**形态成立：
+# 无花括号的裸 hex6 形态会被日期串/短哈希命中（2026-10-13 真机实测），
+# 替换查不到时原样放行，**计数**面上裸 hex6 已单独收紧（判据见 `_loose_sub`）。
 _LOOSE_PLACEHOLDER_RX = re.compile(
     r"\{{1,2}\s*([A-Za-z0-9_]{1,12}_" + _SUFFIX_PAT + r")\s*\}{0,2}|([A-Z0-9]{1,12}_" + _SUFFIX_PAT + r")"
 )
@@ -3941,6 +4350,55 @@ def _suffix_indexable(suffix):
     return len(suffix) == 6 and all(c in _TOKEN_ALPHABET for c in suffix)
 
 
+# ── 已签发后缀台账：把「映射丢了」与「压根不是本机签的」分开 ──────────────
+#
+# 解决什么（真机事件库实测）：面板上的「还原失败」把两类东西混进同一个数字——
+#   · 本机签发过、但映射已丢（复用表淘汰 / 会话被扫 / 重启后没预热回来）：
+#     这是**真的要排查**的还原失败；
+#   · 从未由本机签发过的占位符形态字符串：客户端历史里携带的外来 token、
+#     对话里写的文档示例（后缀清一色同一个字母那种）、模型自己编的。本机无论
+#     如何都还原不了它们，算成「还原失败」只会让指标长期虚高——实测当天 4 条
+#     未还原里 0 条属于前者，15 条历史共 69 个样本 0 个命中已签发集合。
+#
+# 台账只存 6 位后缀本身（随机指纹），不含原文、不含标签，也不落盘：
+# 启动时由 `_warmup_recent_from_db` 从事件库预热（与复用表同一份来源），运行期由
+# `_suffix_index_add` 增量登记。因此它的语义是「**本机近期签发过**」——超出事件库
+# 保留期/预热窗口的老 token 会落到「外来」一侧，而那时它们的映射本来也早已不可还原。
+_ISSUED_SUFFIXES = {}          # suffix -> 登记时刻（dict 保插入序，封顶时按序淘汰）
+_ISSUED_SUFFIXES_MAX = 200000  # 内存上界；正常用量（7 天约 700 条）远够
+
+
+def _note_issued_suffix(suffix):
+    """登记「本机签发过这个后缀」。调用方必须已持 `_STATE_LOCK`。
+
+    封顶后按登记顺序淘汰最老的一批：判据退化成「近期签发过」，老 token 落到
+    「外来」一侧——这与事实相符（那时它们的映射早已过了 TTL，本来就还原不回来）。
+    """
+    sfx = str(suffix or "").lower()
+    if len(sfx) != 6:
+        return
+    if sfx in _ISSUED_SUFFIXES:
+        _ISSUED_SUFFIXES[sfx] = time.time()
+        return
+    if len(_ISSUED_SUFFIXES) >= _ISSUED_SUFFIXES_MAX:
+        for _ in range(max(1, _ISSUED_SUFFIXES_MAX // 10)):
+            _ISSUED_SUFFIXES.pop(next(iter(_ISSUED_SUFFIXES)), None)
+    _ISSUED_SUFFIXES[sfx] = time.time()
+
+
+def _issued_suffix(suffix):
+    """该后缀是否由本机签发过。
+
+    自带 `_STATE_LOCK`（RLock，可重入）：热路径调用点已在锁内，而
+    `_count_orphans_without_session` 这类计数路径在锁外，统一由本函数持锁。
+    """
+    sfx = str(suffix or "").lower()
+    if not sfx:
+        return False
+    with _STATE_LOCK:
+        return sfx in _ISSUED_SUFFIXES
+
+
 def _suffix_index_add(token):
     """登记后缀索引。**撞车即置为不可用，绝不覆盖、也绝不保留其一。**
 
@@ -3961,6 +4419,9 @@ def _suffix_index_add(token):
         return
     tables = _tables()
     with _STATE_LOCK:
+        # 签发台账与后缀索引同处一个临界区：判据读的就是这里写进去的东西，
+        # 分开加锁会让「刚签发的 token 立刻被判定为外来」出现窗口。
+        _note_issued_suffix(sfx)
         cur = tables.suffix.get(sfx)
         if cur is None:
             tables.suffix[sfx] = token
@@ -4994,8 +5455,7 @@ def restore(text, sid, channel="", escape=False, final=False):
             # 能走到这里说明外层**已判定为双花括号占位符形态**，计数不会误伤：
             # 后缀是 6 位 hex 或 6 位纯辅音，普通文本不会自然出现 `{{ word_abcdfg }}`。
             with _STATE_LOCK:      # B-1a ②
-                s["unresolved"] = s.get("unresolved", 0) + 1
-                _record_unresolved_sample(s, whole)
+                _note_unresolved_token(s, whole, suffix)
             return whole
         with _STATE_LOCK:          # B-1a ②：计数 + 集合去重追加必须一起进锁
             s["restored"] = s.get("restored", 0) + 1
@@ -5032,8 +5492,7 @@ def restore(text, sid, channel="", escape=False, final=False):
                 # 判据用「整段里有没有反斜杠」最直白，也与该遍的语义严格一致。
                 if "\\" in whole:
                     with _STATE_LOCK:      # B-1a ②
-                        s["unresolved"] = s.get("unresolved", 0) + 1
-                        _record_unresolved_sample(s, whole)
+                        _note_unresolved_token(s, whole, m.group(2))
                 return whole
             with _STATE_LOCK:              # B-1a ②
                 s["restored"] = s.get("restored", 0) + 1
@@ -5067,22 +5526,40 @@ def restore(text, sid, channel="", escape=False, final=False):
                 if real is not None:
                     orig = _lookup(real, sid)
             if orig is None:
-                # 这一遍的形态判据（`_LOOSE_PLACEHOLDER_RX`）本身就要求
-                # `LABEL_` + 6 位 hex 或 6 位纯辅音后缀——注释里已论证过
-                # 「这种组合正常文本里不会自然出现」，与替换判据同源，
-                # 所以查不到时同样计数，不会因为「怕是残片」就把漏还原藏起来。
+                # 这一遍的形态判据（`_LOOSE_PLACEHOLDER_RX`）要求
+                # `LABEL_` + 6 位 hex 或 6 位纯辅音后缀。原注释断言
+                # 「这种组合正常文本里不会自然出现」——**已被真机事件库证伪**
+                # （2026-10-13）：`desktop-backup-20261013_171839` 这类备份目录名、
+                # `262Z_01a11b` 这类标识片段，都能被**不带花括号的第二分支**整段
+                # 吃下，查表必然失败，于是每次都被计成 unresolved（当天十余条
+                # 「未还原」全是这种误报，屏幕上本来就是完全正常的日期文本）。
                 #
-                # ⚠️ 唯一例外：前一字符是反斜杠 → 这是 `\{\{X\}\}` 的**内部片段**
+                # 计数判据因此收紧（**只改计数，替换判据不动**——查得到原文的
+                # 仍照常还原，见函数头）：
+                #   · 裸形态（无任何花括号）且后缀全是存量 hex 字符 → 不计数。
+                #     日期/时间戳/短哈希天然是 hex6，自然文本的误报面全在这里；
+                #   · 带或半带花括号（`{{X}}` / `{{X`）→ 仍计数：形态本身就说明
+                #     模型在写占位符，漏还原必须可见；
+                #   · 纯辅音后缀（新格式）→ 仍计数：辅音表不含 aeiou 与数字，
+                #     自然文本几乎不出现，命中即真。
+                # 漏计面：模型剥花括号 + 映射丢失 + 存量 hex6 三者同时成立时不再
+                # 计数（极罕见；且原样放行不猜的行为不变）——方向保守，优先消除误报。
+                #
+                # ⚠️ 另一个例外：前一字符是反斜杠 → 这是 `\{\{X\}\}` 的**内部片段**
                 # （本遍的 `\{{1,2}` 会从转义块的第 2 个 `{` 开始匹配），上一遍已
                 # 处理并计数过；不排除就会把转义形态计两次（实测报成 2，样本里
                 # 同时留下 `\{\{X\}\}` 与 `{X}` 两条）。
                 # **只能在计数上排除，不能提前 return**：提前 return 会连
                 # 「该片段其实查得到原文、本该被还原」的情况一起跳过——
                 # 实测这一版直接把 test_t7 打红（响应里该有的还原没了）。
-                if not (m.start() > 0 and m.string[m.start() - 1] == "\\"):
+                bare_legacy = (
+                    m.group(2) is not None
+                    and all(ch in "0123456789abcdef" for ch in tok_body.rsplit("_", 1)[-1])
+                )
+                if (not (m.start() > 0 and m.string[m.start() - 1] == "\\")
+                        and not bare_legacy):
                     with _STATE_LOCK:      # B-1a ②
-                        s["unresolved"] = s.get("unresolved", 0) + 1
-                        _record_unresolved_sample(s, whole)
+                        _note_unresolved_token(s, whole, tok_body.rsplit("_", 1)[-1])
                 return whole
             with _STATE_LOCK:              # B-1a ②
                 s["restored"] = s.get("restored", 0) + 1
@@ -5479,6 +5956,27 @@ _JSON_STR_KEYS = {"arguments", "partial_json"}
 _RESTORE_MAX_DEPTH = 24
 
 
+def _note_restore_signed_skip(sid):
+    """记一次「响应侧按协议契约不还原的块」。
+
+    与请求侧的 `_note_signed_block_skip` 对称：那边记「该块没扫描」，这边记
+    「该块没还原」。两者都是**显式豁免的漏检/漏还原路径**，静默就等于用户以为
+    处理过了（请求侧踩过同一个坑：豁免无计数时，屏幕上可见与统计完全脱节）。
+
+    计数按「块」而非「增量事件」：完整块（非流式）与块起始快照（SSE 的
+    `content_block_start`）各计 1，`thinking_delta` 这类块内增量不重复计——
+    否则一个几千字的思考块会报出几百次。OpenRouter 流式把 `reasoning.text` /
+    `reasoning.encrypted` 直接作为增量数组元素下发（元素自身看不出是增量），
+    那里会按元素计，口径同样是「跳过的对象数」，不追求跨协议完全一致的块粒度。
+
+    只累加在会话上、由 RESTORE 事件读取；取不到会话时不记
+    （探测/单测路径不能因此抛异常）。
+    """
+    s = _session_get(sid)
+    if isinstance(s, dict):
+        s["restore_signed_skipped"] = int(s.get("restore_signed_skipped") or 0) + 1
+
+
 def _count_unresolved(sid, n=1):
     """会话级 unresolved 计数（与 restore() 维护同一字段，只用于诊断展示）。"""
     s = _session_get(sid)
@@ -5489,7 +5987,7 @@ def _count_unresolved(sid, n=1):
             pass
 
 
-# 未还原占位符的样本留存上限。只留形态（token 本身是占位符，不含任何明文），
+# 未还原占位符的样本留存上限。只留形态（token 本身是占位符，不含任何原文），
 # 落库安全；上限压到 5 是为了不让长响应把 payload 撑大。
 _UNRESOLVED_SAMPLES_MAX = 5
 
@@ -5518,6 +6016,102 @@ def _record_unresolved_sample(s, tok):
         pass
 
 
+# 「回显但未还原」的后缀集合上限。
+# 只用于 RESTORE 明细的三态展示：item 最多 30 条，200 足够；
+# 封顶是为了不让超长响应把会话内存撑大（模型可以自造大量后缀）。
+_UNRESOLVED_ECHO_MAX = 200
+
+
+def _note_unresolved_echo(s, suffix):
+    """记录「模型回显了但没还原」的占位符后缀（仅用于诊断展示）。
+
+    为什么需要它：RESTORE 明细里每个签发过的占位符只有二元标记 `restored`，
+    「模型压根没提」（正常）与「模型回显了但映射丢失」（要排查）在前端看起来
+    完全一样——用户以为「又没还原」，实际多数只是模型没用上那个实体。
+    后缀集合让前端能分出第三个状态（见 EventDetailDialog 的 unresolvedEcho）。
+
+    只做诊断、不参与任何还原决策；集合大小封顶，异常一律吞掉。
+    调用点必须在 `_STATE_LOCK` 内（与 unresolved 计数同一临界区）。
+    """
+    try:
+        if not suffix:
+            return
+        cur = s.get("unresolved_suffixes")
+        if not isinstance(cur, set):
+            cur = s["unresolved_suffixes"] = set()
+        if len(cur) < _UNRESOLVED_ECHO_MAX:
+            cur.add(str(suffix).lower())
+    except Exception:
+        pass
+
+
+# 外来占位符的样本留存上限（同 `_UNRESOLVED_SAMPLES_MAX`，理由相同）。
+_FOREIGN_SAMPLES_MAX = 5
+
+
+def _record_sample_into(s, key, cap, tok):
+    """往会话的某个样本列表里追加一条占位符形态样本（只做诊断）。
+
+    `unresolved_samples` 与 `foreign_samples` 的存储规则完全一致，只有列表名与
+    上限不同；抽出来是为了让两边不会各自飘移（样本里存的都是占位符本身，
+    不含原文，落库安全）。
+    """
+    try:
+        lst = s.get(key)
+        if not isinstance(lst, list):
+            lst = s[key] = []
+        if len(lst) < cap and tok not in lst:
+            lst.append(tok)
+    except Exception:
+        pass
+
+
+def _record_unresolved_sample(s, tok):
+    """留存几个「查不到原文」的占位符样本，供事件详情弹窗定位。
+
+    为什么必须留：`unresolved` 原先只有一个计数，用户看到「未还原 7」却无从知道
+    是哪些 token、什么形态。而这两种情况的处置完全不同，光看计数分不出来：
+
+    - 形态正常（`{{EMAIL_abcdfg}}`）→ 引擎表里真的没有它：引擎重启后
+      **凭据类永远不会被 `_warmup_recent_from_db` 预热**（库里只有 digest+preview，
+      红线 4），或是复用表 TTL 过期 / 会话被 sweep 掉；
+    - 形态被改写（`{{ email_abcdfg }}`、小写标签、剥掉花括号）→ 模型在动输出格式，
+      是「哪天彻底还原不回来」的前兆。
+
+    只做诊断，不参与任何还原决策，异常一律吞掉。
+    """
+    _record_sample_into(s, "unresolved_samples", _UNRESOLVED_SAMPLES_MAX, tok)
+
+
+def _record_foreign_sample(s, tok):
+    """留存几个「非本机签发」的占位符样本（`foreign_samples`）。
+
+    与 `unresolved_samples` 的区别只在来源：那个列表里的后缀本机签发过、映射
+    丢了；这个列表里的后缀从未由本机签发过（客户端历史携带的外来 token、
+    对话里写的文档示例、模型自己编的），本机无论如何都还原不了。
+    """
+    _record_sample_into(s, "foreign_samples", _FOREIGN_SAMPLES_MAX, tok)
+
+
+def _note_unresolved_token(s, whole, suffix):
+    """占位符查不到原文时的记账：分出「映射丢了」与「压根不是本机签的」。
+
+    调用方必须已持 `_STATE_LOCK`（与 unresolved 计数同一临界区）。
+    返回 True 表示这是本机签发过的 token（真·映射丢失，要排查）。
+
+    **只影响计数与告警，不影响替换行为**：两条分支都原样返回占位符、绝不猜原文
+    （那是 `_lookup` 的既定安全边界，与本次改动无关）。
+    """
+    if _issued_suffix(suffix):
+        s["unresolved"] = int(s.get("unresolved") or 0) + 1
+        _record_unresolved_sample(s, whole)
+        _note_unresolved_echo(s, suffix)
+        return True
+    s["foreign"] = int(s.get("foreign") or 0) + 1
+    _record_foreign_sample(s, whole)
+    return False
+
+
 # ── 会话不存在时的孤儿计数兜底表 ──────────────────────────────────────────
 # sid -> [count, [样本...], ts]
 #
@@ -5531,7 +6125,7 @@ def _record_unresolved_sample(s, tok):
 # 屏幕上一堆未还原，事件页只有一条 `unresolved=1`，用户直接质疑统计造假。
 #
 # 于是这里**只计数、不还原**：数出文本里有几个占位符形态，留给
-# `/api/ext/restore` 合并进 RESTORE 事件。样本只存占位符本身，不含任何明文。
+# `/api/ext/restore` 合并进 RESTORE 事件。样本只存占位符本身，不含任何原文。
 _NO_SESSION_ORPHANS = {}
 _NO_SESSION_ORPHANS_MAX = 256
 
@@ -5543,15 +6137,26 @@ def _count_orphans_without_session(sid, text):
     这是页面上最显眼、也是模型原样吐回时最常见的形态；裸 token / 单花括号
     在本遍不做统计，避免把正文里的普通标识符算进来（那属于宽松遍的判据，
     它需要会话上下文来区分残片）。
+
+    计数按来源分开（与 `_note_unresolved_token` 同口径）：会话不存在时两种都会
+    命中，但「本机签发过」才值得告警，外来/示例占位符只做留痕。
     """
     try:
         n = 0
         samples = []
+        foreign = 0
+        foreign_samples = []
         for m in _BRACED_PLACEHOLDER_RX.finditer(text):
-            n += 1
-            if len(samples) < _UNRESOLVED_SAMPLES_MAX:
-                samples.append(m.group(0))
-        if n <= 0:
+            whole = m.group(0)
+            if _issued_suffix(m.group(2)):
+                n += 1
+                if len(samples) < _UNRESOLVED_SAMPLES_MAX:
+                    samples.append(whole)
+            else:
+                foreign += 1
+                if len(foreign_samples) < _FOREIGN_SAMPLES_MAX:
+                    foreign_samples.append(whole)
+        if n <= 0 and foreign <= 0:
             return
         if sid not in _NO_SESSION_ORPHANS and len(_NO_SESSION_ORPHANS) >= _NO_SESSION_ORPHANS_MAX:
             # 超上限淘汰最老的一条（与 _EXT_FRAMES_MAX 同思路，防止内存被顶上去）
@@ -5559,26 +6164,38 @@ def _count_orphans_without_session(sid, text):
             _NO_SESSION_ORPHANS.pop(oldest, None)
         rec = _NO_SESSION_ORPHANS.get(sid)
         if rec is None:
-            _NO_SESSION_ORPHANS[sid] = [n, samples, time.time()]
+            _NO_SESSION_ORPHANS[sid] = [n, samples, time.time(), foreign, foreign_samples]
         else:
             rec[0] += n
             for x in samples:
                 if len(rec[1]) < _UNRESOLVED_SAMPLES_MAX and x not in rec[1]:
                     rec[1].append(x)
+            rec[3] = int(rec[3] or 0) + foreign
+            for x in foreign_samples:
+                if len(rec[4]) < _FOREIGN_SAMPLES_MAX and x not in rec[4]:
+                    rec[4].append(x)
             rec[2] = time.time()
     except Exception:
         pass
 
 
 def _take_orphans_without_session(sid):
-    """取走并清零（同一 sid 只应被一条 RESTORE 事件消费）。返回 (count, samples)。"""
+    """取走并清零（同一 sid 只应被一条 RESTORE 事件消费）。
+
+    返回 `(unresolved_n, unresolved_samples, foreign_n, foreign_samples)`。
+    两组分别对应「本机签发过、映射丢了」与「非本机签发」，消费方（代理链路
+    `_restore_emit` 与面板 ext 链路）必须分开记，不能相加后只报一个数。
+    """
     try:
         rec = _NO_SESSION_ORPHANS.pop(sid, None)
         if not rec:
-            return 0, []
-        return int(rec[0] or 0), [str(x) for x in (rec[1] or [])][:_UNRESOLVED_SAMPLES_MAX]
+            return 0, [], 0, []
+        return (int(rec[0] or 0),
+                [str(x) for x in (rec[1] or [])][:_UNRESOLVED_SAMPLES_MAX],
+                int(rec[3] or 0) if len(rec) > 3 else 0,
+                [str(x) for x in (rec[4] if len(rec) > 4 else [])][:_FOREIGN_SAMPLES_MAX])
     except Exception:
-        return 0, []
+        return 0, [], 0, []
 
 
 
@@ -5608,7 +6225,19 @@ def _restore_tree(obj, sid, key=None, depth=0):
         # SSE 上思考增量事件会因"无槽位"改走本兜底，若不挡就会把明文还原回写入；
         # 整包/回退（`_restore_json_body`）与 NDJSON 同样靠这里。
         # 注意：挡的是**块**，不是字段名——同名业务字段仍照常还原。
-        if obj.get("type") in _RESTORE_SKIP_BLOCK_TYPES:
+        # 判据必须是「块类型字符串」。`type` 在 JSON Schema 里同时是**属性名**
+        # （`{"properties": {"type": {...}}}`）和**保留字**（`{"type": ["string","null"]}`），
+        # 值可以是对象或数组。直接拿它做 set 成员判断会抛 `TypeError: unhashable type`，
+        # 整条响应还原就此中断：流式下 `_stream_owned` 的兜底会丢掉**已出队的事件块**
+        # （客户端收到无 event:/data: 前缀的残帧，Responses API 的终止事件永远到不了），
+        # 非流式则整包退回未还原。2026-10-19 issue #44 实测触发形态。
+        block_type = obj.get("type")
+        if isinstance(block_type, str) and block_type in _RESTORE_SKIP_BLOCK_TYPES:
+            # 契约豁免必须计数（与请求侧 `signed_blocks_skipped` 对称、同一理由：
+            # 静默豁免等于用户以为还原管线处理过了）。块内增量不重复计，
+            # 判据与理由见 `_note_restore_signed_skip`。
+            if not block_type.endswith("_delta"):
+                _note_restore_signed_skip(sid)
             return obj
         return {k: _restore_tree(v, sid, k, depth + 1) for k, v in obj.items()}
     return obj
@@ -6749,7 +7378,7 @@ def error(flow):
     _aux_abandon(flow)
     sid = flow.metadata.get("session_id")
     try:
-        host = getattr(flow.request, "host", None) or getattr(flow.request, "pretty_host", "")
+        host = _upstream_host_of(flow)
         path = flow.metadata.get("shield_orig_path") or getattr(flow.request, "path", "")
         s = _session_get(sid, {}) if sid else {}
         source = s.get("source", {})
@@ -7064,6 +7693,134 @@ _MASK_TIMEOUTS = {"count": 0, "peak_wait_ms": 0.0}
 # （被最外层 fail-closed 兜成 503 mask_pipeline_failed）—— 都是"整个网关不可用"的配置事故，
 # 由环境变量误写触发，所以在这里夹住（其余旋钮如 NER 预算同样有下限）。
 _ENGINE_DEADLINE_S = max(5.0, float(_env_float("MASKIT_ENGINE_DEADLINE_S", 120.0)))
+# 上游建连 / TLS 握手的**预算**（秒）。mitmproxy 12.2.3 在 `proxy/server.py:212` 直接
+# `await asyncio.open_connection(...)`，既没有 timeout 也没有 wait_for，所以一条被丢包的
+# 握手会一路走到内核 SYN 重传梯（实测 ≈127 s），而客户端在 180 s 整放弃 —— 用户看到的是
+# 一句无信息量的 `Request timed out.`。addon 侧也拦不住它：`flow.kill()` 与写
+# `flow.response` 都不改变客户端等待（黑洞实测 45s/50s 均拿到 0 字节）。
+# 有效的执行点是取消「正在建立这一跳的那个 task」：mitmproxy 自己的
+# `open_connection` 捕获 CancelledError 后会落 `server_connect_error` → 给客户端一个
+# 干净的 502（实测：8 次连续熔断后客户端连接仍可用、`max_conns` 信号量不泄漏）。
+# 20 s 的取值来自实测分布：健康握手 0.5–1.8 s，家里最坏一次**成功**握手 13.1 s，
+# 留 1.5x 余量；卡过 20 s 的那一跳剩下的是 4/8/16/32/64 s 的重传梯，掐掉让客户端
+# 立刻重试，比让它赌 127 s 好。熔断只在「请求尚未写出」时发生（判据见
+# `ConnectionGovernance.stalled_before_send`），推理模型首包几分钟的请求完全豁免。
+_CONNECT_STALL_S = _connect_budget(_env_float("MASKIT_CONNECT_STALL_S", 20.0))
+# 关掉它（`MASKIT_CONNECT_KILL=0`）= 退回纯观测：仍然统计、仍然归因，只是不落刀。
+_CONNECT_KILL = _env_int("MASKIT_CONNECT_KILL", 1) != 0 and _CONNECT_STALL_S > 0
+
+# ── 上游响应流空闲闸：首包到了、然后彻底没声 ────────────────────────────────
+# 建连闸（上面的 `_CONNECT_STALL_S`）管「请求还没写出去」，`_ENGINE_DEADLINE_S` 管
+# 「脱敏阶段」，而**响应流开走之后这一层原本一个 idle 判据都没有**：上游吐完首包就
+# 彻底静默时，唯一的兜底是 mitmproxy 每连接的空闲看门狗 `tcp_timeout`（默认 600 s），
+# 于是 Maskit 替客户端握着一条已经死了的连接整整十分钟，客户端那边早就超时放弃了。
+# 判据只能是**空闲间隔**而不是总时长：库里同时存在 876 chunks / 412 KB / 跑满 646 s
+# 的合法长生成，按总时长一刀切就是在砍真请求。
+# N=120 s 是保守值——比 600 s 早一个数量级，又远高于本机任何一条真流式的块间隔
+# （`max_gap_s` 每次收到块都刷新、随 runtime metrics 上报，下次调 N 向这个数要，
+# 不要再拍）。首包**之前**的静默一律不管：推理模型几分钟不出首包是合法的。
+_SSE_IDLE_S = max(0.0, _env_float("MASKIT_SSE_IDLE_S", 120.0))
+# 关掉落刀（`MASKIT_SSE_IDLE_KILL=0`）= 退回纯观测：仍然统计静默流，只是不断连接。
+_SSE_IDLE_KILL = _env_int("MASKIT_SSE_IDLE_KILL", 1) != 0 and _SSE_IDLE_S > 0
+# flow -> {"peer", "last_byte", "max_gap_s", "chunks", "killed"}
+# 用 WeakKeyDictionary 而不是手工登记表：收尾路径有好几条（正常结束、审计下池、
+# 客户端断开、异常），漏一条就是永久扣住一个 flow 对象。
+_STREAM_WATCH = weakref.WeakKeyDictionary()
+_STREAM_IDLE_TOTAL = {"killed": 0, "silent": 0, "ambiguous": 0,
+                      "no_task": 0, "no_peer": 0}
+# 观测：本机见过的最大「相邻两块间隔」。定 N 的唯一依据，别再用猜的。
+_STREAM_GAP_MAX = {"s": 0.0}
+
+
+def _stream_watch(flow):
+    """登记一条「响应流已在跑」的 flow，返回它的观测记录（首字节那一刻调用）。
+
+    测试用的 SimpleNamespace flow 不能当 weakref 键——那种情况返回一个不落表的临时
+    记录，空闲闸自然看不到它，绝不因此让流量本身出问题（同 `_safe_transport_snapshot`
+    的口径：诊断链路自己坏了不能拖累转发）。
+    """
+    # 取记录与登记都各自兜底：`flow.client_conn` 只有真 mitmproxy flow 才有，
+    # `_STREAM_WATCH` 又只收弱引用键。这两处任一抛异常都会冒泡进 `_stream_owned`
+    # 的 except，把**整条流式还原**降级成原样直通（2026-10-10 回归：只捕 TypeError
+    # 时，SimpleNamespace flow 的 AttributeError 让 12+ 个流式用例一起变红）。
+    # 观测链路坏了绝不能拖累转发（同 `_safe_transport_snapshot` 的口径）。
+    entry = None
+    try:
+        entry = _STREAM_WATCH.get(flow)
+    except Exception:
+        entry = None
+    if entry is not None:
+        return entry
+    entry = {"peer": None, "last_byte": time.time(),
+             "max_gap_s": 0.0, "chunks": 0, "killed": False}
+    try:
+        peer = getattr(getattr(flow, "client_conn", None), "peername", None)
+        if peer:
+            entry["peer"] = tuple(peer)
+        _STREAM_WATCH[flow] = entry
+    except Exception:
+        pass
+    return entry
+
+
+def _stream_watch_forget(flow):
+    """流已交付完毕：不必再盯着它静默。"""
+    try:
+        _STREAM_WATCH.pop(flow, None)
+    except Exception:
+        pass
+
+
+def _client_handler_tasks(tasks, peername):
+    """mitmproxy 里持有这条客户端连接的那个 task。
+
+    mitmproxy 自己结束一条静默连接的动作就是取消它
+    （`proxy/server.py` 的 `on_timeout` → `transports[client].handler.cancel("timeout")`）。
+    这里不另造机制，只把同一刀的预算从 600 s 提前到 `_SSE_IDLE_S`、条件收窄到
+    「响应流已经开始之后」。名字对不上就退化成「不动手」= 今天的表现，而不是误杀。
+    """
+    return [task for task in tasks
+            if task.get_name() == "client connection handler"
+            and getattr(task, "client", None) == peername
+            and not task.done()]
+
+
+def _act_stream_idle(now=None):
+    """扫一遍在跑的响应流，掐掉连续静默超预算的那条。返回本次计数。"""
+    counters = dict.fromkeys(_STREAM_IDLE_TOTAL, 0)
+    if not _STREAM_WATCH:
+        return counters
+    now = time.time() if now is None else now
+    tasks = None
+    for flow, entry in list(_STREAM_WATCH.items()):
+        if entry["killed"]:
+            continue
+        idle = now - entry["last_byte"]
+        if idle < _SSE_IDLE_S:
+            continue
+        counters["silent"] += 1
+        if not _SSE_IDLE_KILL:
+            continue
+        if not entry["peer"]:
+            # 认不出是哪条客户端连接就不动手：错杀一条健康连接的代价比漏杀大。
+            counters["no_peer"] += 1
+            continue
+        if tasks is None:
+            tasks = list(asyncio.all_tasks())
+        hits = _client_handler_tasks(tasks, entry["peer"])
+        if len(hits) > 1:
+            counters["ambiguous"] += 1
+        elif not hits:
+            counters["no_task"] += 1
+        else:
+            entry["killed"] = True
+            # 「是我们掐的」这件事必须留在 flow 上：mitmproxy 被取消的是客户端读任务，
+            # 落下来的文案照旧是 `Client disconnected.`，不记这一笔就只能靠 600 s 那个
+            # 窗口去反推，而 120 s 的预算根本落不进那个窗口。
+            flow.metadata["shield_idle_killed"] = round(idle, 1)
+            hits[0].cancel("upstream idle")
+            counters["killed"] += 1
+    return counters
 
 
 def set_mask_workers(n):
@@ -7248,8 +8005,23 @@ def _write_runtime_metrics(force=False):
             "aux_pool": aux_pool_stats(),
             "audit": audit_runtime_stats(),
             "engine_deadline_s": _ENGINE_DEADLINE_S,
+            "connect": dict(_CONNECT_STALL, stall_after_s=_CONNECT_STALL_S,
+                            actuating=_CONNECT_KILL, kills=dict(_CONNECT_KILL_TOTAL),
+                            retry=_upstream_retry.stats()),
+            # 上游响应流空闲闸：预算、是否落刀、累计计数，以及**本机实测的最大块间隔**
+            # ——最后这个数是下次调 `_SSE_IDLE_S` 的依据（没有它，N 只能一直靠猜）。
+            "stream_idle": {"budget_s": _SSE_IDLE_S, "actuating": _SSE_IDLE_KILL,
+                            "kills": dict(_STREAM_IDLE_TOTAL),
+                            "max_gap_s": round(_STREAM_GAP_MAX["s"], 2),
+                            "watching": len(_STREAM_WATCH)},
             "transport": dict(_CONNECTION_STATS),
             "heartbeat": dict(_HEARTBEAT),
+            # 接管开着但 sidecar 没起来时，只报 `enabled:false` 等于什么都没解释
+            # （用户视角就是「开关没生效」）。把「配了/起没起/起失败过」分开暴露。
+            "c1_sidecar": (_C1_SIDECAR.metrics() if _C1_SIDECAR is not None
+                           else {"enabled": False,
+                                 "takeover_configured": _c1_any_takeover_enabled(),
+                                 "start_failed": _C1_SIDECAR_FAILED}),
         }
 
         # 敏感词表：**引擎里真正生效的词数**与**问题清单**（词 -> 原因）。
@@ -8031,13 +8803,14 @@ async def _request_impl(flow: http.HTTPFlow):
     matched_up = None
     if CAPTURE_MODE == "reverse":
         flow.metadata["shield_orig_path"] = orig_path
+        await _c1_ensure_started()  # C1 sidecar 惰性启动（takeover=true 时）
         matched_up, final_path = apply_reverse_routing(flow)
         if not matched_up:
             _emit_skip(orig_host, method, orig_path, "no_reverse_route", source=source)
             flow.response = http.Response.make(404, b'{"error":"no_reverse_route"}', {"content-type": "application/json"})
             return
         # 路由后用最终路径和真实上游 host 判断是否为目标 LLM API
-        host = getattr(flow.request, "host", None) or orig_host
+        host = _upstream_host_of(flow)
         path = flow.request.path
         # 非白名单路径不再 404 拦下：/v1/models、/v1/embeddings、健康检查等是客户端
         # 初始化必打的接口，直接拒绝会让人以为代理坏了。这里只决定"是否脱敏"，转发照旧。
@@ -8810,7 +9583,9 @@ async def response(flow: http.HTTPFlow):
     # 流式响应已在 stream 回调里逐块还原并收尾，这里不再重复处理
     if flow.metadata.get("shield_streamed"):
         return
-    host = getattr(flow.request, "host", None) or flow.request.pretty_host
+    # 真实上游 host 走 `_upstream_host_of`：takeover 下 `request.host` 是环回 sidecar，
+    # 照它读会让「排除某域名不流式」这类按域名的判据整个失效（见该函数注释）。
+    host = _upstream_host_of(flow)
     path = flow.request.path
     emit_path = flow.metadata.get("shield_orig_path") or path
     method = getattr(flow.request, "method", "") or ""
@@ -9227,11 +10002,15 @@ def _restore_sse_data(data, sid, final=False, final_prefixes=()):
     # Responses .done payloads replace the full value, rather than extending
     # its deltas. Discard that channel's stale tail after restoring the snapshot;
     # appending it would duplicate text or emit a delta after completion.
+    # 与 `_restore_tree` 的块类型判据同源：`type` 的值可能是对象/数组
+    # （JSON Schema 的 `properties.type`、`"type": ["string","null"]`），
+    # 直接当字典键同样抛 unhashable type。非字符串一律视作「无匹配快照」。
+    event_type = data.get("type")
     snapshot = {
         "response.output_text.done": ("text", "text"),
         "response.reasoning_text.done": ("text", "reason"),
         "response.function_call_arguments.done": ("arguments", "args"),
-    }.get(data.get("type"))
+    }.get(event_type) if isinstance(event_type, str) else None
     if snapshot is not None and isinstance(data.get(snapshot[0]), str):
         channel = _sse_response_channel(data, snapshot[1])
         s = _session_get(sid) or {}
@@ -9486,11 +10265,15 @@ def _restore_ndjson_body(raw_bytes, sid):
     return "\n".join(out).encode("utf-8")
 
 
-def _restore_sse_event(block, sid, final=False):
+def _restore_sse_event(block, sid, final=False, terminal=None):
     """还原一个 SSE 事件块（可能含多行）。返回还原后的文本块。
 
     按事件粒度处理是流式透传的前提：一个事件到手立刻还原、立刻下发，
     首字延迟才不会等于整段生成时长。
+
+    `terminal` 非 None 时作为**出参**：本块宣告整条流结束就追加一项。判据只此一处
+    ——上游发完终止事件就不再发正文，客户端常据此立刻关连接，所以收尾必须能在
+    这里被认出来，而不是死等 body 结束（见 `_stream_owned` 的收尾分支）。
     """
     out_lines = []
     for line in block.split("\n"):
@@ -9499,6 +10282,8 @@ def _restore_sse_event(block, sid, final=False):
         if stripped.startswith("data:"):
             payload = stripped[5:].lstrip(" ")
             if payload.strip() == "[DONE]":
+                if terminal is not None:
+                    terminal.append("done")
                 tail = _flush_pending(sid)  # [DONE] 之前必须把缓冲吐净，客户端见到 DONE 就不再收了
                 if tail:
                     # tail 是完整 SSE 事件块（自带 \n\n），作为独立段插入，
@@ -9521,6 +10306,12 @@ def _restore_sse_event(block, sid, final=False):
                 out_lines.append(line)
                 continue
             ending = _sse_terminal_prefixes(data)
+            # `None` = 该事件类型本身宣告**整条流**结束（message_stop / message_delta /
+            # response.completed 等），可据此收尾；非空元组只宣告**部分通道**结束
+            # （多 choice 时另一个 choice 可能还在吐），绝不能当流级终止——那会把还在
+            # 生成的通道提前切断，比丢记录更严重。
+            if ending is None and terminal is not None:
+                terminal.append("event")
             # A terminal chunk can contain the final text fragment. Restore it
             # before flushing, and leave other choices' partial tokens buffered.
             _restore_sse_data(data, sid, final=final, final_prefixes=ending)
@@ -9744,6 +10535,8 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
         if state["done"]:
             return
         state["done"] = True
+        # 整条流已交付，空闲闸不必再盯着它（见 `_stream_watch`）
+        _stream_watch_forget(flow)
         # 收尾：还原摘要留在循环上（微秒级），审计与响应扫描投递 `_AUX_POOL`
         # （实测原占住循环 64KB≈15ms / 1MB≈127ms / 4MB≈216ms）。
         # 注意本回调是**同步**的（mitmproxy 的 stream 回调无 await 点），投递后不等待，
@@ -9784,6 +10577,7 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
         nonlocal session_ref
         state["done"] = True
         state["aborted"] = True
+        _stream_watch_forget(flow)
         state["buf"] = ""
         state["text"] = []
         state["text_len"] = 0
@@ -9819,6 +10613,22 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
             _touch(sid)  # 长生成期间刷新会话 TTL，防止 _sweep 误删活动中的流式会话
             # 首字节计时：第一次收到非空数据块即记（含流式接管路径）
             if data:
+                _now = time.time()
+                # 「最后一次看到上游字节」的时刻：上游静默多久只能靠它算，
+                # 用于区分真客户端断开与看门狗掐掉静默上游（见
+                # `_upstream_idle_seconds`）。
+                flow.metadata["shield_last_byte_at"] = _now
+                # 相邻两块的间隔：既是空闲闸的判据（`_act_stream_idle`），也是
+                # 下次调 `_SSE_IDLE_S` 唯一该向它要的那个数（`_STREAM_GAP_MAX`）。
+                _watch = _stream_watch(flow)
+                if _watch["chunks"]:
+                    _gap = _now - _watch["last_byte"]
+                    if _gap > _watch["max_gap_s"]:
+                        _watch["max_gap_s"] = _gap
+                    if _gap > _STREAM_GAP_MAX["s"]:
+                        _STREAM_GAP_MAX["s"] = _gap
+                _watch["last_byte"] = _now
+                _watch["chunks"] += 1
                 s_cur = _session_get(sid)
                 if s_cur is not None:
                     if s_cur.get("resp_ts") is None:
@@ -9839,7 +10649,14 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
                     if idx < 0:
                         break
                     line, state["buf"] = state["buf"][:idx], state["buf"][idx + 1:]
-                    out.append(_restore_ndjson_line(line, sid, final=False) + "\n")
+                    # 已出队的行不能再丢：单行还原失败只降级该行为原样透传，
+                    # 不让异常冒泡到外层把整批已处理的行一起丢弃（同 SSE 分支）。
+                    try:
+                        out.append(_restore_ndjson_line(line, sid, final=False) + "\n")
+                    except Exception as e:
+                        _emit("ERR", host=host, method=method, path=emit_path, sid=sid,
+                              msg="ndjson_line:" + str(e)[:160], **source)
+                        out.append(line + "\n")
                 # 异常上游防御：单个超长行无换行符，累积超过 _SSE_BUF_MAX 强制还原清空
                 if len(state["buf"]) > _SSE_BUF_MAX:
                     out.append(_restore_ndjson_line(state["buf"], sid, final=True) + "\n")
@@ -9854,12 +10671,36 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
                     _touch(sid)
             else:
                 # SSE 事件以空行分隔；只处理已完整到达的事件，半个事件留在缓冲里
+                terminal = []   # 出参：本块是否宣告整条流结束（见 `_restore_sse_event`）
                 while True:
                     idx = state["buf"].find("\n\n")
                     if idx < 0:
                         break
                     block, state["buf"] = state["buf"][:idx], state["buf"][idx + 2:]
-                    out.append(_restore_sse_event(block, sid, final=False) + "\n\n")
+                    del terminal[:]
+                    # 事件块已经出队：异常一旦冒泡到外层 except，这一块既发不出去、
+                    # 也回不到 buf，客户端只会收到后续原始字节（无 event:/data: 前缀
+                    # 的残帧），本回调里已处理的其余事件也全部丢失（issue #44 的实际
+                    # 形态）。单块失败只把这一块降级为原样透传，其余事件不受影响。
+                    try:
+                        out.append(_restore_sse_event(block, sid, final=False,
+                                                      terminal=terminal) + "\n\n")
+                    except Exception as e:
+                        del terminal[:]   # 半途置位的终止标记不可信，清掉以免误收尾
+                        _emit("ERR", host=host, method=method, path=emit_path, sid=sid,
+                              msg="sse_event:" + str(e)[:160], **source)
+                        out.append(block + "\n\n")
+                        # 本块失败后同通道的缓冲再也等不到后续块：不补发就是静默丢字
+                        # （与外层 except 的 `_flush_pending` 同义，见 test_shield 的
+                        #  error-path 用例）。补发块自带 \n\n，不会与残块粘连。
+                        try:
+                            tail = _flush_pending(sid)
+                        except Exception:
+                            tail = ""
+                        if tail:
+                            out.append(tail)
+                    if terminal:
+                        state["stream_terminal"] = True
                 # 异常上游防御：上游持续推送只有单换行（无 \n\n 双空行）或无换行的巨型数据，
                 # 导致 buf 无限累积超过 _SSE_BUF_MAX。优先在最后一个换行符切分以保留完整
                 # data: 行（避免破坏合法 JSON），无换行时整段强制还原清空。
@@ -9887,8 +10728,18 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
                 # 「我们卡在半个事件里」（buf 一直非空、out 恒为空）。
                 _log(f"[stream:dbg] {host} cb#{state['calls']} in={len(data)}B "
                      f"out={len(text)}B buf={len(state['buf'])} last={last}")
-            if last:
+            # 收尾有两条触发路径，缺一不可：
+            # ① `last`——body 正常结束（末块回调）；
+            # ② 上游在流里宣告了结束（`[DONE]` / message_stop 等）。
+            # ② 的必要性有实测（2026-10-13 生产 + 本地复现）：上游发完 `data: [DONE]`
+            # 后**不按 HTTP 规范发 chunked 终止块**并保持连接打开，body 永远等不到
+            # "结束"，末块回调也就永远不来；而客户端见到 DONE 就关连接——于是既不写
+            # RESTORE（还原统计/费用/会话链路整段缺失），还把正常收尾记成
+            # `client_disconnected` 取消（面板上只剩一行只有脱敏耗时的孤儿行）。
+            # 判据必须落在「上游已宣告结束」，而不是「body 字节流已关闭」。
+            if last or state.get("stream_terminal"):
                 _finish()
+            if last:
                 # 末块走 mitmproxy 的 ResponseEndOfMessage 分支，那里对 b"" 有
                 # 专门过滤（chunks == b"" -> []），返回 bytes 安全。
                 return text.encode("utf-8")
@@ -9974,7 +10825,12 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
     restored_count = int(s.get("restored", 0) or 0)
     restored_unique = len(s.get("restored_tokens", set()) or set())
     unresolved = int(s.get("unresolved", 0) or 0)
+    # 非本机签发的占位符形态字符串（客户端历史携带的外来 token / 对话里写的
+    # 文档示例 / 模型自造）。与 `unresolved` 分开计数：本机无论如何都还原不了
+    # 它们，算成「还原失败」只会让指标长期虚高（真机：当天 4 条里 0 条是前者）。
+    foreign = int(s.get("foreign", 0) or 0)
     degraded = int(s.get("degraded", 0) or 0)
+    restore_signed_skipped = int(s.get("restore_signed_skipped") or 0)
     if masked_count == 0:
         restore_status = "no_sensitive_data"
     elif unresolved > 0:
@@ -10034,6 +10890,10 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
     items = []
     try:
         restored_tokens = s.get("restored_tokens") or set()
+        # 「模型回显了但没还原」的后缀集合：让前端把这一项与「模型压根没提」分开显示。
+        # 不做这一层区分时，两者都是 `restored=false`，用户把“模型没用上这个实体”（正常）
+        # 误读成“又没还原”（要排查）。
+        unresolved_suffixes = set(s.get("unresolved_suffixes") or ())
         seen_toks = set()
         for orig, tok in list(s.get("fwd", {}).items())[:30]:
             seen_toks.add(tok)
@@ -10047,6 +10907,8 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
                 "length": len(orig),
                 "preview": _preview(orig, lbl),
                 "restored": tok in restored_tokens,
+                **({"unresolved": True}
+                   if (m and (m.group(2) or "").lower() in unresolved_suffixes) else {}),
             }
             # 凭据类不明文落库（与 MASK 口径一致），详情弹窗只显示打码预览
             if is_cred:
@@ -10118,17 +10980,28 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
         restored=restored_count,
         restored_unique=restored_unique,
         unresolved=unresolved,
+        # 非本机签发计数：**不参与 `restore_status` 与 `success` 判定**，也不进
+        # 「还原失败」告警；前端单列一行展示，明细里带上样本以便定位。
+        foreign=foreign,
         # 未还原占位符样本（最多 5 条；样本本身是占位符，不含任何原文）。
         # 此前**只有扩展链路**（panel 的 /api/ext/restore）外发它，代理链路只在
         # 会话里收集 —— 面板只显示一个数字，用户无从区分「模型改写/自造占位符」
         # 与「映射过期或引擎重启导致查不到原文」，而这两种情况的处置完全不同。
         **({"unresolved_samples": [str(x)[:120] for x in (s.get("unresolved_samples") or [])][:5]}
            if s.get("unresolved_samples") else {}),
+        # 外来/示例占位符样本：与 `unresolved_samples` 同源存储规则，只是来源不同
+        # （后缀从未由本机签发过）。分开给前端，才能把两类在详情弹窗里分开展示。
+        **({"foreign_samples": [str(x)[:120] for x in (s.get("foreign_samples") or [])][:5]}
+           if s.get("foreign_samples") else {}),
         # 靠宽松兜底（模型剥了花括号）修回来的个数。
         # 这个计数一直存在于会话里，但**从没被发进事件**——注释写着「计数进
         # RESTORE 事件，让用户看得见」，实际 _emit 参数里没有它，于是
         # 「靠兜底修回来的」这件事永远查不到。0.1.14 补上。
         degraded=degraded,
+        # 响应侧契约豁免计数（与 MASK 侧同名，语义按事件方向区分：
+        # MASK = 请求里未扫描的块数，RESTORE = 响应里未还原的块数）。
+        # 缺省不带字段，避免常态噪声（与请求侧同一做法）。
+        **({"signed_blocks_skipped": restore_signed_skipped} if restore_signed_skipped else {}),
         success=bool(ok) and unresolved == 0,
         msg=hint,
         # status 兼容 SQLite 已有列/历史数据；restore_status 是前端统一读取的键
@@ -10226,7 +11099,7 @@ def responseheaders(flow: http.HTTPFlow):
         if flow.metadata.get("shield_stream_requested"):
             _note_stream_degraded(flow, "non_sse")
         return
-    host = getattr(flow.request, "host", None) or flow.request.pretty_host
+    host = _upstream_host_of(flow)
     path = flow.request.path
     emit_path = flow.metadata.get("shield_orig_path") or path
     method = getattr(flow.request, "method", "") or ""
@@ -10315,8 +11188,7 @@ def _restore_sse_body(raw, sid):
 def _handle_json(flow, sid):
     """薄包装（保留给单测与其他调用点）：纯函数 + 回写。"""
     raw = flow.response.content or b""
-    out = _restore_json_body(raw, sid,
-                             getattr(flow.request, "host", None) or flow.request.pretty_host,
+    out = _restore_json_body(raw, sid, _upstream_host_of(flow),
                              getattr(flow.request, "method", "") or "",
                              flow.metadata.get("shield_orig_path") or flow.request.path,
                              flow.response.headers.get("content-type", "") or "")
@@ -10409,6 +11281,7 @@ def _read_settings():
             if k in builtin:
                 builtin[k] = bool(v)
     # 反向代理 upstream 路由表
+    has_upstreams = "upstreams" in cfg and cfg.get("upstreams") is not None
     ups = []
     raw_ups = cfg.get("upstreams")
     if isinstance(raw_ups, list):
@@ -10428,7 +11301,8 @@ def _read_settings():
                 continue
             seen_names.add(name_key)
 
-            slug = re.sub(r"[^A-Za-z0-9_\-]", "", name).lower()[:40]
+            slug = re.sub(r"[^A-Za-z0-9_\-]", "", name.replace(" ", "_")).lower()[:40]
+            slug = re.sub(r"_+", "_", slug).strip("_")
             if not base or not re.fullmatch(r"/[A-Za-z0-9_\-/]{1,60}", base):
                 base = "/" + (slug or f"up_{len(ups) + 1}")
             if not base.startswith("/"):
@@ -10490,11 +11364,17 @@ def _read_settings():
                                 headers[clean_key] = clean_value
                     model_rules.append({"match": match, "headers": headers, "body": body})
 
+            # takeover 必须在这里显式取出来。面板 `normalize_config` 一直存着它，而
+            # 引擎读侧原先不取 → `up.get("takeover")` 恒 False → 整个 C1 是个哑开关，
+            # 且「config.json → _read_settings() → UPSTREAMS」这条链当时零覆盖
+            # （2026-10-10 审计查明；锁它的是 tests/test_c1_config_chain.py）。
+            # 布尔判据统一用 `shield_defaults.is_true`：手改配置里的 "false" 不能读成开启。
             ups.append({"name": name, "base_path": base, "port": port, "target": target,
-                        "paths": list(paths), "use_proxy": bool(u.get("use_proxy")),
+                        "paths": list(paths), "use_proxy": is_true(u.get("use_proxy")),
+                        "takeover": is_true(u.get("takeover")),
                         "extra_headers": extra_headers, "model_rules": model_rules,
                         **({"connection_policy": u["connection_policy"]} if "connection_policy" in u else {})})
-    if not ups:
+    if not ups and not has_upstreams:
         ups = list(DEFAULT_UPSTREAMS)
     # 出口代理：enabled 关闭时直接置 None，省得 request() 每次都判两个字段。
     # 地址非法同样返回 None（panel 侧 normalize_config 已给过 warning）。
@@ -10673,6 +11553,9 @@ def _maybe_reload(force=False):
     set_ner_req_budget(s.get("ner_req_budget_s"))
     UPSTREAMS = s["upstreams"]
     EGRESS_PROXY = s.get("egress_proxy")
+    # C1 连接池必须跟着配置换代走：接管全关时它还在跑（面板说了不算），
+    # 出口代理改了时它还在用构造时那份（改了不生效且无提示）。见 `_c1_reconcile`。
+    _c1_reconcile(s)
     CAPTURE_MODE = s["capture_mode"]
     FILTER_ENABLED = bool(s.get("filter_enabled", True))
     FAIL_CLOSED = bool(s.get("fail_closed", True))
@@ -10726,6 +11609,7 @@ def load(l):
     _maybe_reload(force=True)
     _warmup_recent_from_db()
     _prune_debug_logs()
+    _upstream_retry.patch()
     # 重启即关闭限时排障（§D1：trace 不跨重启）。面板启动时也会清一次，
     # 两处都清是为了覆盖「只重启引擎」与「只重启面板」两种启法。
     try:

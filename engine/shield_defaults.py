@@ -10,6 +10,30 @@
 
 import re
 
+
+def is_true(value):
+    """配置里布尔项的严格判据：面板存的是真 bool，手改 config.json 的却可能是字符串。
+
+    `bool("false")` / `bool([])` 都是 True —— 用裸 `bool()` 读用户配置时，「把这个
+    开关关掉」会被读成「开启」。受影响的两个键（takeover / use_proxy）都会改**转发
+    路径**，判反了不是小事。字符串只认这几种明确表真的写法，其余一律 False
+    （宁可少开，不可误开）。
+
+    放这里而不是 panel / transparent 各写一份：**存配置的面板**和**读配置的引擎**
+    必须同一判据，否则「面板存进去的形状」与「引擎读出来的意思」可以各自漂移，
+    而漂移的表现是「面板显示已开启、引擎当它没开」。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value == 1
+    return False
+
+
 # 出口代理默认值：关闭 + 空地址（用户在高级设置里填）
 DEFAULT_EGRESS_PROXY = {"enabled": False, "url": ""}
 
@@ -49,6 +73,30 @@ def parse_egress_proxy(url):
     if not (0 < port <= 65535):
         return None
     return (scheme, (host, port))
+
+
+def egress_proxy_url(spec):
+    """ServerSpec `(scheme, (host, port))` → httpx 要的文本形式；非法返回 None。
+
+    `parse_egress_proxy` 的产物本来是给 mitmproxy 的 `flow.server_conn.via` 用的，
+    而 mitmproxy 是**唯一**消费方时不必有反向转换。C1 sidecar 出现后有了第二个消费方
+    （httpx 的 `proxy=`），判据就必须只有一份：sidecar 第一版直接照 **config.json 的
+    形状**（`{"enabled":…, "url":…}`）去读那个元组，`tuple.get(...)` 在启动当场抛
+    AttributeError（2026-10-10 审计查明）。
+    """
+    if not isinstance(spec, (tuple, list)) or len(spec) != 2:
+        return None
+    scheme, hostport = spec[0], spec[1]
+    if not isinstance(scheme, str) or not isinstance(hostport, (tuple, list)) or len(hostport) != 2:
+        return None
+    host, port = hostport[0], hostport[1]
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return None
+    if not host or not (0 < port <= 65535):
+        return None
+    return "%s://%s:%d" % (scheme.strip().lower(), str(host).strip().strip("[]"), port)
 
 
 # 反向代理模式：每个 upstream = 一个本地端口入口。
@@ -95,7 +143,17 @@ DEFAULT_PATHS = [
 ]
 
 DEFAULT_TTL = 600
-DEFAULT_SECRET_PREFIXES = ["sk-", "ah-"]
+DEFAULT_SECRET_PREFIXES = [
+    "sk-",
+    "ah-",
+    "ghp_",
+    "glpat-",
+    "xoxb-",
+    "xoxp-",
+    "pypi-",
+    "npm_",
+    "dify-",
+]
 
 # ========== 命令拦截（config.command_block）内置危害命令清单 ==========
 #
@@ -382,7 +440,16 @@ def _bare_price_index(cache):
     return index
 
 
-def estimate_cost(model, prompt_tokens, completion_tokens, overrides=None, cache=None):
+def estimate_cost(
+    model,
+    prompt_tokens,
+    completion_tokens,
+    overrides=None,
+    price_catalog=None,
+    cache_read_tokens=0,
+    cache_write_tokens=0,
+    **kwargs,
+):
     """按模型估算费用（美元）。
 
     Args:
@@ -390,28 +457,32 @@ def estimate_cost(model, prompt_tokens, completion_tokens, overrides=None, cache
         prompt_tokens / completion_tokens: token 数（整数）。
         overrides: 用户自配价格 {model: {input, output}}（config.model_prices），
             精确匹配优先于一切。
-        cache: 在线同步价格目录 {model: {input, output}}（load_price_cache 产物）。
+        price_catalog: 在线同步价格目录 {model: {input, output}}（load_price_cache 产物）。
+            兼容历史位置参数/关键字参数 `cache`。
+        cache_read_tokens: 缓存命中/读取 token 数（若模型价格包含 cache_read 则享受折扣）。
+        cache_write_tokens: 缓存创建/写入 token 数（若模型价格包含 cache_write）。
 
     匹配顺序（先在线目录后内置表——内置表只是断网/首装的兜底，不该抢主路径）：
         1. overrides 精确        —— 用户自己配的，最高优先
-        2. cache   精确          —— 流量里带厂商前缀时
-        3. cache   去前缀精确    —— 真实流量的常态（gpt-4o / deepseek-chat）
-        4. cache   去前缀最长前缀 —— 带日期/变体后缀（claude-3-5-haiku-20241022）
+        2. catalog   精确          —— 流量里带厂商前缀时
+        3. catalog   去前缀精确    —— 真实流量的常态（gpt-4o / deepseek-chat）
+        4. catalog   去前缀最长前缀 —— 带日期/变体后缀（claude-3-5-haiku-20241022）
         5. 内置表  最长前缀      —— 断网或目录里没有时的最后兜底
 
     返回 (cost_usd, price)：
         cost_usd: float 估算金额；price: 命中的价格条目 {input, output} 或 None（未定价）。
     """
+    catalog = price_catalog if price_catalog is not None else kwargs.get("cache")
     price = None
     m = str(model or "").strip()
     if m:
         bare = _norm_model(m)
         if overrides and m in overrides:
             price = overrides[m]
-        elif cache and m in cache:
-            price = cache[m]
-        elif cache:
-            index = _bare_price_index(cache)
+        elif catalog and m in catalog:
+            price = catalog[m]
+        elif catalog:
+            index = _bare_price_index(catalog)
             price = index.get(bare)
             if price is None:
                 # 最长前缀：claude-3-5-haiku-20241022 命中 claude-3-5-haiku
@@ -434,7 +505,25 @@ def estimate_cost(model, prompt_tokens, completion_tokens, overrides=None, cache
         return 0.0, None
     p = max(0, int(prompt_tokens or 0))
     c = max(0, int(completion_tokens or 0))
-    cost = p / 1e6 * float(price.get("input") or 0) + c / 1e6 * float(price.get("output") or 0)
+    cr = max(0, int(cache_read_tokens or 0))
+    cw = max(0, int(cache_write_tokens or 0))
+
+    p_in = float(price.get("input") or 0)
+    p_out = float(price.get("output") or 0)
+    p_cr = price.get("cache_read")
+    p_cw = price.get("cache_write")
+
+    # 若价格目录提供了缓存读取价（如 OpenRouter 同步条目），按折扣口径计费
+    if cr > 0 and p_cr is not None:
+        # OpenAI/DeepSeek 的 prompt_tokens 包含 cached_tokens；Anthropic 的 input_tokens 不包含 cache_read_input_tokens
+        is_anthropic = "claude" in bare or "anthropic" in m.lower()
+        regular_p = p if is_anthropic else max(0, p - cr)
+        cost_in = (regular_p / 1e6 * p_in) + (cr / 1e6 * float(p_cr))
+    else:
+        cost_in = p / 1e6 * p_in
+
+    cost_cw = (cw / 1e6 * float(p_cw)) if (cw > 0 and p_cw is not None) else 0.0
+    cost = cost_in + (c / 1e6 * p_out) + cost_cw
     return round(cost, 6), price
 
 
@@ -616,13 +705,16 @@ def save_price_cache(path, prices, source):
 def extract_usage(body_text, previous=None):
     """从响应 body 提取 token 用量（尽力而为，供统计与费用估算）。
 
-    支持三种形态：
-    - OpenAI chat/completions 非流式：顶层 usage.{prompt_tokens,completion_tokens}
-    - Anthropic messages：usage.{input_tokens,output_tokens}
+    支持形态：
+    - OpenAI chat/completions 非流式：顶层 usage.{prompt_tokens, completion_tokens}
+      及 prompt_tokens_details.cached_tokens / completion_tokens_details.reasoning_tokens
+    - Anthropic messages：usage.{input_tokens, output_tokens}
+      及 cache_read_input_tokens / cache_creation_input_tokens
+    - DeepSeek 等 OpenAI 变体：prompt_cache_hit_tokens / prompt_cache_miss_tokens
     - SSE：包括 message_start.message.usage 和 response.* 的 response.usage。
       用量是累计计数：只更新本次出现的字段，不相加，也不把缺失字段清零。
     previous 可传入此前流片段的结果；文本截断不影响跨片段累计。
-    返回 {"prompt_tokens": int, "completion_tokens": int} 或 {}（没采到）。
+    返回包含 prompt_tokens, completion_tokens 及可选的 cache_read_tokens, cache_write_tokens, reasoning_tokens。
     """
     import json
     usage = dict(previous or {})
@@ -655,6 +747,65 @@ def extract_usage(body_text, previous=None):
                 if value >= 0:
                     updates[field] = value
                     break
+
+        # 缓存与思考 token 提取（不强塞 0，有有效值才收录）
+        # 1. 缓存读取：OpenAI cached_tokens / Anthropic cache_read_input_tokens / DeepSeek prompt_cache_hit_tokens
+        cache_read_val = None
+        for alias in ("cache_read_input_tokens", "prompt_cache_hit_tokens", "cached_tokens"):
+            if alias in u:
+                try:
+                    val = int(u[alias])
+                    if val >= 0:
+                        cache_read_val = val
+                        break
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        if cache_read_val is None:
+            details = u.get("prompt_tokens_details")
+            if isinstance(details, dict) and "cached_tokens" in details:
+                try:
+                    val = int(details["cached_tokens"])
+                    if val >= 0:
+                        cache_read_val = val
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        if cache_read_val is not None:
+            updates["cache_read_tokens"] = cache_read_val
+
+        # 2. 缓存写入：Anthropic cache_creation_input_tokens / cache_write_tokens
+        for alias in ("cache_creation_input_tokens", "cache_write_tokens", "cache_creation_tokens"):
+            if alias in u:
+                try:
+                    val = int(u[alias])
+                    if val >= 0:
+                        updates["cache_write_tokens"] = val
+                        break
+                except (TypeError, ValueError, OverflowError):
+                    pass
+
+        # 3. 思考 token：reasoning_tokens / completion_tokens_details.reasoning_tokens
+        reasoning_val = None
+        for alias in ("reasoning_tokens", "reasoning_content_tokens"):
+            if alias in u:
+                try:
+                    val = int(u[alias])
+                    if val >= 0:
+                        reasoning_val = val
+                        break
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        if reasoning_val is None:
+            details = u.get("completion_tokens_details")
+            if isinstance(details, dict) and "reasoning_tokens" in details:
+                try:
+                    val = int(details["reasoning_tokens"])
+                    if val >= 0:
+                        reasoning_val = val
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        if reasoning_val is not None:
+            updates["reasoning_tokens"] = reasoning_val
+
         # Preserve total-only snapshots, including explicit zero breakdowns.
         if not any(updates.values()) and u.get("total_tokens") is not None:
             try:

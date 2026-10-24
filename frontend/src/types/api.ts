@@ -56,6 +56,7 @@ export interface UpstreamConfig {
   extra_headers?: Record<string, string>
   model_rules?: ModelRule[]
   use_proxy?: boolean
+  takeover?: boolean
   connection_policy?: ConnectionPolicy | null
 }
 
@@ -172,6 +173,12 @@ export interface ProxyStatus {
   needs_ca: boolean
   wizard_recommended: boolean
   last_error: string
+  /** 局域网访问：config 里的用户意图 */
+  lan_access?: boolean
+  /** 本进程实际绑定地址。与 lan_access 不一致 = 开关改了但还没重启 */
+  panel_host?: string
+  /** 局域网访问地址（仅远程模式下有值），供设置页展示 */
+  lan_urls?: string[]
   /** MASKIT_PANEL_TOKEN 太短/非 ASCII 被忽略（面板改用随机 token），前端弹一次性提醒 */
   panel_token_env_rejected?: boolean
 }
@@ -201,6 +208,13 @@ export interface EventItem extends SlimItem {
   tok?: string
   sha256?: string
   length?: number
+  /** RESTORE：本轮回复里是否还原出了该占位符。 */
+  restored?: boolean
+  /**
+   * RESTORE：模型回显了该占位符但未能还原（引擎查不到原文映射）。
+   * 与 `restored=false` 且无此标记的「模型压根没提」是两回事。
+   */
+  unresolved?: boolean
 }
 
 export interface ShieldEvent {
@@ -227,14 +241,20 @@ export interface ShieldEvent {
   count: number
   restored: number
   /**
-   * 查不到原文、原样透传给客户端的占位符数（仅 RESTORE 事件）。
-   * >0 多数意味着模型自造了一个我们从未生成过的占位符——它把
-   * {{LABEL_hex6}} 的随机后缀当成可计算的数字改写了。这类占位符
-   * 无法还原（对应的原文从不存在），只能如实告诉用户。
+   * 本机签发过、但映射已丢（复用表淘汰 / 会话被扫 / 重启后未预热回来）的占位符数
+   * （仅 RESTORE 事件）。这一类才是**真的要排查**的还原失败。
    */
   unresolved?: number
   /** 未还原占位符样本（引擎侧外发；仅未还原时存在，用于区分模型改写与映射丢失） */
   unresolved_samples?: string[]
+  /**
+   * 非本机签发的占位符形态字符串数（仅 RESTORE 事件）：客户端历史携带的外来 token、
+   * 对话里写的文档示例、模型自己编的。本机无论如何都还原不了它们，
+   * **不计入「还原失败」与告警**，否则面板数字会长期虚高。
+   */
+  foreign?: number
+  /** 外来/示例占位符样本（引擎侧外发；仅存在时才有，供详情弹窗定位） */
+  foreign_samples?: string[]
   /**
    * 靠宽松兜底修回来的占位符数（仅 RESTORE 事件）。模型把 {{}} 剥掉或写残时，
    * _LOOSE_PLACEHOLDER_RX 捞回来的那些。是成功路径，但值得看见——
@@ -258,7 +278,11 @@ export interface ShieldEvent {
   completeness?: 'complete' | 'partial' | 'failed' | 'not_applicable' | 'unknown'
   /** 原因码计数（NER 降级 / 协议契约豁免 / 阻断原因），键见 EventDetailDialog 的标签表。 */
   reason_codes?: Record<string, number>
-  /** 签名思考块整块未扫描的块数（协议契约豁免，属漏检路径故必须可见）。 */
+  /**
+   * 协议契约豁免的块数。方向按事件类型区分：
+   * MASK = 请求里未扫描的块数；RESTORE = 响应里未还原的块数
+   * （签名/密文思考块，改写会让上游逐字校验失败）。属漏检/漏还原路径，故必须可见。
+   */
   signed_blocks_skipped?: number
   items: SlimItem[] | EventItem[]
   dialog?: string
@@ -287,6 +311,11 @@ export interface ShieldEvent {
   queue_wait_ms?: number
   /** 响应侧等待脱敏线程池的时长（毫秒）：只在本条等超过阈值（默认 2s）时才带 */
   aux_wait_ms?: number
+  /**
+   * 上游连续静默的秒数：`reason=upstream_idle` 的证据。
+   * 只有「被本机连接空闲看门狗断开」这个结论而没有秒数时，用户分不清它和一次普通取消。
+   */
+  upstream_idle_s?: number
   mask_ms?: number
   first_byte_ms?: number
   upstream_ms?: number
@@ -302,6 +331,15 @@ export interface ShieldEvent {
    */
   ingress?: 'proxy' | 'ext'
   reason?: string
+  /**
+   * 失败归因的责任方（CANCEL / ERR）：client / dns / proxy / engine / upstream。
+   * 取值与判定见 engine/transparent.py 的 `_FAILURE_OWNERS` 与 `_flow_failure_owner`。
+   * 列表的状态列靠它把「客户端断开 / 域名解析失败 / 出口代理失败 / 上游错误」分开显示 ——
+   * 没有它就只能看到一个「—」。
+   */
+  failure_owner?: string
+  /** 异常类名（ERR）：如 ReadTimeout / ConnectionResetError，便于按类型聚合。 */
+  error_type?: string
   msg?: string
   seq: number
 }
@@ -388,6 +426,13 @@ export interface TodayStats {
   restored: number
   restore_ok: number
   restore_failed: number
+  /**
+   * 按 `restore_status` 分组的事件数。除 `restored` / `unresolved` / `no_*` 外，
+   * 还含 `foreign`：响应里出现了本机从未签发过的占位符形态字符串（外来 token /
+   * 文档示例 / 模型自造）。`foreign` **不计入 `restore_failed` 与 `alerts`**——
+   * 本机无论如何都还原不了它们，算成还原失败会让指标长期虚高。
+   */
+  restore_by_status?: Record<string, number>
   tokens: { prompt: number; completion: number }
   /**
    * 前缀保真度。**null = 本区间没有 MASK 事件样本**（空库 / 老库升级当天），
@@ -430,6 +475,11 @@ export interface ShieldConfig {
   response_scan: boolean
   /** 控制面 Origin 校验开关（默认 true）。反代/CDN 回源 Origin 不匹配致面板 403 时可关 */
   origin_check?: boolean
+  /**
+   * 局域网访问（默认 false）。开启后面板与代理端口绑 0.0.0.0，同一局域网的
+   * 其它设备可访问；**需重启引擎生效**。容器/无头部署请用 MASKIT_PANEL_HOST。
+   */
+  lan_access?: boolean
   /** 敏感词统计是否记录明文（默认 true）。关闭后 daily_words 只存打码形态 */
   record_plaintext_words: boolean
   stream_response: boolean

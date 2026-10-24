@@ -20,7 +20,7 @@ __version__ = '0.105.0'
 # 与 __version__ 分开维护：__version__ 是**本分支自己**的发布序号（0.10x.x 段，
 # 与上游 0.x.x 永不相撞，更新检查按段比较恒判定为更新），这里记录血缘基线。
 # 每次合并上游 tag 后同步改这一行；只读元数据，不参与任何版本比较。
-__upstream_base__ = '0.8.0'
+__upstream_base__ = '0.11.4'
 import json
 import codecs
 import copy
@@ -61,6 +61,7 @@ from shield_defaults import (
     BUILTIN_RULE_META,
     validate_command_regex,
     parse_egress_proxy,
+    is_true,
     OPENROUTER_MODELS_URL,
     PRICE_SYNC_INTERVAL_DAYS,
     MODEL_PRICES,
@@ -210,6 +211,62 @@ SCRIPTS_DIR = _BUNDLE_ROOT  # transparent.py / shield_defaults.py 所在目录�
 HOSTS_FILE = r"C:\Windows\System32\drivers\etc\hosts"
 MARKER = "# LLM-Shield"  # 紧急恢复脚本 scripts/emergency-restore.bat 依赖此标记定位 hosts 块，改动须同步
 CA_CERT = Path(os.path.expanduser("~")) / ".mitmproxy" / "mitmproxy-ca-cert.cer"
+
+
+def _bootstrap_lan_access() -> bool:
+    """启动期读 `config.lan_access`，决定默认绑定地址。
+
+    绑定地址在 `app.run` 之前确定、之后无法热改（Flask 是阻塞单进程模型），所以
+    这里直接读盘，而不是等 `load_config` —— 那个函数在模块后半段才定义。
+    读盘失败（首次启动还没有 config.json / 文件损坏）一律按「仅本机」处理：
+    安全开关的失败方向必须是关，绝不能因为配置读不出来就把控制面暴露到局域网。
+    """
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return isinstance(raw, dict) and bool(raw.get("lan_access"))
+
+
+_LAN_IPS_CACHE = {"ts": None, "ips": []}
+
+
+def _lan_ipv4_addresses():
+    """本机非回环 IPv4 列表（设置页告诉用户「局域网该用哪个地址」）。
+
+    纯本地系统调用，不出网：UDP connect 只让内核选出口地址，不发送任何数据包。
+    缓存 60s——`/api/status` 每 2.5s 被轮询一次，没必要每次都解析一遍网卡。
+    """
+    now = time.monotonic()
+    # 初值是 None 而不是 0.0：`time.monotonic()` 在 Linux 上以开机时刻为零点，
+    # 开机 60 s 内启动面板时 `now - 0.0 < 60` 会命中缓存并一直返回空列表，
+    # 设置页的「局域网地址」就永远不出现（自引入的边界 bug，别改回 0.0）。
+    if _LAN_IPS_CACHE["ts"] is not None and now - _LAN_IPS_CACHE["ts"] < 60:
+        return _LAN_IPS_CACHE["ips"]
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127."):
+                ips.add(ip)
+    except Exception:
+        pass
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("192.0.2.1", 80))  # TEST-NET-1：不可路由，仅用于选出口地址
+            ip = probe.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                ips.add(ip)
+        finally:
+            probe.close()
+    except Exception:
+        pass
+    _LAN_IPS_CACHE["ts"] = now
+    _LAN_IPS_CACHE["ips"] = sorted(ips)
+    return _LAN_IPS_CACHE["ips"]
+
+
 def _default_panel_port() -> int:
     """面板端口：默认 5801，可用环境变量 LLM_SHIELD_PANEL_PORT 覆盖（测试/冲突规避）。"""
     try:
@@ -230,8 +287,25 @@ except Exception:
     _START_READY_TIMEOUT = 60
 ENV_BACKUP_PATH = ROOT / "shield-env-backup.json"
 EVENT_LOG_PATH = LEGACY_JSONL_PATH
-# 面板监听地址：桌面版恒 127.0.0.1；Docker/无头部署用 MASKIT_PANEL_HOST=0.0.0.0 开放。
-PANEL_HOST = os.environ.get("MASKIT_PANEL_HOST", "127.0.0.1").strip() or "127.0.0.1"
+# 面板监听地址：默认仅本机；设置页「局域网访问」开关（config.lan_access）打开后
+# 绑定 0.0.0.0，Docker/无头部署也可用 MASKIT_PANEL_HOST=0.0.0.0 显式指定（环境变量优先）。
+_LAN_ACCESS = _bootstrap_lan_access()
+
+
+def _resolve_bind_host(env_name: str, lan_access: bool) -> str:
+    """绑定地址优先级：环境变量 > 局域网开关 > 回环。
+
+    抽成纯函数是为了能直接钉住优先级——错了就是把控制面暴露到网段，
+    或者反过来把容器里的正常部署锁死到回环。
+    """
+    env_val = os.environ.get(env_name, "").strip()
+    if env_val:
+        return env_val
+    return "0.0.0.0" if lan_access else "127.0.0.1"
+
+
+_DEFAULT_BIND_HOST = _resolve_bind_host("MASKIT_PANEL_HOST", _LAN_ACCESS)
+PANEL_HOST = _DEFAULT_BIND_HOST
 # 远程模式 = 监听地址不是回环：Host 校验放开、Origin 改为同源校验，
 # X-Shield-Token 仍是唯一主防线（面板可改上游/注入头，绝不可免 token）。
 REMOTE_MODE = PANEL_HOST not in {"127.0.0.1", "localhost", "::1"}
@@ -275,6 +349,12 @@ _EXT_WARN_MAX = 200
 # 扩展上下文能出现的 Origin scheme。**扩展 ID 无法枚举**（解压加载/商店/profile 各异），
 # 所以只能按 scheme 放行；详见 _origin_ok() 里的实测说明与安全影响。
 _EXT_ORIGIN_SCHEMES = ("chrome-extension://", "moz-extension://", "safari-web-extension://")
+
+# Tauri 桌面壳的来源（Linux/Windows 为 `tauri://localhost`，macOS 为 `http://tauri.localhost`）。
+# 壳层与面板的通信一律走 127.0.0.1，但 Origin 是 WebView 自己带的，改不了；
+# 本地面板同源放行与远程模式（局域网开关）两条分支**都必须先经过这个白名单**，
+# 否则打开局域网访问会把桌面端自己锁在外面（2026-10-19 实测）。
+_TAURI_ORIGINS = frozenset({"tauri://localhost", "http://tauri.localhost"})
 _ext_cfg_state = {
     "ext_bridge_enabled": False,
     "ext_token": "",
@@ -309,8 +389,8 @@ def _ext_token_ok(token):
 # 反代 HTTPS 终止时显式信任单跳 X-Forwarded-*。默认关闭，避免直接暴露面板时
 # 客户端伪造转发头绕过 Origin 同源校验；启用者必须确保前置代理覆盖而非追加这些头。
 TRUST_PROXY_ENV = "MASKIT_TRUST_PROXY"
-# 反代/兜底端口监听地址：与面板一样，Docker 用 MASKIT_LISTEN_HOST=0.0.0.0 对外
-LISTEN_HOST = os.environ.get("MASKIT_LISTEN_HOST", "127.0.0.1").strip() or "127.0.0.1"
+# 反代/兜底端口监听地址：与面板同口径——默认仅本机，局域网开关或 MASKIT_LISTEN_HOST=0.0.0.0 放开
+LISTEN_HOST = _resolve_bind_host("MASKIT_LISTEN_HOST", _LAN_ACCESS)
 # API token 每次启动随机；远程模式下用户无法读容器内 proxy_token 文件，
 # 允许 MASKIT_PANEL_TOKEN 固定（≥16 位，太短直接忽略并回退随机，宁可拒绝也不弱化）。
 _MIN_PANEL_TOKEN_LEN = 16
@@ -495,21 +575,23 @@ def _origin_ok():
     # 也不要静默放行。
     if request.path in _EXT_ENDPOINTS and origin.lower().startswith(_EXT_ORIGIN_SCHEMES):
         return True
+    # Tauri 桌面壳的来源必须**先于**远程模式分支放行。
+    #
+    # 壳层的 fetch 经 Rust reqwest 代发，WebView2 自动附带 `Origin: tauri://localhost`
+    # （Request 构造时带入，JS 无法覆盖）。而桌面端开局域网访问（config.lan_access）
+    # 会把 REMOTE_MODE 置真，下面的同源校验拿它去比 `http://127.0.0.1:5801`，
+    # **必然不等**——用户只是打开了一个网络开关，桌面端界面却当场全部 403
+    # （2026-10-19 实测复现）。这不是放宽安全边界：壳层来源不是网页能伪造的
+    # （浏览器禁止 JS 设置 Origin），而 X-Shield-Token 仍是主防线。
+    if origin.lower() in _TAURI_ORIGINS:
+        return True
     # 远程模式：SPA 与 API 同源托管，Origin 必须等于本次请求的 scheme://host，
     # 拒绝任何外站页面借用户浏览器发起的跨源调用（token 在内存里，但 CSRF 面仍要关死）。
     if REMOTE_MODE:
         scheme, host = _effective_request_origin()
         return _normalize_origin(origin) == _normalize_origin(f"{scheme}://{host}")
-    # 放行面：本地面板同源 + Tauri 壳页面（tauri://localhost / http://tauri.localhost）。
-    # Tauri 壳的 fetch 经 Rust reqwest 代发（tauri-plugin-http），WebView2 会对跨域
-    # 请求自动附加 Origin: tauri://localhost（Request 构造时带入，JS 无法覆盖）——
-    # 不放行则新桌面壳全部 403。X-Shield-Token 仍是主防线（每次启动随机、仅本机）。
-    return origin in {
-        f"http://127.0.0.1:{PANEL_PORT}",
-        f"http://localhost:{PANEL_PORT}",
-        "tauri://localhost",
-        "http://tauri.localhost",
-    }
+    # 本地面板同源白名单（Tauri 壳已在上面统一放行）。
+    return origin.lower() in {f"http://127.0.0.1:{PANEL_PORT}", f"http://localhost:{PANEL_PORT}"}
 
 
 def _guard_reject(reason, resp, status=403):
@@ -705,6 +787,47 @@ def _next_seq():
 # 800 行环形缓冲几分钟就被占满，崩溃现场的 Traceback 全被冲掉。一律不进 log_buf。
 _CONN_NOISE_RE = re.compile(r"client (connect|disconnect|tls|handshake)|server (connect|disconnect)|\d+\.\d+\.\d+\.\d+:\d+: client")
 
+# 面板自身诊断行的落盘通道（engine.log）。
+#
+# 为什么需要：_emit_log 只进 800 行内存环形缓冲，而引擎进程是被壳层
+# `taskkill /F /T` 强杀的（src-tauri/src/lib.rs 的 terminate_process_tree），
+# 没有 flush 机会 —— 启动失败、上游端口未监听、代理自启异常这些最需要事后归因的
+# 行，会在进程被杀的瞬间整片消失（issue #41 报障时没有任何日志可交，就是这么来的）。
+#
+# **只落 [panel]/[engine]/[proxy] 前缀的诊断行**：SHIELD 事件行携带 req_preview /
+# original 等明文，落盘会把「原文只进详情弹窗」的约束打穿，而诊断包会带走这个文件。
+_DIAG_LOG_MAX = 2 * 1024 * 1024
+_DIAG_PREFIXES = ("[panel]", "[engine]", "[proxy]")
+# 默认只在打包态（PyInstaller 冻结）开启：它解决的是「壳层 taskkill /F 导致内存日志
+# 整片消失」，而源码态有控制台可看、测试会把诊断行写进用户真实数据目录。
+# 需要排查时用 MASKIT_DIAG_LOG=1 强制打开。
+_DIAG_LOG_ENABLED = bool(getattr(sys, "frozen", False)) or (
+    os.environ.get("MASKIT_DIAG_LOG", "").strip().lower() in ("1", "true", "yes")
+)
+_diag_log_lock = threading.Lock()
+
+
+def _persist_diag_line(line):
+    r"""把面板自身诊断行追加到 DATA_ROOT/engine.log（超 2MB 轮转一份 .1）。
+
+    失败绝不抛出：日志落盘是排障增强，不能反过来影响脱敏主链路。
+    路径在调用时解析（不是模块级常量）：测试会 patch `panel.DATA_ROOT` 做隔离，
+    提前绑死就会绕过隔离、写进用户真实的 `%APPDATA%\Maskit`。
+    """
+    try:
+        path = DATA_ROOT / "engine.log"
+        rotated = DATA_ROOT / "engine.log.1"
+        with _diag_log_lock:
+            try:
+                if path.exists() and path.stat().st_size > _DIAG_LOG_MAX:
+                    os.replace(path, rotated)
+            except Exception:
+                pass
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        pass
+
 
 def _emit_log(line: str):
     line = line.rstrip("\r\n")
@@ -725,6 +848,9 @@ def _emit_log(line: str):
         log_buf.append(line)
         if ev:
             events.append(ev)
+    # 落盘放在锁外：文件 IO 不能占着 buf_lock（2.5s 轮询的 /api/logs 会等这把锁）。
+    if _DIAG_LOG_ENABLED and line.startswith(_DIAG_PREFIXES):
+        _persist_diag_line(line)
 
 
 # tail 通道脱敏白名单：log_buf 保留 SHIELD 行原文供本地排障
@@ -2330,16 +2456,22 @@ def _listening_port_pids(ports, fresh=False):
                     continue
                 if port in wanted:
                     found.setdefault(port, set()).add(pid)
-    # POSIX 工具不可用时，连接探测只补充端口存在性，不伪造 PID（PID 1 可能被误杀）。
-    if sys.platform != "win32":
-        for p in wanted - set(found):
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(0.05)
-                    if s.connect_ex(("127.0.0.1", p)) == 0:
-                        found[p] = set()
-            except Exception:
-                pass
+    # 端口表取不到时（Windows 的 netstat 被安全软件/组策略拦截、连接数大导致 5s
+    # 超时，或精简镜像缺 ss/lsof），连接探测只补充端口存在性，不伪造 PID
+    # （PID 1 可能被误杀）。**必须全平台生效**：Windows 曾只在 netstat 分支取 PID
+    # 而没有这段兜底，netstat 一旦返回空，本函数就恒返回空字典，于是：
+    # ① 启动就绪判定恒判「端口未监听」，必然等到 _START_READY_TIMEOUT 后报启动失败；
+    # ② 端口占用预检永远查不出占用（真冲突被推迟成 60s 后误报「未监听」）；
+    # ③ watchdog 每 10s 就把正在正常转发的 mitmdump 杀掉重启（issue #41）。
+    # 只探 netstat 未命中的端口：未监听时 connect 立即 RST，不会刷爆 mitmdump 日志。
+    for p in wanted - set(found):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.05)
+                if s.connect_ex(("127.0.0.1", p)) == 0:
+                    found[p] = set()
+        except Exception:
+            pass
     _netstat_cache["ts"] = now
     _netstat_cache["data"] = found
     return {port: pids for port, pids in found.items() if port in wanted}
@@ -2993,6 +3125,10 @@ def _start_proxy_locked():
         if p.poll() is None:
             # 端口迟迟不 listen：进程还活着但不可用，先杀掉释放端口，避免占端口的僵尸
             _emit_log(f"[panel] mitmdump {_START_READY_TIMEOUT}s 内未监听端口 {missing}，判定启动失败")
+            # 现场落盘必须在 kill 之前：这一分支的 mitmdump 真实输出只作为 API 返回值
+            # 给前端 toast，用户关掉提示就永久丢失；而 _emit_log 只进内存、进程随后
+            # 被强杀，等于启动失败现场什么都不剩（只有 crash-dumps 里才有端口占用表）。
+            _dump_crash_context("startfail")
             try:
                 _kill_proxy_tree(p.pid)
             except Exception:
@@ -3631,6 +3767,13 @@ def default_config():
         # scheme://host 不一致会导致面板 403——无法进 UI 时用环境变量
         # MASKIT_DISABLE_ORIGIN_CHECK=1 逃生；能进 UI 时关这个开关等效。
         "origin_check": True,
+        # ── 局域网访问（默认关）──
+        # 开启后面板（5801）与代理端口绑定 0.0.0.0，同一局域网的其它设备可直接访问。
+        # 为什么默认关：一旦监听非回环地址，Host 校验必然放开（局域网 IP 无法枚举），
+        # 面板就只剩 X-Shield-Token 一道防线。桌面用户没有这个需求时，多开一个
+        # 入口就是纯风险。容器/无头部署不受它影响（MASKIT_PANEL_HOST 环境变量优先）。
+        # 改它需要重启引擎才生效（绑定地址在 app.run 时确定，无法热改）。
+        "lan_access": False,
         # 敏感词统计是否记录明文。默认开：打码 preview（1**@***.com）排出来的
         # 排行榜没有信息量，而数据只落本机 SQLite、不出网。关掉后库里永不出现明文。
         "record_plaintext_words": True,
@@ -3903,6 +4046,69 @@ def _preflight_connection_controls(upstreams):
                 _validate_upstream_connection_policy(upstream["connection_policy"], http2=False)
 
 
+# takeover 的预检**不**放进上面那个函数：那个的语义是「显式不支持就必须挡住保存」，
+# 而接管是性能选项，退回直连是安全默认——为它拦下整次保存比警告难接受得多。
+# 所以这里是「存后建议」，走 warnings 通道（前端把 warnings 逐条 toast 出来）。
+_TAKEOVER_ADVICE_MODE = (
+    "上游传输接管只在反向代理模式下生效，当前模式是 {mode}：已保存但不会生效 / "
+    "Upstream takeover only takes effect in reverse mode (current: {mode}); saved but inactive"
+)
+_TAKEOVER_ADVICE_TARGET = (
+    "客户端「{name}」的接管不会生效：目标 {target} 规范化不出 origin，"
+    "sidecar 的目标白名单按 origin 建，宁可退回直连也不会转发给它不认识的上游 / "
+    "Takeover for \"{name}\" stays inactive: {target} yields no origin, and the sidecar "
+    "allowlist is keyed by origin (falls back to the direct route)"
+)
+
+
+def _takeover_origin_normalizer():
+    """取 sidecar 那一份 `normalize_origin`：白名单是谁建的，判据就得用谁的。
+
+    在面板里另写一份「这个 target 能不能规范化」，等于允许两份代码各自漂移，而漂移
+    的表现恰好就是本函数要消灭的那种「开关开了却不起作用」。sidecar 属于引擎侧模块，
+    这里只在保存后跑一次，所以懒加载（同 `selfcheck` 的做法）；拿不到就跳过这项检查
+    ——预检自己坏了绝不能拖累保存。
+    """
+    try:
+        from upstream_sidecar import normalize_origin
+    except Exception:
+        return None
+    return normalize_origin
+
+
+def _takeover_preflight_advice(cfg):
+    """把「接管存了但永远不会生效」当场说给用户，而不是留到指标里让人猜。
+
+    C1 接管成立的条件只有两个，都写死在别处：
+      ① 反向代理模式——`transparent._c1_apply_takeover` 的唯一调用点是
+         `apply_reverse_routing`，explicit/local 模式下这个键被完全忽略；
+      ② target 能规范化成 origin——sidecar 的白名单就是按 origin 建的，规范化不出
+         origin 的上游即使被送到 sidecar 也会被自己拒转。
+    两种情况以前都毫无提示：面板显示开关已开，而 runtime metrics 里
+    `caller_connections` 永远是 0，用户只能猜「接管没加速是不是没生效」。
+    """
+    if not isinstance(cfg, dict):
+        return []
+    on = [u for u in (cfg.get("upstreams") or [])
+          if isinstance(u, dict) and is_true(u.get("takeover"))]
+    if not on:
+        return []
+    advice = []
+    mode = str(cfg.get("capture_mode") or "reverse").strip().lower()
+    if mode != "reverse":
+        advice.append(_TAKEOVER_ADVICE_MODE.format(mode=mode))
+    normalize = _takeover_origin_normalizer()
+    if normalize is None:
+        return advice
+    for up in on:
+        raw_target = up.get("target") or ""
+        if normalize(raw_target):
+            continue
+        advice.append(_TAKEOVER_ADVICE_TARGET.format(
+            name=up.get("name") or "?", target=_safe_target(raw_target)))
+    return advice
+
+
 _CONNECTION_POLICY_LOAD_WARNING = (
     "connection_policy 无效或当前不可用：已保留原值且未改写文件，请移除显式策略后保存。 / "
     "Invalid or unavailable connection_policy: original value and file retained; remove the explicit policy before saving."
@@ -4060,8 +4266,9 @@ def normalize_config(raw, warnings=None, *, validate_controls=True):
         prefixes = _uniq(prefixes)[:100] or list(DEFAULT_SECRET_PREFIXES)
 
     # 反向代理 upstream 路由表
+    has_upstreams_field = "upstreams" in raw and raw.get("upstreams") is not None
     ups = []
-    raw_ups = raw.get("upstreams", base["upstreams"])
+    raw_ups = raw.get("upstreams", base["upstreams"]) if has_upstreams_field else base["upstreams"]
     if isinstance(raw_ups, list):
         seen_names = set()
         seen_base = set()
@@ -4072,9 +4279,9 @@ def normalize_config(raw, warnings=None, *, validate_controls=True):
             name = str(u.get("name") or "").strip()
             base_path = str(u.get("base_path") or "").strip()
             target = str(u.get("target") or "").strip()
-            # name 限安全字符集（防 DOM XSS，允许中英文字母、数字、下划线、减号）
-            if not name or not re.fullmatch(r"[A-Za-z0-9_\-\u4e00-\u9fff]{1,40}", name):
-                warn.append(f"客户端名称「{name[:20] or '(空)'}」含不支持的字符（只能中英文、数字、_ 和 -），该条已忽略")
+            # name 限安全字符集（防 DOM XSS，允许中英文字母、数字、空格、下划线、减号）
+            if not name or not re.fullmatch(r"[A-Za-z0-9_\-\u4e00-\u9fff ]{1,40}", name):
+                warn.append(f"客户端名称「{name[:20] or '(空)'}」含不支持的字符（只能中英文、数字、空格、_ 和 -），该条已忽略")
                 continue
             if not target:
                 warn.append(f"客户端「{name}」未填真实上游地址，该条已忽略")
@@ -4091,7 +4298,8 @@ def normalize_config(raw, warnings=None, *, validate_controls=True):
             # user_base 记录「用户显式填过且合法」的值：只有它被改名才告警——单端口前缀
             # 模式下 base_path 就是客户端 base_url 的路径，改名等于改契约，用户必须同步改
             # 客户端配置；静默改名会让他对着 404 找不到原因。自动生成的 /up_N 不告警（本就没契约）。
-            slug = re.sub(r"[^A-Za-z0-9_\-]", "", name).lower()[:40]
+            slug = re.sub(r"[^A-Za-z0-9_\-]", "", name.replace(" ", "_")).lower()[:40]
+            slug = re.sub(r"_+", "_", slug).strip("_")
             user_base = base_path
             if not base_path or not re.fullmatch(r"/[A-Za-z0-9_\-/]{1,60}", base_path):
                 base_path = "/" + (slug or f"up_{len(ups) + 1}")
@@ -4188,7 +4396,14 @@ def normalize_config(raw, warnings=None, *, validate_controls=True):
                         continue
                     model_rules.append({"match": match, "headers": rule_headers, "body": rule_body})
             upstream = {"name": name, "base_path": base_path, "port": port, "target": target,
-                        "paths": paths_u, "use_proxy": bool(u.get("use_proxy")),
+                        "paths": paths_u, "use_proxy": is_true(u.get("use_proxy")),
+                        # takeover 由 transparent._c1_apply_takeover 消费。不在这里显式保留
+                        # 就等于「开关存不住」：手改 config.json 生效，但任何一次面板保存
+                        # 都会把它抹掉且不留痕迹。
+                        # 两个开关都用 `is_true` 而不是裸 `bool()`：手改配置里写成字符串
+                        # "false" 时 `bool()` 读成 True，而这两个都改转发路径——面板把
+                        # 「关掉」存成「开启」，引擎再照着开启走，用户完全看不出链路变了。
+                        "takeover": is_true(u.get("takeover")),
                         "extra_headers": extra_headers, "model_rules": model_rules}
             if "connection_policy" in u and u["connection_policy"] is not None:
                 try:
@@ -4203,7 +4418,7 @@ def normalize_config(raw, warnings=None, *, validate_controls=True):
                     if _CONNECTION_POLICY_LOAD_WARNING not in warn:
                         warn.append(_CONNECTION_POLICY_LOAD_WARNING)
             ups.append(upstream)
-    if not ups:
+    if not ups and not has_upstreams_field:
         ups = list(DEFAULT_UPSTREAMS)
 
     try:
@@ -4279,6 +4494,8 @@ def normalize_config(raw, warnings=None, *, validate_controls=True):
         "fail_closed": bool(raw.get("fail_closed", True)),
         "response_scan": bool(raw.get("response_scan", True)),
         "origin_check": bool(raw.get("origin_check", True)),
+        # 局域网访问：缺字段 = 旧配置 = 关（安全开关的默认必须偏保守，不能因升级静默放开）
+        "lan_access": bool(raw.get("lan_access", False)),
         "record_plaintext_words": bool(raw.get("record_plaintext_words", True)),
         "ext_bridge_enabled": ext_enabled,
         "ext_token": ext_token,
@@ -4937,12 +5154,17 @@ def api_set_config():
         # 整个「读当前配置 → 合并字段 → 校验写盘 → 同步内存」必须在 cfg_lock 临界区内原子完成！
         # 避免并发请求各自拿到旧快照后互相覆盖（实测两个并发 POST 各改一字段会丢掉一个更新）。
         with cfg_lock:
+            allow_shrink = bool(incoming.pop("_allow_shrink", False) or incoming.pop("allow_shrink", False))
             merged = _load_config_locked()
             if isinstance(merged, dict):
                 for k, v in incoming.items():
                     merged[k] = v
                 incoming = merged
-            cfg = save_config(incoming, warnings)
+            cfg = save_config(incoming, warnings, allow_shrink=allow_shrink)
+            # 接管预检放在 save 之后、且用**规整后的** cfg：那时 target 已补过 scheme、
+            # takeover 已是真 bool、capture_mode 是合并后的最终值——判据才对得上引擎
+            # 真正会读到的东西（用 incoming 判会把「没提交的字段」当成默认值）。
+            warnings.extend(_takeover_preflight_advice(cfg))
     except Exception as e:
         return jsonify({"ok": False, "error": _safe_public_text(e, 240)}), 400
     _emit_log("[panel] 配置已保存（词表/规则/域名等热重载即时生效）")
@@ -5088,13 +5310,21 @@ def _apply_config_patch(cfg, key, op, path, value, match=None):
             raise ValueError("match 必须是字符串")
         val_name = value.get("name")
         target_name = match if match is not None else val_name
-        if not isinstance(target_name, str) or not target_name:
-            raise ValueError("list_upsert 需要 name 或 match 指明要更新的条目")
+        if not isinstance(target_name, str) or not target_name.strip():
+            raise ValueError("list_upsert 需要非空 name 或 match 指明要更新的条目")
+        target_name = target_name.strip()
         if val_name is None:
             # 带 match 但 value 没传 name 时自动继承目标名，防止成为无名对象在 normalize 时被丢弃
             value = dict(value, name=target_name)
-        elif not isinstance(val_name, str) or not val_name:
+        elif not isinstance(val_name, str) or not val_name.strip():
             raise ValueError("list_upsert 的条目必须包含非空字符串 name")
+        else:
+            value = dict(value, name=val_name.strip())
+
+        if key == "upstreams" and not path:
+            u_name = value["name"]
+            if not re.fullmatch(r"[A-Za-z0-9_\-\u4e00-\u9fff ]{1,40}", u_name):
+                raise ValueError(f"客户端名称「{u_name[:20]}」不合法（只能中英文、数字、空格、_ 和 -，长度 1-40）")
         for i, item in enumerate(node):
             if isinstance(item, dict) and item.get("name") == target_name:
                 if (key == "upstreams" and not path and
@@ -5107,9 +5337,19 @@ def _apply_config_patch(cfg, key, op, path, value, match=None):
                 # omission, including rename; explicit null intentionally resets it.
                 if key == "upstreams" and not path and "connection_policy" not in value and "connection_policy" in item:
                     value = dict(value, connection_policy=item["connection_policy"])
+                # takeover 同理：陈旧表单/其它客户端整份覆盖时，不能顺手把 C1 关掉——
+                # 那会让「已经开着接管的上游」在一次无关编辑后静默退回 mitmproxy 直连。
+                if key == "upstreams" and not path and "takeover" not in value and "takeover" in item:
+                    value = dict(value, takeover=item["takeover"])
+                if key == "upstreams" and not path:
+                    if not str(value.get("target") or "").strip():
+                        raise ValueError("客户端真实上游地址（target）不能为空")
                 node[i] = value
                 break
         else:
+            if key == "upstreams" and not path:
+                if not str(value.get("target") or "").strip():
+                    raise ValueError("客户端真实上游地址（target）不能为空")
             node.append(value)
     else:  # list_del
         if not isinstance(node, list) or not isinstance(value, str) or not value:
@@ -5153,6 +5393,7 @@ def api_patch_config():
             allow_before = _allow_hosts_of(cfg)
             cfg = _apply_config_patch(cfg, key, op, path, body["value"], body.get("match"))
             cfg = save_config(cfg, warnings)
+            warnings.extend(_takeover_preflight_advice(cfg))
     except Exception as e:
         return jsonify({"ok": False, "error": _safe_public_text(e, 240)}), 400
     _emit_log(f"[panel] 配置增量已保存（{key} / {op}）")
@@ -5296,6 +5537,7 @@ def api_status():
             "base_path": u.get("base_path") or "",
             "paths": [str(p).split("?", 1)[0].split("#", 1)[0] for p in (u.get("paths") or [])],
             "use_proxy": bool(u.get("use_proxy")),
+            "takeover": bool(u.get("takeover")),
         }
         status_upstreams.append(status_u)
         upstream_ports.append({
@@ -5324,6 +5566,11 @@ def api_status():
         "capture_mode": capture_mode,
         "proxy_port": PROXY_PORT,
         "proxy_url": f"http://127.0.0.1:{PROXY_PORT}",
+        # 局域网访问：config.lan_access 是用户意图，panel_host 是**本进程实际绑定**。
+        # 两者不一致（开关打开但仍绑回环）＝改了还没重启，前端据此提示重启。
+        "lan_access": bool(cfg.get("lan_access", False)),
+        "panel_host": PANEL_HOST,
+        "lan_urls": [f"http://{ip}:{PANEL_PORT}" for ip in _lan_ipv4_addresses()] if REMOTE_MODE else [],
         "upstreams": status_upstreams,
         "upstream_ports": upstream_ports,
         "admin": is_admin(),
@@ -6237,7 +6484,11 @@ def api_logs():
                         _e.get("model") or "",
                         _usage.get("prompt_tokens") or 0,
                         _usage.get("completion_tokens") or 0,
-                        _overrides2, _price_cache2)
+                        _overrides2,
+                        price_catalog=_price_cache2,
+                        cache_read_tokens=_usage.get("cache_read_tokens") or 0,
+                        cache_write_tokens=_usage.get("cache_write_tokens") or 0,
+                    )
                     _e["cost_usd"] = round(_cost, 4)
     except Exception:
         pass
@@ -6506,7 +6757,15 @@ def api_stats_models():
         models = stats_models(days=days)
         out = []
         for m in models:
-            cost, price = estimate_cost(m["model"], m["prompt"], m["completion"], overrides, cache_prices)
+            cost, price = estimate_cost(
+                m["model"],
+                m["prompt"],
+                m["completion"],
+                overrides,
+                price_catalog=cache_prices,
+                cache_read_tokens=m.get("cache_read") or 0,
+                cache_write_tokens=m.get("cache_write") or 0,
+            )
             m["cost_usd"] = cost
             m["priced"] = price is not None
             out.append(m)
@@ -6553,6 +6812,10 @@ _EXPORT_KEEP_FIELDS = {
     # 不带责任方就没法回答“该查引擎、上游还是客户端”。
     "failure_owner",       # engine / upstream / client / dns / proxy
     "error_type",          # 异常类名（ConnectionResetError / ReadTimeout …）
+    # 上游连续静默秒数：`reason=upstream_idle` 的**证据**。只带这个结论字段而不带它，
+    # 拿日志复盘时就无法自证「是上游没吐字节」而不是「客户端先挂断」——那正是这次
+    # 改判要回答的问题。值是本地打点的时长差，不含正文、凭据与远端标识。
+    "upstream_idle_s",
     # ---- 统一口径（批次 2）：处置结论与完整度 ----
     # 这几项是“这一条到底算不算扫干净了”的唯一机器可读结论，导出缺了它们，
     # 拿日志找人复盘时就只能看现象（命中 0 条）而看不到结论（直通未脱敏 / 检测不完整）。
@@ -7437,19 +7700,33 @@ def api_ext_restore():
                 # 什么告警都不显示，用户无从判断是"引擎坏了"还是"模型在编"（代理链路
                 # 正是因为看得见才没有踩这个坑）。这里补齐，两个字段都不进任何聚合。
                 unresolved = int(s.get("unresolved") or 0)
+                # 非本机签发的占位符形态字符串：与 unresolved 分开记，不进告警
+                # （与代理链路 `_emit_restore_summary` 同口径）。
+                foreign = int(s.get("foreign") or 0)
+                foreign_samples = [str(x) for x in (s.get("foreign_samples") or [])][:5]
                 degraded = int(s.get("degraded") or 0)
                 # 未还原占位符样本：只用于定位「到底是哪些 token 没还原、什么形态」。
-                # 存的是占位符本身（不含任何明文），落库安全。取不到就是空列表。
+                # 存的是占位符本身（不含任何原文），落库安全。取不到就是空列表。
                 unresolved_samples = [str(x) for x in (s.get("unresolved_samples") or [])][:5]
+                # 「回显但未还原」的后缀集合与响应侧契约豁免块数：与代理链路同源读取。
+                # 前者区分「模型没提」与「回显了但映射丢了」，后者让签名思考块豁免
+                # 在扩展链路的详情页也可见（与 MASK 侧 signed_blocks_skipped 对称）。
+                unresolved_suffixes = set(s.get("unresolved_suffixes") or ())
+                restore_signed_skipped = int(s.get("restore_signed_skipped") or 0)
                 # 会话不存在时 restore() **只数不还原**（安全门：放行会让自造 sid 借
                 # 全局复用表还原占位符），计数落在兜底表里，这里并进本次事件——
                 # 否则「重启引擎后打开历史对话，页面上满屏 {{...}}」在事件页是 0。
-                _ns_count, _ns_samples = tr._take_orphans_without_session(sid)
+                _ns_count, _ns_samples, _ns_foreign, _ns_foreign_samples = tr._take_orphans_without_session(sid)
                 if _ns_count:
                     unresolved += _ns_count
                     for _x in _ns_samples:
                         if len(unresolved_samples) < 5 and _x not in unresolved_samples:
                             unresolved_samples.append(_x)
+                if _ns_foreign:
+                    foreign += _ns_foreign
+                    for _x in _ns_foreign_samples:
+                        if len(foreign_samples) < 5 and _x not in foreign_samples:
+                            foreign_samples.append(_x)
                 try:
                     restored_tokens = s.get("restored_tokens") or set()
                     seen_toks = set()
@@ -7465,6 +7742,10 @@ def api_ext_restore():
                             "length": len(orig),
                             "preview": tr._preview(orig, lbl),
                             "restored": tok in restored_tokens,
+                            # 模型回显了该占位符但未能还原（后缀命中未还原集合）——
+                            # 与「模型压根没提」是两回事，前端据此分两个章展示。
+                            **({"unresolved": True}
+                               if (m and (m.group(2) or "").lower() in unresolved_suffixes) else {}),
                         }
                         if is_cred:
                             item["cred"] = True
@@ -7501,9 +7782,11 @@ def api_ext_restore():
                 except Exception:
                     items = []
             # 仅在有还原成功、有异常未还原，或会话发生过敏感词打码时才记录 RESTORE，杜绝空事件刷屏
+            # （外来占位符单独计数，但同样只在真出现时建事件）
             should_emit = (
                 _ext_cfg().get("ext_record_events", True)
-                and (restored > 0 or unresolved > 0 or degraded > 0 or len(items) > 0)
+                and (restored > 0 or unresolved > 0 or degraded > 0
+                     or foreign > 0 or len(items) > 0)
             )
             if should_emit:
                 # 还原后的正文里可能**裸复述**了模型见过的凭据原文，落库前必须清洗
@@ -7521,6 +7804,12 @@ def api_ext_restore():
                 tr._emit("RESTORE", ingress="ext", sid=sid,
                          restored=restored, unresolved=unresolved, degraded=degraded,
                          unresolved_samples=unresolved_samples,
+                         # 外来/示例占位符：单独上报，**不进 unresolved**（与代理链路同口径）
+                         foreign=foreign,
+                         **({"foreign_samples": foreign_samples} if foreign_samples else {}),
+                         # 响应侧契约豁免计数（与 MASK 侧同名；缺省不带，避免噪声）
+                         **({"signed_blocks_skipped": restore_signed_skipped}
+                            if restore_signed_skipped else {}),
                          items=items,
                          resp_preview=_out_text[:800],
                          dialog=_out_text[:4000],
@@ -9048,7 +9337,8 @@ def _diagnostics_payload(error_limit=60):
     out["upstreams"] = [
         {"name": u.get("name"), "port": u.get("port"),
          "target": _safe_target(u.get("target")),
-         "base_path": u.get("base_path"), "use_proxy": bool(u.get("use_proxy"))}
+         "base_path": u.get("base_path"), "use_proxy": bool(u.get("use_proxy")),
+         "takeover": bool(u.get("takeover"))}
         for u in (cfg.get("upstreams") or [])
     ]
 
@@ -9103,7 +9393,9 @@ def _diagnostics_payload(error_limit=60):
                 "ner_global_throttled", "ner_sem_wait_ms",
                 # 失败归因（批次 8 / P0-5）：诊断包里的 recent_errors 正是用户
                 # “发过来问为什么失败”的那一段，没有责任方就只能靠肉眼猜。
-                "failure_owner", "error_type")
+                # `upstream_idle_s` 是 `reason=upstream_idle` 的证据本身：只带结论
+                # 不带连续静默秒数，接包的人无法核对这条判据有没有被误触发。
+                "failure_owner", "error_type", "upstream_idle_s")
         rows = []
         for e in fetch_events(since=0, limit=600, max_limit=EXPORT_MAX):
             if e.get("type") not in bad and int(e.get("http_status") or 0) < 400:
@@ -9459,7 +9751,15 @@ def start_panel_server(open_browser_on_start=True):
         # 已存在的旧文件不会被 O_CREAT 的 mode 改写，必须显式再收紧一次
         os.chmod(token_path, 0o600)
     except Exception as e:
-        _emit_log(f"[panel] 写 token 文件失败(壳层取不到 token): {e}")
+        # 双写：_emit_log 只进内存，而壳层的就绪条件是「/healthz 通 + token 文件存在」
+        # （src-tauri/src/lib.rs 的 readiness_loop），写失败会让面板明明健康却永远判
+        # 「未就绪」（前端一直转圈、API 全 401）。必须进 engine-stdout.log，否则无现场。
+        _msg = f"[panel] 写 token 文件失败(壳层取不到 token): {e}"
+        _emit_log(_msg)
+        try:
+            print(_msg, file=sys.stderr, flush=True)
+        except Exception:
+            pass
     atexit.register(shutdown)
     # signal/console handler 只能在主线程注册；pywebview 模式下本函数在子线程运行
     is_main = threading.current_thread() is threading.main_thread()
@@ -9470,11 +9770,20 @@ def start_panel_server(open_browser_on_start=True):
         install_console_close_handler()
     if open_browser_on_start:
         threading.Thread(target=open_browser, daemon=True).start()
-    print(f"[panel] http://{PANEL_HOST}:{PANEL_PORT}")
+    # 首行带版本号：面板连不上时 UI 拿不到版本（版本徽标取自 /api/status），
+    # 而“报障时先确认对方是哪个版本”只能靠这行日志。
+    print(f"[panel] Data Maskit v{__version__}  http://{PANEL_HOST}:{PANEL_PORT}")
     if REMOTE_MODE:
         # 远程模式下用户只能从这里拿到 token（随机时打印明文；固定时只提示来源）
         if _env_token:
             print("[panel] remote mode: token from MASKIT_PANEL_TOKEN; open http://<host>:%d (enter token in WebUI, or quick access: .../#token=<MASKIT_PANEL_TOKEN>)" % PANEL_PORT)
+        elif _LAN_ACCESS:
+            # 桌面端自己打开的「局域网访问」：token 就在本机数据目录的 proxy_token（0600），
+            # 没必要再往 engine-stdout.log 写一份明文——那个文件会被用户随手贴进 issue
+            # 或诊断包（issue 模板就在让人贴日志）。容器/无头部署用 MASKIT_PANEL_HOST
+            # 触发远程模式（_LAN_ACCESS 为假），走下面的明文分支，保持原有排障路径。
+            print(f"[panel] lan access: shared token is in {ROOT / 'proxy_token'}; "
+                  f"other devices open http://<this-host>:{PANEL_PORT}/#token=<token>")
         else:
             print(f"[panel] remote mode: MASKIT_PANEL_TOKEN not set, generated token = {API_TOKEN}")
             print(f"[panel] open http://<host>:{PANEL_PORT} (enter token in WebUI, or quick access: .../#token={API_TOKEN})")
@@ -9492,6 +9801,10 @@ def start_panel_server(open_browser_on_start=True):
 
 
 if __name__ == "__main__":
+    # 源码态直接运行（开发/调试 UI 用）：**不自启代理、不挂 fallback 兜底**。
+    # 完整引擎行为在 engine/engine_entry.py（Tauri sidecar 入口）——那边才跑
+    # _autostart + _start_fallback。所以用本入口时看到上游 187xx 端口无人监听
+    # 是预期现象，不要把「客户端连不上」当成脱敏链路的缺陷。
     import argparse as _ap
     _p = _ap.ArgumentParser(description="Data Maskit 引擎面板")
     _p.add_argument("--no-browser", action="store_true", help="不自动打开浏览器（测试/后台用）")

@@ -10,6 +10,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useVisibility } from '@/lib/useVisibility'
+import { pickUserNotes } from '@/lib/releaseNotes'
 import {
   Plus,
   Pencil,
@@ -35,6 +36,8 @@ import {
   Search,
   ChevronRight,
   Globe,
+  Download,
+  Upload,
 } from 'lucide-react'
 import { getConfig, saveConfig, saveBuiltinRules, patchConfig, testUpstream, openDataDir, restoreNetwork, getHealth, getConfigBackups, restoreConfigBackup, getPriceSyncStatus, syncPricesNow, getPriceList, getMappingStats, clearMappings, type ConfigBackup, type ConfigPatch, type SaveConfigResponse } from '@/api/settings'
 import { runAudit, cancelAudit, getAuditJob, getAuditReport } from '@/api/audit'
@@ -79,6 +82,7 @@ import { useI18n } from '@/lib/i18n'
 import { AboutUpdateCard } from '@/components/settings/AboutUpdateCard'
 import { EnvImportDialog } from '@/components/settings/EnvImportDialog'
 import { ModelRulesEditor } from '@/components/settings/ModelRulesEditor'
+import { WordsImportDialog } from '@/components/settings/WordsImportDialog'
 
 import { BackgroundCard } from '@/components/settings/BackgroundCard'
 import { ExtBridgeCard } from '@/components/settings/ExtBridgeCard'
@@ -289,6 +293,20 @@ function UpstreamForm({
   // 预设已不再预填凭据头，这里兜住手输与历史配置。
   const PLACEHOLDER_HEADER_VAL = /^\s*(?:Bearer\s+)?<[^<>]{1,64}>\s*$/i
   const saveChecked = () => {
+    const trimmedName = String(form.name ?? '').trim()
+    if (!trimmedName) {
+      toast(t('settings.upstream.nameRequired'), 'error')
+      return
+    }
+    if (!/^[A-Za-z0-9_\-\u4e00-\u9fff ]{1,40}$/.test(trimmedName)) {
+      toast(t('settings.upstream.nameInvalid'), 'error')
+      return
+    }
+    const trimmedTarget = String(form.target ?? '').trim()
+    if (!trimmedTarget) {
+      toast(t('settings.upstream.targetRequired'), 'error')
+      return
+    }
     // 空值的行不算违规：onSaveUpstream 会把它整行丢掉，效果等同「删行」，
     // 否则用户清空值（而不是点删除）时会被永久卡在弹窗里，改不动也退不出。
     const cred = Object.keys(extraHeaders).find(
@@ -323,7 +341,12 @@ function UpstreamForm({
         }
       }
     }
-    onSave({ ...form, model_rules: modelRules })
+    onSave({
+      ...form,
+      name: trimmedName,
+      target: trimmedTarget,
+      model_rules: modelRules,
+    })
   }
 
   return (
@@ -456,7 +479,12 @@ function UpstreamForm({
               <p className="text-muted-foreground">{t('connection.policyHint')}</p>
               {!deadlinesAvailable && <p role="status" className="text-muted-foreground">{t('connection.unavailable')}</p>}
               {http2 && <p className="text-muted-foreground">{t('connection.h1Only')}</p>}
-              <Label htmlFor="connection-reuse">{t('connection.reuse')}</Label>
+              <TooltipProvider delayDuration={200}>
+                <Label htmlFor="connection-reuse" className="flex items-center gap-1">
+                  {t('connection.reuse')}
+                  <Tooltip><TooltipTrigger asChild><HelpCircle className="h-3.5 w-3.5 cursor-help text-muted-foreground/60" /></TooltipTrigger><TooltipContent className="max-w-[280px] text-xs">{t('connection.reuseTooltip')}</TooltipContent></Tooltip>
+                </Label>
+              </TooltipProvider>
               <Select value={policy.reuse} disabled={!reuseAvailable} onValueChange={(v) => setPolicy({ reuse: v as 'default' | 'never' })}>
                 <SelectTrigger id="connection-reuse" className="h-8 text-xs"><SelectValue /></SelectTrigger>
                 <SelectContent>
@@ -465,12 +493,24 @@ function UpstreamForm({
                 </SelectContent>
               </Select>
               <div className="grid grid-cols-3 gap-2">
-                <div><Label htmlFor="connection-idle">{t('connection.idleTtl')}</Label>
-                  <Input id="connection-idle" className="mt-1 h-8 text-xs" type="number" min="0.001" step="any" disabled={!reuseAvailable} value={policy.idle_ttl_s ?? ''} placeholder={t('connection.unchanged')} onChange={(e) => setPolicy({ idle_ttl_s: e.target.value === '' ? null : Number(e.target.value) })} /></div>
-                <div><Label htmlFor="connection-connect">{t('connection.connectBudget')}</Label>
-                  <Input id="connection-connect" className="mt-1 h-8 text-xs" type="number" min="1" max="120" disabled={!deadlinesAvailable} value={form.connection_policy?.connect_timeout_s ?? ''} placeholder={t('connection.unenforced')} onChange={(e) => setPolicy({ connect_timeout_s: Number(e.target.value) })} /></div>
-                <div><Label htmlFor="connection-tls">{t('connection.tlsBudget')}</Label>
-                  <Input id="connection-tls" className="mt-1 h-8 text-xs" type="number" min="1" max="120" disabled={!deadlinesAvailable} value={form.connection_policy?.tls_handshake_timeout_s ?? ''} placeholder={t('connection.unenforced')} onChange={(e) => setPolicy({ tls_handshake_timeout_s: Number(e.target.value) })} /></div>
+                <div>
+                  <TooltipProvider delayDuration={200}>
+                    <Label htmlFor="connection-idle" className="flex items-center gap-1">{t('connection.idleTtl')}<Tooltip><TooltipTrigger asChild><HelpCircle className="h-3.5 w-3.5 cursor-help text-muted-foreground/60" /></TooltipTrigger><TooltipContent className="max-w-[280px] text-xs">{t('connection.idleTtlTooltip')}</TooltipContent></Tooltip></Label>
+                  </TooltipProvider>
+                  <Input id="connection-idle" className="mt-1 h-8 text-xs" type="number" min="0.001" step="any" disabled={!reuseAvailable} value={policy.idle_ttl_s ?? ''} placeholder={t('connection.unchanged')} onChange={(e) => setPolicy({ idle_ttl_s: e.target.value === '' ? null : Number(e.target.value) })} />
+                </div>
+                <div>
+                  <TooltipProvider delayDuration={200}>
+                    <Label htmlFor="connection-connect" className="flex items-center gap-1">{t('connection.connectBudget')}<Tooltip><TooltipTrigger asChild><HelpCircle className="h-3.5 w-3.5 cursor-help text-muted-foreground/60" /></TooltipTrigger><TooltipContent className="max-w-[280px] text-xs">{t('connection.connectBudgetTooltip')}</TooltipContent></Tooltip></Label>
+                  </TooltipProvider>
+                  <Input id="connection-connect" className="mt-1 h-8 text-xs" type="number" min="1" max="120" disabled={!deadlinesAvailable} value={form.connection_policy?.connect_timeout_s ?? ''} placeholder={t('connection.unenforced')} onChange={(e) => setPolicy({ connect_timeout_s: Number(e.target.value) })} />
+                </div>
+                <div>
+                  <TooltipProvider delayDuration={200}>
+                    <Label htmlFor="connection-tls" className="flex items-center gap-1">{t('connection.tlsBudget')}<Tooltip><TooltipTrigger asChild><HelpCircle className="h-3.5 w-3.5 cursor-help text-muted-foreground/60" /></TooltipTrigger><TooltipContent className="max-w-[280px] text-xs">{t('connection.tlsBudgetTooltip')}</TooltipContent></Tooltip></Label>
+                  </TooltipProvider>
+                  <Input id="connection-tls" className="mt-1 h-8 text-xs" type="number" min="1" max="120" disabled={!deadlinesAvailable} value={form.connection_policy?.tls_handshake_timeout_s ?? ''} placeholder={t('connection.unenforced')} onChange={(e) => setPolicy({ tls_handshake_timeout_s: Number(e.target.value) })} />
+                </div>
               </div>
               {form.connection_policy && <Button size="sm" variant="outline" onClick={() => set('connection_policy', null)}>{t('connection.reset')}</Button>}
             </div>
@@ -515,6 +555,15 @@ function UpstreamForm({
                   </div>
                 </div>
               )
+            )}
+            {captureMode === 'reverse' && (
+              <>
+                <label className="flex cursor-pointer select-none items-center gap-2 text-xs text-muted-foreground transition-colors hover:text-foreground">
+                  <Switch checked={!!form.takeover} onCheckedChange={(v) => set('takeover', v)} />
+                  {t('settings.upstream.takeover')}
+                </label>
+                <p className="text-[11px] leading-relaxed text-muted-foreground">{t('settings.upstream.takeoverHint')}</p>
+              </>
             )}
           </div>
         </div>
@@ -712,6 +761,8 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
   const [newCatName, setNewCatName] = useState('')
   // 从 .env 导入对话框
   const [envImportOpen, setEnvImportOpen] = useState(false)
+  // 敏感词库导入对话框
+  const [wordsImportOpen, setWordsImportOpen] = useState(false)
   const [newPrefix, setNewPrefix] = useState('')
   const [newDomain, setNewDomain] = useState('')
   const [newPath, setNewPath] = useState('')
@@ -771,12 +822,15 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
             : window.fetch('https://api.github.com/repos/lauchiwa/data-maskit/releases/latest'))
           const d = await r.json()
           version = String(d?.tag_name || '')
-          notes = String(d?.body || '')
+          // GitHub 的 body 是整章 CHANGELOG；服务端 /api/update/check 也可能把 GitHub
+          // body 原样转回。两处都过 pickUserNotes：有「更新摘要」取那段，没有则剥掉
+          // Markdown 标记再截断（老版本 Release 兼容），绝不把 `###` 甩到「关于」页。
+          notes = pickUserNotes(String(d?.body || ''))
           pubDate = String(d?.published_at || '')
         } catch {
           const d = await shieldFetch<{ version?: string; notes?: string; pub_date?: string }>('/api/update/check', { timeoutMs: 20000 })
           version = String(d?.version || '')
-          notes = String(d?.notes || '')
+          notes = pickUserNotes(String(d?.notes || ''))
           pubDate = String(d?.pub_date || '')
         }
         if (alive && version) {
@@ -992,7 +1046,12 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
     // 清理空 header（Key 为空或 Value 为空的条目不发后端）
     const extra = u.extra_headers ?? {}
     const cleanExtra = Object.fromEntries(Object.entries(extra).filter(([, v]) => v.trim() !== ''))
-    const clean: UpstreamConfig = { ...u, extra_headers: Object.keys(cleanExtra).length ? cleanExtra : undefined }
+    const clean: UpstreamConfig = {
+      ...u,
+      name: String(u.name ?? '').trim(),
+      target: String(u.target ?? '').trim(),
+      extra_headers: Object.keys(cleanExtra).length ? cleanExtra : undefined,
+    }
     // 编辑：按原 name 匹配（改名/改端口都更新而非新增）；新增：无匹配则添加
     const isEdit = editing != null
     // 只提交这一个客户端，由服务端在锁内按 name 就地更新/追加。
@@ -1049,6 +1108,13 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
     if (v.length < 3 && !v.startsWith('re:')) {
       toast(tf('settings.toast.wordTooShort', { word: v, n: v.length }), 'error')
     }
+    // 大小写变体友好提示（不阻断）：系统默认忽略大小写
+    if (!v.startsWith('re:')) {
+      const caseMatch = existing.find((x) => !x.startsWith('re:') && x.toLowerCase() === v.toLowerCase())
+      if (caseMatch) {
+        toast(tf('settings.words.caseVariantExists', { word: caseMatch }))
+      }
+    }
     save(() => patchConfig({ key: 'sensitive', op: 'list_add', path: [cat], value: [v] }), t('settings.toast.added'))
     setAddWordVal('')
     setAddWordCat(null)
@@ -1062,6 +1128,28 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
     if (!name.trim()) return
     save(() => patchConfig({ key: 'sensitive', op: 'set', path: [name.trim()], value: [] }), t('settings.toast.catAdded'))
     setNewCatName('')
+  }
+
+  const exportWords = () => {
+    const data = {
+      version: 1,
+      exported_at: new Date().toISOString(),
+      sensitive: cfg?.sensitive ?? {},
+      sensitive_disabled: cfg?.sensitive_disabled ?? [],
+      sensitive_word_disabled: cfg?.sensitive_word_disabled ?? {},
+      sensitive_word_whole: cfg?.sensitive_word_whole ?? [],
+    }
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    const dateStr = new Date().toISOString().slice(0, 10)
+    a.href = url
+    a.download = `maskit-words-${dateStr}.json`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+    toast(t('settings.words.exportSuccess'))
   }
 
   const removeCategory = (cat: string) => {
@@ -1489,6 +1577,12 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
               <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => setEnvImportOpen(true)}>
                 <FileText className="mr-1 h-3 w-3" /> {t('settings.words.envImport')}
               </Button>
+              <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => setWordsImportOpen(true)}>
+                <Upload className="mr-1 h-3 w-3" /> {t('settings.words.import')}
+              </Button>
+              <Button size="sm" variant="outline" className="h-7 text-xs" onClick={exportWords}>
+                <Download className="mr-1 h-3 w-3" /> {t('settings.words.export')}
+              </Button>
             </div>
           </div>
 
@@ -1516,8 +1610,13 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
             )
           })()}
           {/* 分类词表：卡片式（每分类一张卡，网格布局） */}
-          <div className="rounded-lg border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
-            {t('settings.words.regexHint').split('{n}')[0]}<code className="font-mono">re:</code>{t('settings.words.regexHint').split('{n}').slice(1).join('{n}')}
+          <div className="rounded-lg border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground space-y-1">
+            <div>
+              {t('settings.words.regexHint').split('{n}')[0]}<code className="font-mono">re:</code>{t('settings.words.regexHint').split('{n}').slice(1).join('{n}')}
+            </div>
+            <div>
+              {t('settings.words.caseInsensitiveHint')}
+            </div>
           </div>
           {/* 词条搜索：词库多时快速定位 */}
           {Object.values(words).reduce((n, l) => n + l.length, 0) > 15 && (
@@ -1645,6 +1744,9 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                         } else {
                           // 正常 → 整词
                           toggleWordWhole(w)
+                          if (/[\u4e00-\u9fff]/.test(w)) {
+                            toast(t('settings.words.cjkWholeHint'))
+                          }
                         }
                       }
                       return (
@@ -1748,6 +1850,18 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
               }
               return patchSequence(steps)
             }, msg)}
+          />
+
+          <WordsImportDialog
+            open={wordsImportOpen}
+            onOpenChange={setWordsImportOpen}
+            currentSensitive={words}
+            currentSensitiveDisabled={cfg?.sensitive_disabled ?? []}
+            currentSensitiveWordDisabled={wordDisabled}
+            currentSensitiveWordWhole={wordWhole}
+            onImport={(payload, msg) => {
+              save(payload, msg)
+            }}
           />
             </TabsContent>
 
@@ -2007,6 +2121,52 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                   </SelectContent>
                 </Select>
               </div>
+            </CardContent>
+          </Card>
+
+          {/* 局域网访问。绑定地址在 app.run 时确定，改开关必须重启引擎才生效，
+              所以这里只保存配置 + 提示，不在前端假装“已生效”。 */}
+          <Card className="border bg-card">
+            <CardHeader>
+              <CardTitle className="text-sm font-semibold">{t('settings.advanced.lanAccess')}</CardTitle>
+              <p className="mt-1 text-xs text-muted-foreground">{t('settings.advanced.lanAccessHint')}</p>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              <SettingToggle
+                label={t('settings.advanced.lanAccessToggle')}
+                desc={t('settings.advanced.lanAccessToggleDesc')}
+                checked={!!cfg?.lan_access}
+                onChange={(v) => save({ lan_access: v }, t('settings.toast.lanAccessSaved'))}
+              />
+              {!!cfg?.lan_access && (
+                <>
+                  <p className="text-[11px] leading-snug text-amber-600 dark:text-amber-400">
+                    {t('settings.advanced.lanAccessSecurity')}
+                  </p>
+                  {!!status?.lan_urls?.length && (
+                    <div>
+                      <div className="text-[11px] text-muted-foreground">{t('settings.advanced.lanAccessUrls')}</div>
+                      <div className="mt-1 flex flex-wrap gap-1.5">
+                        {status.lan_urls.map((u) => (
+                          <code key={u} className="rounded border bg-muted/40 px-1.5 py-0.5 font-mono text-[11px]">{u}</code>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {/* 配置已开但仍绑在回环：说明本进程启动时开关还是关的 */}
+                  {(status?.panel_host ?? '').startsWith('127.') && (
+                    <p className="text-[11px] text-muted-foreground">{t('settings.advanced.lanAccessRestart')}</p>
+                  )}
+                  {/* 局域网用户没有本机 token，必须告诉用户令牌存在哪；
+                      不给路径的话这个开关等于摆设（其它设备进不去面板）。 */}
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <Button size="sm" variant="outline" className="h-7 text-[11px]" onClick={doOpenDataDir}>
+                      {t('settings.security.openDataDir')}
+                    </Button>
+                    <span className="text-[11px] text-muted-foreground">{t('settings.advanced.lanAccessToken')}</span>
+                  </div>
+                </>
+              )}
             </CardContent>
           </Card>
 
@@ -2987,7 +3147,7 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
         <UpstreamForm
           http2={cfg?.http2 === true}
           transportCapabilities={cfg?._meta?.transport_capabilities}
-          initial={editing ?? { name: '', port: nextPort, target: '', use_proxy: false, paths: ['/v1'], base_path: '' }}
+          initial={editing ?? { name: '', port: nextPort, target: '', use_proxy: false, takeover: false, paths: ['/v1'], base_path: '' }}
           onSave={onSaveUpstream}
           onClose={() => { setEditing(null); setAdding(false) }}
           captureMode={cfg?.capture_mode ?? 'reverse'}

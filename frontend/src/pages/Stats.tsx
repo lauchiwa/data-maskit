@@ -309,7 +309,7 @@ function ModelRanking({ hidden }: { hidden: boolean }) {
                       </div>
                       <span className="shrink-0 text-[11px] text-muted-foreground">
                         {m.requests.toLocaleString()} {t('stats.timesSuffix')} ·{' '}
-                        <span title={`${toks.toLocaleString()} ${t('stats.tokens')}`}>
+                        <span title={m.cache_read ? tf('stats.tokensWithCache', { total: toks.toLocaleString(), cache: m.cache_read.toLocaleString() }) : `${toks.toLocaleString()} ${t('stats.tokens')}`}>
                           {formatTokensShort(toks, t('stats.unitSystem') === 'si' ? 'si' : 'cjk')} {t('stats.tokens')}
                         </span>
                         {m.priced

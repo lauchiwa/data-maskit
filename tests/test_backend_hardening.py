@@ -118,6 +118,105 @@ class PosixProcessTests(unittest.TestCase):
         self.assertEqual(out, {18701: set()})
 
 
+class WindowsPortScanTests(unittest.TestCase):
+    """Windows 也必须有连接探测兜底（issue #41）。
+
+    Windows 侧取监听端口只有 `netstat -ano -p tcp` 一条路：netstat 被安全软件 /
+    组策略拦截、或连接数大导致 5s 超时时，`_run_console` 落到 except 返回空串，
+    netstat 结果恒为空。此前兜底被 `if sys.platform != "win32"` 挡住，于是三条
+    路径一起失灵：启动就绪判定恒判「端口未监听」→ 等满 _START_READY_TIMEOUT（60s）
+    报启动失败（用户侧就是「点了启动起不来」）；端口占用预检永远查不出占用；
+    watchdog 每 10s 就把正在正常转发的 mitmdump 杀掉重启。
+    """
+
+    def setUp(self):
+        old_cache = dict(panel._netstat_cache)
+        self.addCleanup(panel._netstat_cache.update, old_cache)
+        panel._netstat_cache["ts"] = 0.0
+        panel._netstat_cache["data"] = {}
+
+    def test_netstat_empty_still_reports_listening_port(self):
+        with mock.patch.object(panel.sys, "platform", "win32"), \
+             mock.patch.object(panel, "_run_console", return_value=(0, "")), \
+             mock.patch.object(panel.socket, "socket") as sock_cls:
+            sock = sock_cls.return_value.__enter__.return_value
+            sock.connect_ex.return_value = 0
+            # 只能证明「端口在监听」，拿不到 PID：返回空集合，不能伪造 PID。
+            self.assertEqual(panel._listening_port_pids({18701}, fresh=True),
+                             {18701: set()})
+
+    def test_netstat_empty_and_port_closed_reports_nothing(self):
+        # 端口真实空闲时必须返回空，否则占用预检会把空闲端口误判成被占用、启动被自己挡住。
+        with mock.patch.object(panel.sys, "platform", "win32"), \
+             mock.patch.object(panel, "_run_console", return_value=(0, "")), \
+             mock.patch.object(panel.socket, "socket") as sock_cls:
+            sock = sock_cls.return_value.__enter__.return_value
+            sock.connect_ex.return_value = 10061  # WSAECONNREFUSED
+            self.assertEqual(panel._listening_port_pids({18701}, fresh=True), {})
+
+    def test_netstat_pid_is_never_overwritten_by_probe(self):
+        # netstat 命中时不能再补探测：空 PID 集合会盖掉真实 PID，占用预检和
+        # _free_upstream_ports 都靠 PID 判断「是不是自己的 mitmdump」，一旦被盖掉，
+        # 崩溃残留进程就永远清不掉。
+        out = "  TCP    127.0.0.1:18701   0.0.0.0:0   LISTENING   4321\n"
+        with mock.patch.object(panel.sys, "platform", "win32"), \
+             mock.patch.object(panel, "_run_console", return_value=(0, out)), \
+             mock.patch.object(panel.socket, "socket") as sock_cls:
+            sock = sock_cls.return_value.__enter__.return_value
+            sock.connect_ex.side_effect = AssertionError("netstat 已命中，不应再做连接探测")
+            self.assertEqual(panel._listening_port_pids({18701}, fresh=True),
+                             {18701: {4321}})
+
+
+class DiagLogPersistTests(unittest.TestCase):
+    """诊断行落盘（issue #41 的可观测性修复）。
+
+    引擎是被壳层 `taskkill /F /T` 强杀的（stdout 块缓冲也来不及 flush），内存里那
+    800 行诊断缓存会随进程一起消失。这些用例守两条硬边界：该落的必须落盘；
+    带明文的 SHIELD 事件行绝不能落盘。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        for name, value in (("DATA_ROOT", self.root), ("_DIAG_LOG_ENABLED", True)):
+            p = mock.patch.object(panel, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _log(self):
+        return self.root / "engine.log"
+
+    def test_diag_prefix_is_persisted(self):
+        panel._emit_log("[panel] mitmdump 60s 内未监听端口 [18701]，判定启动失败")
+        self.assertIn("未监听端口", self._log().read_text(encoding="utf-8"))
+
+    def test_event_line_with_plaintext_is_not_persisted(self):
+        # 隐私红线：SHIELD 事件行携带 req_preview / original 明文，而诊断包会打包
+        # 数据目录。只允许 [panel]/[engine]/[proxy] 诊断前缀落盘。
+        panel._emit_log('SHIELD\tMASK\t{"req_preview":"原文不该落盘"}')
+        self.assertFalse(self._log().exists())
+
+    def test_disabled_by_default_in_source_mode(self):
+        # 源码态/测试默认不落盘：否则跑一次单测就往用户 %APPDATA%\Maskit 写诊断行。
+        with mock.patch.object(panel, "_DIAG_LOG_ENABLED", False):
+            panel._emit_log("[panel] 不该落盘")
+        self.assertFalse(self._log().exists())
+
+    def test_oversized_file_rotates_once_and_keeps_single_history(self):
+        self._log().write_text("x" * (panel._DIAG_LOG_MAX + 1), encoding="utf-8")
+        panel._emit_log("[panel] 轮转后这一行")
+        self.assertTrue((self.root / "engine.log.1").exists())
+        self.assertFalse((self.root / "engine.log.2").exists(), "只保留一份历史")
+        self.assertIn("轮转后这一行", self._log().read_text(encoding="utf-8"))
+
+    def test_write_failure_never_raises(self):
+        # 磁盘满/目录不可写时绝不能影响脱敏主链路
+        with mock.patch.object(panel, "DATA_ROOT", Path("/proc/nonexistent-dir")):
+            panel._emit_log("[panel] 写不进去也不许抛")
+
+
 class SidecarAndReportTests(unittest.TestCase):
     def test_sidecar_uses_engine_entry_prefix_and_posix_session(self):
         fake = mock.Mock()
