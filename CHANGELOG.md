@@ -4,6 +4,23 @@
 
 每个版本章节的**开头**必须有 `### 更新摘要 / Summary`（中英各一至三条）—— 它会被原样用作用户能看到的「版本介绍」（GitHub Release 首屏与更新弹窗），所以只写用户能感知到的变化，不写实现细节。技术条目写在摘要下面的分节里。
 
+## [Unreleased]
+
+基于上游 v0.13.0（`xiaYuTian11/maskit`）。
+*Based on upstream v0.13.0 (`xiaYuTian11/maskit`).*
+
+### 更新摘要 / Summary
+- 同步上游 v0.13.0：图片与文件附件不再被误打码，工具定义不再被改坏导致请求被拒，日志告警更准确。
+- Synced upstream v0.13.0: attachments are no longer corrupted, tool definitions are no longer rewritten into rejected requests, and log warnings are more accurate.
+
+### 新增 / Added
+- 同步上游 v0.12.0–v0.13.0：凭据键名识别、工具定义区按结构保留、媒体附件豁免、出口复检默认只记录、高熵凭据检测（默认关）、暗色界面；保留本分支模型规则与缓存字段保护。
+  *Synced upstream v0.12.0–v0.13.0: credential key detection, tool definitions kept structurally intact, media attachment exemption, egress recheck logs by default, high-entropy credential detection (off by default), dark UI; keeps this fork's model rules and cache-field protection.*
+
+### 修复 / Bug Fixes
+- 工具定义与结构化输出里 `enum` / `const` / `default` 的对象取值此前整段原文上行，现按取值扫描。
+  *Object values inside `enum` / `const` / `default` in tool definitions and structured output were sent verbatim; they are now scanned as values.*
+
 ## [0.106.1] - 2026-10-24
 
 基于上游 v0.11.4（`xiaYuTian11/maskit`）。

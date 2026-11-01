@@ -32,6 +32,12 @@ class CacheFieldPathTests(unittest.TestCase):
         self.enterContext(mock.patch.object(tr, "_maybe_reload"))
         self.enterContext(mock.patch.object(tr, "_emit"))
         self.enterContext(mock.patch.object(tr, "write_runtime_metrics"))
+        # Leaf cache and known/sent indexes are process-wide: a key masked by a previous
+        # test would otherwise be replayed here (word list is patched without a reload).
+        tr._leaf_cache_clear()
+        tr._known_reset_for_tests()
+        self.addCleanup(tr._known_reset_for_tests)
+        self.addCleanup(tr._leaf_cache_clear)
         self.counter = 0
 
     def _send(self, route, body):
@@ -163,7 +169,9 @@ class CacheFieldPathTests(unittest.TestCase):
                         result = (obj["tools"][0]["function"]["parameters"] if kind == "tool"
                                   else obj["response_format"]["json_schema"]["schema"])
                         self.assertEqual(set(result["required"]), set(result["properties"]))
-                        self.assertNotIn(key, result["properties"], "Business names still get masked")
+                        # Upstream v0.13.0: parameter names are structure the provider
+                        # validates, so they stay verbatim (see test_tool_definition_scope).
+                        self.assertIn(key, result["properties"])
 
     def test_nested_protocol_lookalikes_do_not_protect_key_names(self):
         tr.CUSTOM_WORDS.update({key: "TERM" for key in self.FIELDS})

@@ -8462,6 +8462,30 @@ def _scope_of_path(path):
     return "protocol"
 
 
+# 定义区里「取值」类关键字：其下整棵子树都是用户写的字面量，不只是直接叶子。
+_DEFINITION_LITERAL_KEYS = frozenset({"enum", "const", "default", "examples", "example"})
+# 这些容器的直接子键是用户起的名字（参数名 / 定义名），不是 JSON Schema 关键字。
+_DEFINITION_NAME_CONTAINERS = frozenset({
+    "properties", "patternProperties", "definitions", "$defs",
+})
+
+
+def _under_definition_literal(path):
+    """定义区路径是否落在 enum / const / default / examples 的取值子树里。
+
+    叶子判据只看直接键名（`key in _DEFINITION_TEXT_KEYS`）时，
+    `{"const": {"user_id": "<原文>"}}`、`{"enum": [{"owner": "<原文>"}]}` 的叶子键是
+    `user_id` / `owner`，于是整段原样上行（本分支 `tests/test_cache_field_paths.py`
+    实测）。取值子树里没有上游按结构读的东西，整棵扫描不会引入 400。
+    紧跟在 `properties` 等名字容器下的同名键是参数名，不算关键字。
+    """
+    for i, k in enumerate(path):
+        if k in _DEFINITION_LITERAL_KEYS and not (
+                i > 0 and path[i - 1] in _DEFINITION_NAME_CONTAINERS):
+            return True
+    return False
+
+
 def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0, flag=None, role=None):
     """递归脱敏 JSON 里的字符串叶子（完整路径判定 + 业务区强制扫描）。
 
@@ -8489,6 +8513,9 @@ def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0, flag=None, rol
     _scope = _scope_of_path(path)
     in_business = _scope == "business"
     in_definition = _scope == "definition"
+    # 定义区里落在取值子树的叶子按取值扫描（见 `_under_definition_literal`）。
+    def_structural = (in_definition and key not in _DEFINITION_TEXT_KEYS
+                      and not _under_definition_literal(path))
     if isinstance(obj, str):
         # 仅顶层 retention 的合法协议枚举保真；同名业务值、数组及非法值照常扫描。
         # 不放进全局标量豁免，避免 customer / schema const 等位置漏检。
@@ -8497,7 +8524,7 @@ def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0, flag=None, rol
         # 定义区里只有自然语言该扫（`_DEFINITION_TEXT_KEYS`），其余原样上行：
         # 工具名 / namespace / pattern / enum / required / properties 键名 / grammar
         # 改写任何一处都只会让上游拒请求，保护价值为零。
-        if in_definition and key not in _DEFINITION_TEXT_KEYS:
+        if def_structural:
             _note_definition_skip(sid)
             return obj
         # 业务区（tool_use.input / function.arguments 等参数容器）内一律扫描：
@@ -8531,7 +8558,7 @@ def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0, flag=None, rol
         # `{"host": {"default": 10011800000}}`（JSON number）原样上行。
         # 那是本文件自己的注释明令禁止的口径（enum/const/default 是**取值**不是结构）。
         if (key in _MASK_SKIP_NUMERIC_KEYS
-                or (in_definition and key not in _DEFINITION_TEXT_KEYS)
+                or def_structural
                 or _leaf_exempt(key, parent, in_business)):
             return obj
         s = repr(obj) if isinstance(obj, float) else str(obj)
