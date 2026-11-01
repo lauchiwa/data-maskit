@@ -261,6 +261,15 @@ export interface ShieldEvent {
    * 它说明模型在改写输出格式，是「哪天彻底还原不回来」的前兆。
    */
   degraded?: number
+  /** B-4（2026-10-25）：warn 三态本轮放行的值与类型。设成 warn 就是明文出网，
+   *  必须看得见，否则和关掉规则没区别，却还留着「我设了 warn」的误解。 */
+  warned?: number
+  warned_labels?: string[]
+  /** B-1：known 正向打码命中数（让「无锚点却被遮」可归因） */
+  known_hits?: number
+  /** B-2：出口复检因超预算被跳过（跳过必须留痕） */
+  egress_skipped?: boolean
+  egress_skip_reason?: string
   /**
    * 本轮语义识别（NER）是否发生降级：true = 有字符串叶子没走语义识别。
    * **只在降级时后端才写这个键**（正常一轮没有它）；原因与条数见 ner_skip_reasons。
@@ -273,7 +282,7 @@ export interface ShieldEvent {
    * 批次 2 统一检测口径：本次请求的处置结论。四种状态此前在列表里都表现为「0 命中」，
    * 现在分开：已脱敏 / 已扫描未命中 / 主动阻断 / 明确直通（未脱敏）。
    */
-  decision?: 'masked' | 'scanned_clean' | 'blocked' | 'passthrough'
+  decision?: 'masked' | 'scanned_clean' | 'blocked' | 'flagged' | 'passthrough'
   /** 所配置的检测执行到什么程度；complete 只表示「已执行完」，不保证现实无漏检。 */
   completeness?: 'complete' | 'partial' | 'failed' | 'not_applicable' | 'unknown'
   /** 原因码计数（NER 降级 / 协议契约豁免 / 阻断原因），键见 EventDetailDialog 的标签表。 */

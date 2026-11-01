@@ -29,10 +29,11 @@ UNKNOWN = "unknown"
 
 # 原因码 →（类别，短说明）。
 # 类别决定两件事：
-#  ｜ degraded：检测没跑完（→ `partial`；严格模式下这些码是申请阻断的依据）
-#  ｜ exempt ：按协议契约故意不扫（不算降级，但必须可见）
-#  ｜ blocked ：主动阻断
-#  ｜ info   ：过程信息，与完整度无关
+#  ｜ degraded   ：检测没跑完（→ `partial`；严格模式下这些码是申请阻断的依据）
+#  ｜ partial_scope：**加分项**只扫了一部分（可见，但**不**降级、**不**阻断）
+#  ｜ exempt     ：按协议契约故意不扫（不算降级，但必须可见）
+#  ｜ blocked    ：主动阻断
+#  ｜ info       ：过程信息，与完整度无关
 REASON_CODES = {
     # NER / 语义识别降级
     "budget_exhausted": ("degraded", "语义识别预算耗尽"),
@@ -44,6 +45,32 @@ REASON_CODES = {
     "global_throttled": ("degraded", "语义推理被限流"),
     "om_compose": ("degraded", "坐标合成降级，跳过语义识别"),
     "runtime": ("degraded", "语义识别运行时降级"),
+    # B-1（2026-10-25）：已知值正向打码降级。与 NER 降级同一性质——
+    # 「已知这个值敏感、但这一轮没扫」，静默失败会让用户以为值本来不该被遮。
+    "known_scan": ("degraded", "已知值正向打码降级"),
+    # C-1（2026-10-25）：中文姓名启发层降级。与 NER 降级同性质。
+    "zh_names": ("degraded", "中文姓名启发层降级"),
+    # 启发层**扫描窗口截断**（2026-10-25 真机事故定案）。
+    #
+    # 为什么不归 degraded：启发层是**加分项**（补 NER 漏检），不是「所配置的检测」
+    # 本体。它没扫完全文 == 「这一段没补到」，不是「连正则都没跑」。
+    #
+    # 归 degraded 的实际后果有真机证据：长会话（客户端每轮重发整段历史，1487 条
+    # 消息 / 1.9MB 请求体是常态）对 32KB 窗口**必然**截断，于是 v0.12.0 之后
+    # 145 条 MASK 里 144 条被打成 partial（99%）——告警彻底失去信息量，
+    # 用户看到的是「每行都黄」。
+    #
+    # 方向性：把「加分项没跑完」当「检测不完整」是把保守方向用反了——
+    # 它制造的不是安全，是噪声。
+    "zh_names_truncated": ("partial_scope", "中文姓名启发层只扫了前 32KB"),
+    # 媒体/内联二进制整块未扫（2026-10-29）：图片、音视频、Office/PDF 容器的 data URL
+    # 与媒体地址。改了必然破上游解码，而 base64 里不承载可脱敏文本；归 partial_scope
+    # 的理由与上一条相同——它是**保护范围外的载体**，不是「该跑的检测没跑完」。
+    "media_skipped": ("partial_scope", "内联二进制/媒体地址整块未扫描"),
+    # 短名降噪（2026-10-28）：2~3 字中文 NAME 在没有角色词/称谓佐证时按误报跳过。
+    # 与 `zh_names_truncated` 同归 partial_scope：这是**减噪**，不是「检测没跑完」，
+    # 所以不降完整度、不触发严格模式阻断，但必须可见（不静默）。
+    "short_name_no_context": ("partial_scope", "短中文姓名无上下文佐证，按误报跳过"),
     # 协议契约豁免
     "signed_blocks_skipped": ("exempt", "签名/密文思考块按协议契约整块未扫描"),
     # 主动阻断
@@ -65,6 +92,9 @@ REASON_CODES = {
 }
 
 # 严格模式下应当阻断的原因码（“模型明确不适用”与纯过程信息不阻断）。
+#
+# ⚠️ `partial_scope` 刻意**不在**此集合：它表示「加分项只覆盖了一部分」，
+# 不是「所配置的检测没跑完」。把它当阻断依据等于让「长文本」直接变成 503。
 BLOCKING_CATEGORIES = frozenset({"degraded"})
 
 
@@ -116,15 +146,22 @@ def decision_of(*, changed: bool, blocked: bool = False, passthrough: bool = Fal
     return DECISION_MASKED if changed else DECISION_SCANNED_CLEAN
 
 
-def report_for_mask(*, changed: bool, ner_skips: dict | None = None, signed_skipped: int = 0) -> dict:
+def report_for_mask(*, changed: bool, ner_skips: dict | None = None, signed_skipped: int = 0,
+                    media_skipped: int = 0) -> dict:
     """MASK 事件 / `/api/ext/mask` 响应的统一上报口径。
 
     `signed_skipped` 是「签名思考块整块未扫描」的块数（exempt 类）：它不把完整度降成
     `partial`（属协议契约内的显式不扫面），但必须出现在 `reason_codes` 里保持可见。
+
+    `media_skipped` 是「媒体/内联二进制整块未扫」的块数（partial_scope 类）：同理不降级、
+    不阻断，但必须可见——不然用户不知道图片/文件内容不在保护范围内（2026-10-29 真机：
+    Excel 图表 PNG 的 base64 被当文本改写后上游 400）。
     """
     reasons = dict(ner_skips or {})
     if signed_skipped:
         reasons["signed_blocks_skipped"] = int(signed_skipped)
+    if media_skipped:
+        reasons["media_skipped"] = int(media_skipped)
     return build_report(decision=decision_of(changed=changed), reasons=reasons)
 
 

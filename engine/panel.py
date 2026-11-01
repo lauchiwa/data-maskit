@@ -20,7 +20,7 @@ __version__ = '0.106.1'
 # 与 __version__ 分开维护：__version__ 是**本分支自己**的发布序号（0.10x.x 段，
 # 与上游 0.x.x 永不相撞，更新检查按段比较恒判定为更新），这里记录血缘基线。
 # 每次合并上游 tag 后同步改这一行；只读元数据，不参与任何版本比较。
-__upstream_base__ = '0.11.4'
+__upstream_base__ = '0.13.0'
 import json
 import codecs
 import copy
@@ -3740,6 +3740,12 @@ def default_config():
         # 走 /api/config/patch 的 list_add/list_remove 维护（前端 Settings 在用）。
         "sensitive_word_whole": [],
         "builtin_rules": dict(DEFAULT_BUILTIN_RULES),
+        # per-kind 三态（B-4）：`{LABEL: "mask"|"warn"|"block"}`，缺省 mask。
+        # **`warn` = 明文出网**（只提醒、不改写），UI 与 SECURITY.md 必须标清。
+        "rule_actions": {},
+        # 值级白名单（B-4）：整值精确匹配、大小写不敏感，上限 200 × 256。
+        # 用户遇到规则误报时用它钉住单个值，不必关掉整条规则。
+        "allow_values": [],
         "secret_prefixes": list(DEFAULT_SECRET_PREFIXES),
         "debug": False,
         "diagnostic_unmatched": False,
@@ -4115,6 +4121,12 @@ _CONNECTION_POLICY_LOAD_WARNING = (
 )
 
 
+# per-kind 三态 / 值级白名单的上界（B-4）。panel 端**有意不 import transparent**
+# （见 `_EXT_MAX_BODY` 的注释），所以数值各写一份，由 `ConstantParityTests` 钉住相等。
+_ALLOW_VALUES_MAX = 200
+_ALLOW_VALUE_MAX_LEN = 256
+
+
 def normalize_config(raw, warnings=None, *, validate_controls=True):
     """校验并规整配置。
 
@@ -4230,6 +4242,51 @@ def normalize_config(raw, warnings=None, *, validate_controls=True):
                     dis.append(w)
             if dis:
                 sensitive_word_disabled[lab] = _uniq(dis)[:MAX_ITEMS]
+
+    # per-kind 三态 + 值级白名单（B-4）。放在 builtin_rules 之前归一，
+    # 因为 `rule_actions` 的合法键**依赖** builtin_rules 的键集合。
+    rule_actions = {}
+    raw_actions = raw.get("rule_actions")
+    if isinstance(raw_actions, dict):
+        for rk, rv in raw_actions.items():
+            rk = str(rk or "").strip().upper()
+            rv = str(rv or "").strip().lower()
+            if rk not in DEFAULT_BUILTIN_RULES:
+                warn.append(f"规则三态「{rk[:24]}」不是内置规则名，已忽略")
+                continue
+            if rv not in ("mask", "warn", "block"):
+                warn.append(f"规则三态「{rk}」的值「{rv[:16]}」非法，已忽略（回退脱敏）")
+                continue
+            if rv != "mask":          # mask 是缺省，不落盘（省得配置里全是噪声）
+                rule_actions[rk] = rv
+    allow_values = []
+    raw_allow = raw.get("allow_values")
+    if isinstance(raw_allow, list):
+        seen_allow = set()
+        for item in raw_allow:
+            # **只收字符串**（2026-10-25 复核）：`str(None)` → `"None"`、
+            # `str(123)` → `"123"`，那会让白名单里凭空多出 `None` / `123` 这种值
+            # —— 文本里出现 `None` 这个词就被放行。白名单的语义是「用户明确
+            # 钉住的那个**值**」，只有字符串才是值。
+            if not isinstance(item, str):
+                warn.append(f"白名单项必须是字符串（收到 {type(item).__name__}），已忽略")
+                continue
+            v = item.strip()
+            if not v:
+                continue
+            if len(v) > _ALLOW_VALUE_MAX_LEN:
+                warn.append(f"白名单值超过 {_ALLOW_VALUE_MAX_LEN} 字符，已忽略")
+                continue
+            low = v.lower()
+            if low in seen_allow:
+                continue
+            if len(seen_allow) >= _ALLOW_VALUES_MAX:
+                warn.append(f"白名单最多 {_ALLOW_VALUES_MAX} 条，后续已忽略")
+                break
+            seen_allow.add(low)
+            allow_values.append(v)
+    elif raw_allow is not None:
+        warn.append("allow_values 必须是数组，已忽略")
 
     builtin_rules = dict(DEFAULT_BUILTIN_RULES)
     raw_builtin = raw.get("builtin_rules")
@@ -4484,6 +4541,8 @@ def normalize_config(raw, warnings=None, *, validate_controls=True):
         "sensitive_word_disabled": sensitive_word_disabled,
         "sensitive_word_whole": _uniq([str(w) for w in (raw.get("sensitive_word_whole") or []) if w])[:MAX_ITEMS],
         "builtin_rules": builtin_rules,
+        "rule_actions": rule_actions,
+        "allow_values": allow_values,
         "secret_prefixes": prefixes,
         "debug": bool(raw.get("debug", False)),
         "diagnostic_unmatched": bool(raw.get("diagnostic_unmatched", False)),
@@ -6790,6 +6849,17 @@ _EXPORT_KEEP_FIELDS = {
     # 「导出的就是筛出来的那批」（§D3.2 导出一致性）。
     "ingress",
     "upstream", "model", "stream_mode", "stream_actual", "transport",
+    # C-2（2026-10-25）：还原失败归因的**细分子状态**。
+    # `restore_status` 本身在 `NOT_EXPORTED` 里（仅列表/弹窗展示，理由见那里），
+    # 所以这里只加 `placeholder_seen` —— 它是让导出能区分「模型没提」与
+    # 「模型提了但形态坏了」的那一位。
+    "placeholder_seen",
+    # B-4：warn 三态本轮放行的值与类型（导出要能回答「哪些值被放行了」）
+    "warned", "warned_labels",
+    # B-1：known 正向打码命中数（让「无锚点却被遮」可归因）
+    "known_hits",
+    # B-2：出口复检被跳过（超预算）与原因——「跳过必须留痕」的唯一落点
+    "egress_skipped", "egress_skip_reason",
     "failure_phase", "upstream_may_have_executed",
     "ner_init_ms", "ner_infer_ms", "ner_budget_wait_ms", "ner_calls", "ner_windows", "ner_cache_hits", "ner_cache_misses",
     "count", "restored", "status", "http_status",
@@ -6823,6 +6893,9 @@ _EXPORT_KEEP_FIELDS = {
     # `test_attribution` 的 AST 扫描看不见它们 —— 漏登记不会报错，只会静默少一列。
     "decision", "completeness", "reasons", "reason_codes", "blocked", "failed",
     "error_code", "ner_truncated", "ner_skip_reasons", "signed_blocks_skipped",
+    # 媒体/内联二进制整块豁免计数（2026-10-29）：与 signed_blocks_skipped 同理，
+    # 豁免是漏检路径，导出里必须看得见。
+    "media_skipped",
     # ---- 审计结果（计数/枚举，不含正文）----
     # `audit_scan_truncated` 是审计结论本身（“没扫完整包”），与 NER 的 truncated 同理。
     "audit_ms", "audit_scan_bytes", "audit_scan_truncated",
@@ -7152,6 +7225,41 @@ def api_ext_warn():
         return jsonify({"ok": False, "error": "engine_error"})
 
 
+def _emit_ext_block(reason, sid, needles=None, decision="blocked", leaked=None):
+    """扩展链路阻断/告警事件（与代理链路的 `_emit("BLOCK", ...)` 同口径）。
+
+    为什么单独一个函数：扩展链路没有 mitmproxy 的 `flow`，`_emit` 需要的
+    host/method/path/source 都得自己造；把造法集中一处，免得两个阻断点
+    （egress_verify / 将来其它）各写一份、字段慢慢漂移。
+
+    `decision` 必须如实区分（2026-10-26 用户第一准则）：`blocked` = 真的没上行，
+    `flagged` = 只记录、请求照常上行。写成同一个值会让用户以为请求被拦了。
+    """
+    try:
+        import transparent as tr
+        _blocking = decision == "blocked"
+        # `report_for_skip` **已经带 `decision`**（它自己算一份）。所以这里的
+        # `decision` 只能叠在后面覆盖它 —— 两个位置都传关键字会撞成
+        # `TypeError: got multiple values`，被下面的 `except` 吞掉，事件根本不落库
+        # （实测：改成 flagged 后 test_block_is_logged 直接红，就是因为这个）。
+        _report = inspection.report_for_skip(reason="pipeline_error", blocked=_blocking)
+        tr._emit(
+            "BLOCK",
+            ingress="ext",
+            sid=sid,
+            reason=reason,
+            block_source="egress",
+            count=len(needles or []),
+            **(({"leaked": leaked}) if leaked else {}),
+            msg=("脱敏后仍能匹配到本次登记的原文，已在本机阻断（扩展链路）"
+                 if _blocking else
+                 "脱敏后仍能匹配到本次登记的原文（仅记录，请求照常上行，扩展链路）"),
+            **{**_report, "decision": decision},
+        )
+    except Exception:
+        pass
+
+
 @app.post("/api/ext/mask")
 def api_ext_mask():
     """扩展请求体打码。sid 由**服务端**签发（客户端不能指定）。"""
@@ -7206,6 +7314,51 @@ def api_ext_mask():
         # Flask 工作线程，而扩展侧 HTTP 超时更短，用户看到的就是「网页请求失败」。
         with tr._ner_doc_budget(tr._ner_req_budget(len(text.encode("utf-8")))):
             masked = tr.mask_body(text, sid)
+        # ── 出口前复检（与代理链路同口径，2026-10-25 补齐）───────────────
+        # 为什么扩展链路**更**需要这道网：它是明文直通的（`ext_block_when_engine_down`
+        # 默认 false），一旦脱敏漏了，扩展侧不会像代理那样有 fail-closed 兜底。
+        # 之前只接了代理链路，扩展用户等于少一层保护 —— 两条链路的保护必须同口径，
+        # 否则「同一个 body 走两条链路结果不同」正是本仓反复踩过的坑。
+        with _EXT_LOCK:
+            _sess_now = dict(tr.sessions.get(sid) or {})
+        # needle 只取本轮新增（与代理链路同口径，见 `_mask_egress_needles` 注释）
+        _needles = tr._mask_egress_needles(
+            _sess_now.get("fwd") or {}, _sess_now.get("labels") or {},
+            _sess_now.get("new_orig") or set(),
+        )
+        if _needles and tr._mask_egress_verify(masked, _needles, sid):
+            # 与代理链路**同一条准则**（2026-10-26 用户第一准则）：默认只记录、
+            # 不阻断。扩展链路是明文直通的，阻断它同样会把用户的网页工具链打停；
+            # 而残留大概率是规则主动放过的正常输出。
+            _blocking = bool(getattr(tr, "_MASK_EGRESS_BLOCK", False))
+            _leaked = tr._leaked_values(
+                masked, _needles, _sess_now.get("labels") or {})
+            _emit_ext_block("egress_verify", sid, _needles,
+                            decision="blocked" if _blocking else "flagged",
+                            leaked=_leaked)
+            if _blocking:
+                return jsonify({
+                    "ok": False,
+                    "error": "egress_unmasked",
+                    "blocking": True,
+                    "hint": "脱敏后仍能匹配到本次登记的原文，已在本机阻断、未上行；"
+                            "这是引擎缺陷，请提交反馈并附诊断包。",
+                    **inspection.report_for_skip(reason="pipeline_error", blocked=True),
+                }), 503
+        # ── per-kind `block` 三态（与代理链路同口径，2026-10-25 补齐）─────
+        # 取走即清（请求级语义，见 `transparent._take_rule_block` 的注释）。
+        _blk, _blocked_labels = tr._take_rule_block(sid)
+        if _blk:
+            _emit_ext_block("rule_action_block", sid, _blocked_labels)
+            return jsonify({
+                "ok": False,
+                "error": "rule_blocked",
+                "blocking": True,
+                "labels": _blocked_labels,
+                "hint": "命中类型的处理方式被设为「拦截」，已在本机阻断、未上行。"
+                        "可在 设置 → 敏感词 → 内置规则 里改回「脱敏」。",
+                **inspection.report_for_skip(reason="pipeline_error", blocked=True),
+            }), 503
         # 本轮降级（有空叶子没走 NER）：随响应回给扩展，并写进下面的 MASK 事件
         ner_skips = tr._ner_skips_of_this_round()
         with _EXT_LOCK:
@@ -7217,10 +7370,14 @@ def api_ext_mask():
             _EXT_STATS["mask"] += 1              # += 是读改写三步，必须在锁内
             # 签名块豁免计数（本轮）：取走即清零，与代理路径同语义
             _signed = tr._take_signed_skips(sid)
+            # 媒体/内联二进制豁免计数：同口径取走（扩展链路 mask_body 走 _mask_tree，
+            # 同样会命中图片/文件字段）。
+            _media = tr._take_media_skips(sid)
         hit_count = len(s.get("last_hits") or set())
         # 统一检测口径（§B4）：扩展链路与代理路径**同源**，否则扩展用户永远只看到“0 命中”
         _report = inspection.report_for_mask(changed=hit_count > 0, ner_skips=ner_skips,
-                                             signed_skipped=_signed)
+                                             signed_skipped=_signed,
+                                             media_skipped=_media)
         # 仅当真实命中敏感词并发生打码时才产生 MASK 事件，彻底消除大量 0 命中的空白噪声日志。
         # 例外：本轮发生语义识别降级时即使 0 命中也要记 —— 降级意味着「本该识别出人名/
         # 机构/地址的文本没被识别」，而这恰好是最可能漏码的情形，不记就等于静默降级。
@@ -7234,6 +7391,9 @@ def api_ext_mask():
             # 清洗只针对**凭据形态**：普通 PII（手机号/身份证/姓名）的原文照旧保留，
             # 详情弹窗的「脱敏 ↔ 原文」对照能力不受影响。
             scrubbed_dialog = tr._redact_credentials(tr._redact_session_credentials(text, s))
+            _warned_n, _warned_labels = tr._take_warned(sid)
+            _known_n = tr._take_known_hits(sid)
+            _egress_skipped, _egress_skip_reason = tr._take_egress_skip(sid)
             tr._emit("MASK", ingress="ext", sid=sid,
                      count=hit_count,
                      new_count=len(s.get("new_orig") or set()),
@@ -7244,6 +7404,14 @@ def api_ext_mask():
                      **({"ner_truncated": True, "ner_skip_reasons": ner_skips}
                         if ner_skips else {}),
                      **(({"signed_blocks_skipped": _signed} if _signed else {})),
+                     # 媒体整块豁免计数（与代理链路同字段名）：扩展链路也要看得见
+                     **(({"media_skipped": _media} if _media else {})),
+                     # warn 三态（B-4）：与代理链路同口径，取走即清
+                     **(({"warned": _warned_n, "warned_labels": _warned_labels}
+                        if _warned_n else {})),
+                     **({"known_hits": _known_n} if _known_n else {}),
+                     **({"egress_skipped": True, "egress_skip_reason": _egress_skip_reason}
+                        if _egress_skipped else {}),
                      **_report)
         return jsonify({"ok": True, "masked_text": masked, "sid": sid,
                         **({"ner_skipped": ner_skips} if ner_skips else {}),
@@ -8308,6 +8476,26 @@ def api_open_url():
 def api_logs_clear():
     result = clear_logs()
     return jsonify(result)
+
+
+@app.get("/api/logs/egress-preview")
+def api_egress_preview():
+    """脱敏取证：最近 N 条「厂商实际收到的 body」（仅内存，重启即清）。
+
+    为什么需要它：事件库只留 preview、凭据连 preview 都不存，用户想核对
+    「这条请求到底发出去的是不是占位符」只能抓包。本端点返回**脱敏后**的正文
+    （占位符形态），不碰原文——原文仍只在引擎的会话映射里。
+
+    安全边界：
+      · 仅内存，不落盘（与「凭据恒不落库」同一口径）；
+      · 每条最多 8KB（取证不需要全文）；
+      · 不含可还原的原文对照（那等于再造一份明文持有面）。
+    """
+    try:
+        import transparent as tr
+        return jsonify({"ok": True, "items": tr._egress_preview_list()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": _safe_public_text(e, 240)}), 500
 
 
 @app.post("/api/mappings/clear")
@@ -9395,7 +9583,9 @@ def _diagnostics_payload(error_limit=60):
                 # “发过来问为什么失败”的那一段，没有责任方就只能靠肉眼猜。
                 # `upstream_idle_s` 是 `reason=upstream_idle` 的证据本身：只带结论
                 # 不带连续静默秒数，接包的人无法核对这条判据有没有被误触发。
-                "failure_owner", "error_type", "upstream_idle_s")
+                "failure_owner", "error_type", "upstream_idle_s",
+                # C-2：还原失败归因（同上，诊断包里也要能区分两种「没还原」）
+                "placeholder_seen")
         rows = []
         for e in fetch_events(since=0, limit=600, max_limit=EXPORT_MAX):
             if e.get("type") not in bad and int(e.get("http_status") or 0) < 400:

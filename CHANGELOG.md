@@ -168,6 +168,120 @@
 ### 新增 / Added
 - 上游血缘基线元数据 `__upstream_base__`，经 `/api/status` 与诊断导出暴露（字段 `upstream_base`），用于确认运行中的实例基于哪个上游版本；只读，不参与版本比较。
   *Upstream lineage baseline `__upstream_base__`, exposed via `/api/status` and diagnostics export (field `upstream_base`), to identify which upstream version a running instance is based on; read-only, never used in version comparison.*
+## [0.13.0] - 2026-10-30
+
+### 更新摘要 / Summary
+- 全新视觉体验与暗色优先质感：控制台新增趋势走势图，日志表格自适应小屏幕宽度。
+- 图片与文件附件不再被误打码：上传图片与文件时不再损坏二进制数据，避免上游拒收请求。
+- 还原归因更精准：普通编号与版本号等普通标识符不再被误判为占位符被改写，状态显示更准确。
+- Fresh dark-first visual design, a live trend sparkline on the dashboard, and a responsive logs table.
+- Images and file attachments are no longer corrupted by text masking, preventing upstream request rejections.
+- Plain identifiers and version numbers are no longer mistaken for rewritten placeholders.
+
+### 新增
+- 全新 macOS 风格设计系统与通用模式组件（PageHeader/Section/StatCard/Toolbar/Hint），统一页面排版节奏与交互质感。
+- Mac-styled design system with reusable pattern components (PageHeader, Section, StatCard, Toolbar, Hint) for consistent typography and spacing.
+- 控制台新增原生趋势走势图，日志表格优化列宽自适应紧凑屏幕。
+- Native trend sparkline on Dashboard and optimized Logs table columns for compact screens.
+
+### 修复
+- 还原失败归因不再把普通标识符当占位符：普通编号与版本号裸串不再计入占位符被改写，假阳性归零。
+- Restore attribution no longer flags plain identifiers and version tags as rewritten placeholders.
+- `SECURITY.md` 补注：出口复检的拦截事件按判定结果区分放行与真阻断。
+- `SECURITY.md` now documents that egress-recheck block events distinguish forwarded and blocked decisions.
+- 自动更新元数据固定优先取 macOS 的 `.app.tar.gz`，消除目录枚举顺序依赖。
+- macOS update metadata now always prefers `.app.tar.gz` to avoid 404s on client auto-updates.
+- 图片与文件附件不再被当文本脱敏：媒体专属键下的内联二进制整块豁免，浏览器扩展链路同步上报豁免计数。
+- Binary images and file attachments under media keys are exempted from text masking, and the extension bridge reports counts in sync.
+
+## [0.12.2] - 2026-10-28
+
+### 更新摘要 / Summary
+- 日志页不再满屏黄色告警：同一个值在别处重复出现时，不再逐条记成残留。
+- 中文姓名识别更准：普通词不再被替换成占位符，正文和代码保持原样。
+- 长对话里语义识别不再被整段跳过，检测结果更可靠。
+- Fewer yellow warnings in the logs: repeated occurrences of the same value are no longer logged one by one as leftovers.
+- Chinese names are recognised more accurately: ordinary words are no longer replaced with placeholders.
+- Semantic detection is no longer skipped wholesale in long conversations, so results are more reliable.
+
+### 修复
+- 中文人名检测不再把「简洁」「边界」「项目规」这类普通词当成姓名打码：此前它们会把正文换成占位符，模型据此分析或改代码必然出错。
+- Chinese name detection no longer masks ordinary words (common two-to-three-character terms) as personal names, which used to rewrite the text the model reads.
+- 形如 `hugging-face` 的全小写英文复合词不再被当成人名打码。
+- Lowercase English hyphenated words such as `hugging-face` are no longer masked as personal names.
+- 出口复检不再对同一个长值在别处的重复出现逐条报「有残留」：本轮已判定为敏感值就全文一并遮盖。
+- The egress recheck no longer reports a leftover for every repeat of the same long value: once a value is classified as sensitive this turn, every occurrence is masked.
+- 修复长会话里语义识别被整段跳过的问题（已知值正向打码后坐标映射失同步），「检测不完整」告警相应减少。
+- Fixed semantic detection being skipped entirely in long conversations (the offset map lost sync after known-value masking), which also cuts the "incomplete scan" warnings.
+
+## [0.12.1] - 2026-10-26
+
+### 更新摘要 / Summary
+- 修复更新到 0.12.0 后日志页几乎每条请求都标「检测不完整」的问题，告警恢复正常。
+- 修复部分请求会整条失败、客户端一直重试失败的问题，涉及工具定义、结构化输出与出口复检。
+- 网关不再因为「检测到某个值可能没遮住」就拦截请求：现在只在日志里提示，请求照常转发，不会让微信机器人、编辑器助手这类服务整条不可用。
+- Fixed nearly every request showing "incomplete scan" after updating to 0.12.0.
+- Fixed requests failing outright and the client retrying forever.
+- The gateway no longer blocks requests over a possibly unmasked value: it logs a note and forwards them, so chat bots and editor assistants stay online.
+
+### 修复
+- 「检测不完整」告警不再被长对话误触发：中文姓名补漏只扫前 32KB 是**有界设计**，此前它把整条请求判成降级，于是长对话（每轮重发整段历史）几乎每条都标黄；现在它仍可见，但不再算作检测未完成。
+- 工具定义里 `type` 写成数组（`["string","null"]`）或对象时不再整条报错：此前请求侧会直接失败（503），响应侧会让整段流式还原降级。
+- 上游返回的 `choices` 不是数组时不再中断还原：此前这类畸形响应会让整段回复以未还原形态透传。
+- The "incomplete scan" badge is no longer triggered by long conversations: the 32KB cap on Chinese-name detection is intentional, but it used to mark the whole request as degraded, so long conversations (which resend full history every turn) were almost always flagged.
+- Tool definitions whose `type` is an array (`["string","null"]`) or an object no longer break the request: previously the request failed outright, and responses fell back to passing text through unmasked.
+- Responses whose `choices` is not an array no longer interrupt restoration.
+- 出口复检不再把「本来就该放过的写法」当成泄漏：同一个值在别处以更长数字串、带字母边界、结尾多一个点的形式出现时，规则本就主动放过它，此前会被判成泄漏并让整条请求失败（客户端重试也一样失败）。现在复检与扫描规则同口径，真泄漏仍然拦截。
+- 出口复检不再被占位符「拼接」骗过：当对话正文里出现「部分被遮」的示例时，此前把占位符删掉会让两侧文字拼回原文，误判成泄漏；现在占位符按分隔符处理，不会拼出原文。
+- The egress recheck no longer treats "forms the rules deliberately skip" as leaks: when the same value appears elsewhere as part of a longer digit run, with letter boundaries, or followed by a trailing dot, the rules intentionally skip it — this used to be flagged as a leak and fail the whole request (client retries failed too). The recheck now uses the same criteria as the scanner, while real leaks are still blocked.
+- The egress recheck is no longer fooled by placeholder "splicing": when the conversation text contains a "partially masked" example, deleting the placeholder used to glue the surrounding text back into the original value and misreport a leak. Placeholders are now treated as separators, so no such value can be reconstructed.
+- 出口复检默认改为「只记录、不拦截」：命中时日志里留下原因与残留明细，请求照常上行。阻断会让整条业务链路不可用，而漏掉的值可以事后从日志里补规则；需要旧行为的用户可显式开启拦截开关。
+- 修复部分地址在含全角字符的文本里被误判为需要打码、而在纯英文文本里又不需要，导致同一条请求被反复拦截的问题。
+- The egress recheck now records instead of blocking by default: a hit leaves the reason and the leftover details in the log while the request is forwarded. Blocking takes a whole service offline, whereas a missed value can be fixed later from the log; users who want the old behaviour can turn the block switch on explicitly.
+- Fixed addresses being masked in text containing full-width characters but not in plain text, which made the same request get blocked repeatedly.
+
+## [0.12.0] - 2026-10-25
+
+### 更新摘要 / Summary
+- 数据库密码、API 密钥这类配置项现在能正确识别带前缀的写法，以前只认裸关键词。
+- 日志页现在能分清「模型没提到敏感值」和「真的没还原」，不再把两种情况都显示成同一个状态。
+- 新增「只提醒」「拦截」两种处理方式和值级白名单，误报可以只放行那一个值，不必关掉整条规则。
+- Credentials written the way .env files actually look are now detected; previously only the bare keyword was.
+- The log page now tells "the model never mentioned the value" apart from "the value was not restored", instead of showing one status for both.
+- Added "warn only" and "block" per-rule handling plus a per-value allowlist, so a false positive can be released without disabling the whole rule.
+
+### 修复
+- 凭据识别覆盖 `.env` 真实写法：`DB_PASSWORD` / `MYSQL_ROOT_PASSWORD` / `OPENAI_API_KEY` / `db.password` 等带前缀或点号的键名以前全部漏检，现在正常脱敏。
+- 工具定义区不再被改写：工具名、命名空间、参数结构、语法约束以前会被打码，导致上游拒绝请求；现在只扫描其中的说明文字。
+- 视觉等价写法不再绕过：零宽字符插入、全角数字与符号（`１３８…`、`alice＠example.com`）以前整条漏检，现在能识别，且发出去的内容与用户输入逐字节一致。
+- 已知敏感值不再重复出网：某个值一旦被确认敏感，之后在任何位置出现都会被替换，不必再靠 `password=` 这类锚点。
+- 新增出口前复检：脱敏后仍能匹配到原文的请求会被拦下，不再上行。
+- 新增中文姓名补漏与剔误：`客户陈建国` 这类句式不再漏检，`张开的括号` 这类普通词不再被当成人名。
+- 还原状态细分：`no_placeholder_in_response` 拆成「模型没提」「模型提了但形态坏了」「响应没走完」，日志页可区分。
+- 「只提醒」「拦截」两种处理方式现在对所有规则都生效（此前只对部分规则有效），且放行记录会显示在日志里。
+
+### 新增
+- 每条规则可选「脱敏 / 只提醒 / 拦截」三种处理方式。
+- 值级白名单：可放行单个具体值，大小写不敏感，最多 200 条。
+- 脱敏取证：可在日志页查看最近 50 条「实际发出去的内容」，仅内存、不落盘。
+- 高熵凭据检测（默认关闭）：覆盖没有厂商前缀、也没有赋值标签的内部服务令牌。
+
+### Fixed
+- Credential detection now covers real `.env` key names (`DB_PASSWORD`, `MYSQL_ROOT_PASSWORD`, `OPENAI_API_KEY`, `db.password`), which were previously missed entirely.
+- Tool definitions are no longer rewritten: tool names, namespaces, parameter schemas and grammar constraints used to be masked, causing upstream rejections; only their descriptions are scanned now.
+- Visually equivalent spellings no longer bypass masking: zero-width insertions and full-width digits/symbols (`１３８…`, `alice＠example.com`) were missed entirely; they are now detected, and what leaves the machine stays byte-identical to what the user typed.
+- A value once confirmed sensitive is now masked wherever it appears, without needing a `password=`-style anchor.
+- New pre-egress re-check: a request that still matches an original value after masking is rejected instead of being sent upstream.
+- Chinese name completion and rejection: "role word + name" phrases (customer, contact, author …) are no longer missed, and ordinary words that merely start with a surname are no longer treated as names.
+- Restore status is now split: `no_placeholder_in_response` becomes "the model never mentioned it", "the model rewrote the placeholder", or "the response did not finish".
+- "Warn only" and "block" now apply to every rule (previously only some), and what was let through is shown in the log.
+
+### Added
+- Each rule can be set to mask, warn only, or block.
+- Per-value allowlist: release a single concrete value (case-insensitive, up to 200 entries).
+- Masking forensics: the log page can show the last 50 bodies actually sent upstream (memory only, never written to disk).
+- High-entropy credential detection (off by default) for internal service tokens with neither a vendor prefix nor an assignment label.
+
 ## [0.11.4] - 2026-10-20
 
 ### 更新摘要 / Summary

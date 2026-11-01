@@ -26,6 +26,7 @@ import datetime
 import ipaddress
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -813,14 +814,46 @@ RULES = [
     # 半角 [:=]，实测 5/7 的中文凭据场景整条原文上行（SHIELD-CRED-CJK-001）。
     # 中文关键词不需要英文那种 (?<![A-Za-z0-9_.]) 边界：汉字本就不在该字符类里。
     # 值的字符类不含汉字，所以「密码：请联系管理员」这类正常中文句子不会误报。
+    #
+    # ── 键名前缀/后缀通配（2026-10-25，真机事件库复盘驱动）──────────────
+    # 旧写法的关键词两侧是硬边界 `(?<![A-Za-z0-9_.])` / `(?![A-Za-z0-9_.])`，
+    # 于是只认**裸关键词**（`password=`）。而真实泄漏面几乎全是带前缀的：
+    # `DB_PASSWORD=` / `MYSQL_ROOT_PASSWORD=` / `OPENAI_API_KEY=` / `db.password=`。
+    # 实测这些**全部原文上行**，而用户界面显示 SECRET 规则是开启的 ——
+    # 「看起来开了、其实大半不工作」比关着更危险。
+    #
+    # 现在改成：标识符串的**起点**要求边界（`(?<![A-Za-z0-9_.-])`），串内允许
+    # 前缀/后缀通配（各自 ≤64 字符）。为什么起点要边界：不要求的话每个字符位置
+    # 都会起一次尝试，长标识符串上是 O(n²)；要求之后每个标识符串只从起点试一次，
+    # 前后缀上限 64 又把回溯钉死在常数级（`test_regressions.py` 的对抗串用例锁这条）。
+    # 为什么 64：真实键名（含 `MONGO_INITDB_ROOT_` 这类长前缀）都远短于此，
+    # 而它同时是回溯上界。
+    #
+    # 通配会扩大匹配面，误报靠 `_secret_value_ok()` 在**值语义**上收窄：
+    # 计数词（`max_tokens=4096`）、代码标识符（`secretName: Uint8Array`）一律放行。
+    # 这与 magpie `internal/redact/redact.go:147` 的取舍同源：键名宽、值窄。
     (re.compile(
-        r"(?i)(?:(?<![A-Za-z0-9_.])(?:password|passwd|pwd|secret|token|api[_-]?key"
-        r"|access[_-]?key|private[_-]?key)(?![A-Za-z0-9_.])"
+        r"(?i)(?:(?:password|passwd|pwd|secret|token|api[_-]?key"
+        r"|access[_-]?key|private[_-]?key)"
+        # 后缀通配：`DB_PASSWORD` / `OPENAI_API_KEY` / `db.password` 里的关键词
+        # 后面可能还有东西（`_ROOT_` / `.`）。**只通配后缀，不通配前缀**——
+        # 前缀由 `(?<![A-Za-z0-9_])` 保证「关键词不能从更长的标识符中间开始」，
+        # 而后缀通配足以覆盖所有真实写法（实测 `DB_PASSWORD` / `MYSQL_ROOT_PASSWORD`
+        # / `OPENAI_API_KEY` / `db.password` 全部命中）。
+        #
+        # 为什么不能通配前缀（2026-10-25 实测）：`[A-Za-z0-9_.-]{0,64}` 放在关键词
+        # 之前会让正则从**每个字符位置**起一次尝试，1MB 中文文本从 34ms 涨到 90ms
+        # （脱敏总耗时从 63ms/MB 涨到 95ms/MB）。而功能上它**一点没多覆盖**——
+        # 因为关键词总是后缀通配的起点，前缀通配只是让正则多做无用回溯。
+        r"[A-Za-z0-9_.-]{0,64}"
+        # 中文关键词作为同一条规则的第二分支：拆成两条会多一次全文扫描
+        # （实测 1MB 文本上每条 ~54ms，合并后只付一次）。
         r"|(?:密码|口令|令牌|密钥|秘钥|密匙|凭据|凭证|私钥|授权码|访问密钥|接口密钥))"
         r"[\"'“”「」]?\s*[:=：＝]\s*[\"'“”「」]?(?!/)"
         r"(?=[A-Za-z0-9!@#$%^&*_~+=-]*[0-9!@#$%^&*])"
         r"([A-Za-z0-9!@#$%^&*_~+=-]{6,64})(?![A-Za-z0-9!@#$%^&*_~+=-])"
     ), "SECRET", 1),
+
     # 连接串密码：scheme://user:pass@host 形态，只脱密码组（第2组），
     # 保留 scheme/user/host——模型仍能理解这是连接串（审计规则专项 P0）。
     # EMAIL 规则的注释里曾提到 postgres://user:secret123@db.internal 被误当邮箱，
@@ -1002,6 +1035,18 @@ SENSITIVE_WORD_DISABLED = {}
 # 整词匹配开关：set(words) —— 开启后该词两侧加边界（不为字母数字/汉字），
 # 避免「机要」打中「机要害」。默认对 2-3 字词不开（靠词长区分），用户显式开启（审计规则专项 P2）。
 SENSITIVE_WORD_WHOLE = set()
+# 值级白名单（B-4）：这些值**永不被脱敏**，整值精确匹配（大小写不敏感）。
+#
+# 为什么需要它：规则总有误报（如 `secretName: Uint8Array` 会被 SECRET 规则
+# 当成凭据）。用户遇到误报只有三条路：关掉整条规则（漏检面扩大）、加整词
+# （对凭据类值不适用）、或者这个值级白名单（一次性钉住一个值，不动规则）。
+#
+# 上限参照 magpie `settings/masking.go`：200 条 × 256 字符。无界白名单等于
+# 无界误检面，而且每条都要在热路径上比对。
+# 存**小写**形态（比对时把值也 lower，见 `_allow_value_hit`）。
+ALLOW_VALUES = set()
+ALLOW_VALUES_MAX = 200
+ALLOW_VALUE_MAX_LEN = 256
 # 内置规则开关（按 label；False 则 mask/scan 跳过该标签全部正则）
 BUILTIN_RULES = dict(DEFAULT_BUILTIN_RULES)
 SESSION_TTL = DEFAULT_TTL
@@ -1946,6 +1991,164 @@ def _connstr_ok(orig: str, m=None, text: str = "") -> bool:
     return True
 
 
+# ── SECRET 的值语义收窄（2026-10-25）──────────────────────────────
+# 键名改成前缀/后缀通配后，匹配面变大，必须靠**值**把误报挡回去。
+#
+# 两类必须放行的误报形态（都有真实事故或协议依据）：
+#
+#   1. **计数词**（`max_tokens=4096` / `token_count=12` / `cache_read_input_tokens=900`）：
+#      它们是 OpenAI / Anthropic 的**协议参数**，不是凭据。打成占位符等于给上游
+#      发一个非法参数（400），而用户完全不知道是自己开的规则干的。
+#      注意 `token` 与 `tokens` 都算：`_COUNTER_WORDS` 里存的是去掉了 `token(s)` 的
+#      剩余部分，所以 `max_tokens` 与 `max_token` 同判。
+#
+#   2. **代码标识符**（`secretName: Uint8Array` / `getSecret()`）：值里没有任何数字
+#      或特殊符号，且形如标识符串（含可选点路径）。真实凭据几乎必含数字或符号。
+#      这条与旧规则里已有的 `(?=[...]*[0-9!@#$%^&*])` 前瞻互补：前瞻已经挡掉了
+#      “纯字母值”，但 `Uint8Array` 这种带大写字母的仍能通过前瞻（前瞻只要求含
+#      `$`/`*` 等符号或数字…实际上它确实不含），所以需要单独一层。
+#
+# 关键：这个函数是**纯函数、永不抛异常**（热路径，与 audit_signals 同一纪律）。
+_COUNTER_WORD_PREFIXES = frozenset({
+    # OpenAI / Anthropic usage 字段
+    "max", "min", "total", "prompt", "completion", "input", "output",
+    "cache_read", "cache_creation", "reasoning", "cached", "audio",
+    # 计数 / 速率 / 配额类指标名
+    "count", "num", "rate", "per_second", "per_minute", "budget", "limit",
+    "usage", "remain", "remaining", "available", "used", "size", "len",
+})
+# 形如标识符串（可带点路径）：`secretName` / `toBase64Url` / `a.b.c`
+_IDENTIFIER_LIKE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
+
+
+# ===================== 高熵凭据检测（C-3）=====================
+#
+# 覆盖「无前缀、无标签」的随机串（内部服务令牌）：既没有厂商前缀，也没有
+# `password=` 这样的锚点，现有两条路都够不着。
+#
+# 参照 `CassiopeiaCode/CosyRedactGateway`，但判据用**二元转移熵**而不是
+# Shannon 熵：后者对 `abcdefghijklmnopqrst`（有序示例值）也给高分，前者能区分
+# —— 有序序列的转移几乎确定（熵低），随机串的转移分散（熵高）。
+#
+# **默认关**：误报面取决于文本内容（base64 附件、minified JS、哈希文件名都会命中），
+# 本仓没有足够真实样本做离线校准。开启后默认只走 `warn`（提醒），不直接改写。
+HIGH_ENTROPY_ENABLED = False
+_HIGH_ENTROPY_MIN_LEN = 20
+# 二元转移熵门槛：自然语言约 2.5~3.5 bit，随机字母数字约 4.5~5.5 bit。
+# 取 4.0 作为分界（实测有序序列 < 1.5，重复串 < 0.5）。
+_HIGH_ENTROPY_MIN_ENTROPY = 4.0
+# 字符类别数下限：纯数字/纯字母不算（那是序号、单词、哈希的常见形态）
+_HIGH_ENTROPY_MIN_CLASSES = 3
+_HIGH_ENTROPY_TOKEN_RX = re.compile(r"[A-Za-z0-9]{%d,}" % _HIGH_ENTROPY_MIN_LEN)
+
+
+def _high_entropy_on():
+    """高熵检测是否启用（配置开关；缺省关）。"""
+    return bool(HIGH_ENTROPY_ENABLED)
+
+
+def _bigram_entropy(s):
+    """二元字符转移的 Shannon 熵（bit/char）。空串返回 0。
+
+    为什么用二元而不是一元：一元熵只看字符分布均匀度，`abcdefghij` 与
+    `9f8e7d6c5b` 都是一元高熵；二元转移熵能区分「有序」与「随机」——
+    前者每个字符后面几乎只有一个后继（熵低），后者后继分散（熵高）。
+    """
+    try:
+        if not s or len(s) < 2:
+            return 0.0
+        counts = {}
+        total = 0
+        for i in range(len(s) - 1):
+            k = s[i:i + 2]
+            counts[k] = counts.get(k, 0) + 1
+            total += 1
+        if not total:
+            return 0.0
+        ent = 0.0
+        for c in counts.values():
+            p = c / total
+            ent -= p * math.log2(p)
+        return ent
+    except Exception:
+        return 0.0
+
+
+def _char_classes(s):
+    """字符类别数（大写 / 小写 / 数字，最多 3）。"""
+    n = 0
+    if any(c.isupper() for c in s):
+        n += 1
+    if any(c.islower() for c in s):
+        n += 1
+    if any(c.isdigit() for c in s):
+        n += 1
+    return n
+
+
+def _high_entropy_spans(text):
+    """找出高熵随机串，返回 [(start, end, "SECRET")]。
+
+    三层判据（全部满足）：
+      1. 形态：≥ `_HIGH_ENTROPY_MIN_LEN` 的 ASCII 字母数字块；
+      2. 字符多样性：≥ 3 类（大写/小写/数字），且非纯数字；
+      3. 二元转移熵 ≥ `_HIGH_ENTROPY_MIN_ENTROPY`（排除有序序列与重复串）。
+
+    永不抛异常：热路径上跑，出错返回空列表（等价于「这轮没找到」）。
+    """
+    try:
+        if not isinstance(text, str) or not text:
+            return []
+        out = []
+        for m in _HIGH_ENTROPY_TOKEN_RX.finditer(text):
+            tok = m.group(0)
+            if _char_classes(tok) < _HIGH_ENTROPY_MIN_CLASSES:
+                continue
+            if _bigram_entropy(tok) < _HIGH_ENTROPY_MIN_ENTROPY:
+                continue
+            out.append((m.start(), m.end(), "SECRET"))
+        return out
+    except Exception:
+        return []
+
+
+def _secret_value_ok(value: str, key_name: str = "") -> bool:
+    """该 SECRET 命中是否应该**真的脱敏**。
+
+    入参：
+      value    — 规则捕获组 1（值本身，已由正则保证 6~64 位 ASCII 且含数字/符号）
+      key_name — 命中的键名部分（正则 match 中值之前的整段，可含前缀/后缀与分隔符）
+
+    返回 False = 放行（不脱敏），True = 按凭据脱敏。
+
+    **fail-open 到「照常脱敏」**：函数自身出错时返回 True（宁可多遮，不可漏遮）——
+    与 `_connstr_ok` 的 fail-closed 取向一致（那边的异常也返回 True）。
+    """
+    try:
+        v = str(value or "")
+        if not v:
+            return False
+        # ① 计数词：键名去掉分隔符后以计数词开头/结尾（`max_tokens` / `tokens_max`）
+        name = re.sub(r"[^A-Za-z0-9_]+", "_", str(key_name or "")).strip("_").lower()
+        # 去掉 token/tokens 后剩下的词，看它是不是计数前缀（max_ / total_ / count_…）
+        for core in ("tokens", "token"):
+            if core in name:
+                rest = name.replace(core, "").strip("_")
+                if not rest:
+                    break  # 光秃秃的 token= 是真凭据名，不豁免
+                parts = [p for p in rest.split("_") if p]
+                if any(p in _COUNTER_WORD_PREFIXES for p in parts):
+                    return False
+        # ② 代码标识符：值无数字无特殊符号，且形如标识符/成员访问
+        if not any(ch.isdigit() for ch in v) and _IDENTIFIER_LIKE.match(v):
+            # 再排除「明显的协议前缀」（process.env.X / os.environ.X）
+            if not (v.startswith("process.env") or v.startswith("os.")):
+                return False
+        return True
+    except Exception:
+        return True
+
+
 def _overlaps_exempt_conn(start: int, end: int, spans) -> bool:
     """EMAIL 命中 [start, end) 是否与被豁免的连接串**重叠**。
 
@@ -2068,6 +2271,60 @@ def _prefix_secret_regex():
         if key == _prefix_rx_key and _prefix_rx_cache is not None:
             return _prefix_rx_cache
         return _prefix_secret_regex_locked(key)
+
+
+def _prefix_may_hit(text):
+    """文本里是否**可能**含有任一凭据前缀（纯 `str.find` 预筛，比正则快 10 倍）。
+
+    为什么需要它：`_prefix_secret_regex()` 编译出的是一条 `(?<!…)(?:p1|p2|…)`
+    形态的正则，引擎要在**每个字符位置**尝试各分支。前缀清单从 9 个扩到 21 个
+    之后，1MB 中文文本上的成本从 ~18ms 涨到 **47ms**（而命中数仍是 0）。
+
+    等价性：正则把前缀里的 `-` / `_` 展开成 `[-_]` 字符类（见
+    `_prefix_secret_regex_locked`），所以 `sk-` 也匹配 `sk_live_`。预筛必须
+    同样覆盖两种形态，否则会**漏掉**这类写法——那是把性能优化做成漏检。
+    """
+    try:
+        if not text:
+            return False
+        key = tuple(SECRET_PREFIXES)
+        cache = _PREFIX_PRE_CHECK.get("set")
+        cached_key = _PREFIX_PRE_CHECK.get("key")
+        if cache is None or cached_key != key:
+            # 重建必须持锁（2026-10-25 复核）：`_mask_text` 跑在 `_MASK_POOL`
+            # 多线程 + panel 的 Flask 线程里，两个线程同时重建会互相覆盖
+            # `key`/`set`，导致后续调用反复判定「清单变了」→ 反复重建（每请求
+            # 白付一次 O(前缀数×变体数) 的构建）。
+            with _PREFIX_PRE_CHECK_LOCK:
+                cache = _PREFIX_PRE_CHECK.get("set")
+                if cache is None or _PREFIX_PRE_CHECK.get("key") != key:
+                    variants = set()
+                    for p in SECRET_PREFIXES:
+                        p = str(p or "")
+                        if not p:
+                            continue
+                        # 每个 -/_ 位置展开成两种形态（最多 2^k 个，k 很小）
+                        forms = [""]
+                        for ch in p:
+                            if ch in ("-", "_"):
+                                forms = [f + c for f in forms
+                                         for c in (ch, "-" if ch == "_" else "_")]
+                            else:
+                                forms = [f + ch for f in forms]
+                        variants.update(forms)
+                    cache = frozenset(variants)
+                    # 先写 set 再写 key：读者看到 key 匹配时 set 一定已就绪
+                    _PREFIX_PRE_CHECK["set"] = cache
+                    _PREFIX_PRE_CHECK["key"] = key
+        return any(v in text for v in cache)
+    except Exception:
+        # 预筛出错一律「可能命中」→ 退回跑正则（宁可慢，不能漏）
+        return True
+
+
+# 预筛缓存（前缀清单变化时失效，与 `_prefix_rx_cache` 同一生命周期）
+_PREFIX_PRE_CHECK = {"set": None, "key": None}
+_PREFIX_PRE_CHECK_LOCK = threading.Lock()
 
 
 def _prefix_secret_regex_locked(key):
@@ -2221,6 +2478,803 @@ _SYNC_LOCK = threading.Lock()
 _RECENT_FWD = {}   # orig -> [token, label, ts]
 _RECENT_REV = {}   # token -> [orig, label, ts]
 _RECENT_MAX = 2000
+
+# ===================== 已知值正向打码（known）=====================
+#
+# 解决什么（2026-10-25 真机事件库复盘）：某轮工具输出里出现 `password=<值>`，
+# 该值被脱敏并进入复用表；模型在回答里复述了它，用户把回答贴回下一轮 ——
+# 那一轮**没有任何锚点**，于是同一个已被确认敏感的值明文再次出网。
+#
+# 与 `_RECENT_FWD` 的区别（两者**不合并**）：
+#   · `_RECENT_FWD` 是「原文 → 它上次拿到的占位符」，只按**锚点命中**登记，
+#     作用是「同一个值在不同轮次拿到同一个占位符」；
+#   · `_KNOWN` 是「这个值已知是敏感值」，作用是「任何位置出现都遮」，
+#     包括规则根本匹配不到的裸引用。
+# 前者是复用，后者是**扫描面**。
+#
+# 参照 magpie `internal/redact/known.go`：前 8 字节 map + 4-gram 位图粗过滤。
+# 为什么需要位图：`_KNOWN` 可能有上千条，逐个 `in text` 是 O(needle × 文本)；
+# 位图先按 4-gram 过滤，绝大多数 needle 在第一层就被排除。
+#
+# `_KNOWN_MIN`：短值不参与。`abc` 这种值出现在普通文本里的概率极高，
+# 遮它等于把全文打烂。8 与 magpie 同口径（也是 SECRET 规则要求的最短值长度）。
+_KNOWN_MIN = 8
+# 上界：无界增长 = 内存泄漏 + 扫描变慢。与 `_RECENT_MAX` 同量级。
+_KNOWN_MAX = 2000
+# orig -> (token, label)；只用 8 字节头做分组，避免长值比对的常数开销
+_KNOWN_BY_HEAD = {}
+# 4-gram 位图（1<<14 位 = 2KB）：粗过滤，命中才做完整比对
+_KNOWN_BITS = bytearray(1 << 11)
+# 代数：任何增删都 +1，让 sent 记录能判定「我记住的那份还有效吗」
+_KNOWN_GEN = 0
+_KNOWN_LOCK = threading.Lock()
+
+# ===================== 已发送字节固化（sent）=====================
+#
+# 为什么 known 必须与 sent 成对：agent 每轮重发整段历史。某一轮新发现的值
+# 会让**历史叶子**也被重新打码 → 前缀字节变化 → 上游 prompt cache 全量重写
+# （magpie 真实事故：cache_read 0，cache_write 412K→426K）。
+#
+# 做法：一段文本首次被打码时，把它**当时**命中的 known 区间记下来（按文本哈希）；
+# 之后同一段文本直接用记下的区间，不再按当前 known 重算。新文本才用新 known。
+#
+# 记录的是**区间**（start, end, token），不是原文 —— 原文仍在 `_RECENT_REV`，
+# 这里不新增一份原文持有。
+#
+# 双代淘汰（与 `_leaf_cache` / magpie `sentKnown` 同构）：cur 满了就整体换成 old，
+# 让「最近用过的」自然留下来。
+_SENT_MAX = 1 << 13          # 8192 条（长会话每轮重发同一批历史，够用）
+_SENT_CUR = {}
+_SENT_OLD = {}
+_SENT_LOCK = threading.Lock()
+
+
+def _known_reset_for_tests():
+    """清空 known / sent（**只给测试用**）。
+
+    这两个索引是进程级、不带会话维度（语义就是「本机已知的敏感值」），
+    所以用例之间必须显式重置，否则前一个用例登记的值会污染后一个。
+    """
+    global _KNOWN_GEN
+    with _KNOWN_LOCK:
+        _KNOWN_BY_HEAD.clear()
+        for i in range(len(_KNOWN_BITS)):
+            _KNOWN_BITS[i] = 0
+        _KNOWN_GEN += 1
+    with _SENT_LOCK:
+        _SENT_CUR.clear()
+        _SENT_OLD.clear()
+
+
+def _known_gram(s: str, i: int) -> int:
+    """s[i:i+4] 的 14 位哈希（粗过滤用，允许碰撞——碰撞只是多一次完整比对）。"""
+    g = ord(s[i]) | (ord(s[i + 1]) << 7) | (ord(s[i + 2]) << 14) | (ord(s[i + 3]) << 21)
+    return (g * 2654435761) & 0xFFFFFFFF
+
+
+def _known_add(orig: str, token: str, label: str) -> bool:
+    """登记一个已知值；返回 True 表示是**新增**（会推进代数）。
+
+    不登记的情况（每一条都有具体理由，别顺手放宽）：
+
+      · **太短**（< `_KNOWN_MIN`）：`abc` 这种值在普通文本里出现概率极高，
+        遮它等于把全文打烂；
+      · **凭据类标签**：原文只应在有锚点的位置出现；而且把凭据值当 needle
+        扫全文会让 egress 复检的 needle 集里出现原文；
+      · **内置规则命中的值**（`label in BUILTIN_RULES`）：规则本身有自己的
+        校验与边界（Luhn / ISO7064 / 区间不遮 / 白名单 DNS…），known 的
+        「任何位置都遮」会把那些边界全部绕过——实测 `47.98.12.34-47.98.12.35`
+        这类 IP 区间、`test_regressions` 的误报侧用例会当场红。
+        known 要解决的是**规则压根发现不了的裸引用**（人名、项目代号、
+        自定义词），不是「替规则扩大覆盖面」；
+      · **本身就是占位符**：防套娃。
+    """
+    global _KNOWN_GEN
+    try:
+        if not orig or len(orig) < _KNOWN_MIN:
+            return False
+        if label in CREDENTIAL_LABELS:
+            return False
+        if label in BUILTIN_RULES:
+            # 内置规则命中的值不参与正向打码：规则的校验与边界是它自己的语义，
+            # known 的「无条件遮」会绕过 Luhn/ISO7064/区间/白名单等判据。
+            return False
+        if _PLACEHOLDER_RX.match(orig):
+            return False
+        head = orig[:_KNOWN_MIN]
+        with _KNOWN_LOCK:
+            cur = _KNOWN_BY_HEAD.get(head)
+            if cur is not None and cur[0] == orig:
+                return False
+            if cur is not None and len(_KNOWN_BY_HEAD) >= _KNOWN_MAX:
+                # 满了：清掉最旧的一半（dict 保插入序）
+                for k in list(_KNOWN_BY_HEAD)[: max(1, _KNOWN_MAX // 2)]:
+                    _KNOWN_BY_HEAD.pop(k, None)
+            _KNOWN_BY_HEAD[head] = (orig, token, label)
+            g = _known_gram(orig, 0)
+            idx = (g >> 3) & ((1 << 14) - 1)
+            _KNOWN_BITS[idx >> 3] |= 1 << (idx & 7)
+            _KNOWN_GEN += 1
+        return True
+    except Exception:
+        return False
+
+
+# ===================== 输入归一化视图（归一化扫描）=====================
+#
+# 解决什么（2026-10-25 隔离实例实测）：同一批敏感值换「视觉等价」写法就全漏：
+#   138\u200b0013\u200b8000       零宽插入
+#   １３８００１３８０００         全角数字
+#   alice＠example.com            全角 @
+# 而 NFKC 之后全部命中 —— 缺的不是规则，是**输入归一化**。
+# 用户从微信/Word/PDF 复制粘贴时，全角标点与零宽字符是常态。
+#
+# 关键取舍：**归一化只用于「发现」，绝不用于「改写」**。
+#   · 视图只跑规则；
+#   · 命中区间经映射反投回**原文**坐标；
+#   · 替换发生在原文上。
+# 所以发往上游的字节除占位符那几段外，逐字节等于用户输入（含全角与零宽）。
+#
+# 为什么不直接 `text = nfkc(text)` 再扫：
+#   1) 那会擅自改动用户数据（全角→半角），上游看到用户从没输入过的文本；
+#   2) 还原时无法逐字节还原（`test_normalization_bypass` 的 roundtrip 用例锁这条）。
+_ZERO_WIDTH_CHARS = "\u200b\u200c\u200d\u2060\ufeff"
+_ZERO_WIDTH_SET = frozenset(_ZERO_WIDTH_CHARS)
+# 「可能变形」字符的**预检**正则：只有命中它才需要建归一化视图。
+#
+# 为什么必须有这道预检（2026-10-25 实测）：逐字符 NFKC + 建映射表在 1MB 中文
+# 文本上要 **232 ms**，而脱敏本身只要 166 ms/MB —— 归一化成了最大的性能悬崖。
+# 而绝大多数真实文本（中文正文、ASCII 代码）**一个变形字符都没有**。
+#
+# 收录范围（只收「会影响规则命中」的字符）：
+#   · 零宽字符（会把数字/符号隔断）
+#   · 全角 ASCII 区 U+FF01-FF5E（全角数字/字母/符号，`１３８`、`＠`）
+#   · 半角/全角片假名区 U+FF61-FF9F（罕见，但 NFKC 会变）
+#   · 圈号/带圈字符 U+2460-24FF（`①②③` 会被 NFKC 变成数字）
+#   · 康熙部首 / 兼容汉字 U+2F00-2FDF / U+F900-FAFF
+#
+# **刻意不收**中文标点（`，。！？：` 在 U+3000-303F）：它们 NFKC 后变半角，
+# 但那对规则命中毫无影响（规则匹配的是数字/字母/符号），而收了它们会让
+# **每一段中文**都建视图 —— 正是那个 232ms 的来源。保持原文形态也更安全
+# （归一化不该改写用户的中文标点）。
+# 收录范围（**只收「会让规则从命中变漏检」的字符**）：
+#   · 零宽字符：会把数字/符号隔断（`138\u200b0013`）
+#   · 全角**数字/字母**：`０-９` `Ａ-Ｚ` `ａ-ｚ`（`１３８`、`ｓｋ－`）
+#   · 全角**符号里与规则相关的**：`＠`（邮箱）、`：` `＝`（SECRET 分隔符）、
+#     `．` `－` `＿` `／` `＋`（连接串/域名形态）
+#   · 圈号 U+2460-24FF（`①②③` 会被 NFKC 变成数字）
+#
+# **刻意不收**其它全角标点（`，` `！` `？` `（` `）` …）：它们 NFKC 后也变半角，
+# 但对规则命中毫无影响，而收了它们会让**每一段中文**都建视图 ——
+# 实测那正是 1MB 中文文本 243ms 的来源（脱敏本身才 166ms/MB）。
+_DEFORMABLE_RX = re.compile(
+    "["
+    "\u200b\u200c\u200d\u2060\ufeff"   # 零宽
+    "\uff10-\uff19"                       # ０-９
+    "\uff21-\uff3a"                       # Ａ-Ｚ
+    "\uff41-\uff5a"                       # ａ-ｚ
+    "\uff20\uff1a\uff1d\uff0e\uff0d\uff3f\uff0f\uff0b"  # ＠：＝．－＿／＋
+    "\u2460-\u24ff"                       # 圈号 ①②③
+    # ── 2026-10-25 复核补齐：扫遍 BMP 找出「NFKC 会变成 ASCII 数字/字母/符号、
+    # 但上面的预检没覆盖」的字符（共 443 个），按 Unicode 块收进来。
+    # 为什么必须补：预检是「要不要建归一化视图」的唯一判据 —— 漏一个字符就是
+    # 一条「视觉等价写法绕过」（`²` → `2`、`½` → `1⁄2`、`ſ` → `s`）。
+    # 刻意**不收** U+3200-33FF（中文兼容方块 `㍱` 等，163 个）：它们 NFKC 后
+    # 变成汉字词组而非数字/符号，对规则命中无影响，收了只会让中文文本多建视图。
+    "\u00aa\u00b2\u00b3\u00b9\u00ba\u00bc-\u00be"        # ª ² ³ ¹ º ¼½¾
+    "\u0100-\u017f"                        # 拉丁扩展 A（合字 Ĳ ĳ ŉ ſ 等）
+    "\u0180-\u024f"                        # 拉丁扩展 B
+    "\u02b0-\u02ff"                        # 修饰字母（ʰ ʲ ʳ ʷ ʸ ˡ ˢ ˣ）
+    "\u1e00-\u1eff"                        # 拉丁扩展附加（ẚ 等）
+    "\u1d00-\u1dff"                        # 音标扩展（小型大写字母）
+    "\u2000-\u200a\u2010-\u2027"         # 各种空格与连字符/破折号
+    "\u2030-\u205e"                        # 千分号、角分号等
+    "\u2070-\u209f"                        # 上标/下标数字
+    "\u20a0-\u20cf"                        # 货币符号（全角￥等）
+    "\u2100-\u21ff"                        # 字母式符号（№ ™ Ⅻ 等）
+    "\u2a00-\u2aff"                        # 补充数学运算符
+    "\u2c00-\u2c5f"                        # 格拉哥里字母
+    "\u2c7c"                                # ⱼ（下标 j，NFKC → j）
+    "\ua700-\ua7ff"                        # 拉丁扩展 D
+    "\u2c7d"                                # ⱽ（下标 V，NFKC → V）
+    "\ufb00-\ufb06\ufb29"                 # 拉丁连字 ﬀ ﬁ ﬂ + ﬩(→+)
+    # 竖排/兼容形式里**只有影响规则命中的那几个**：`︓﹕`(→:) `﹒`(→.) `﹢`(→+)
+    # `﹣`(→-) `﹦`(→=) `﹫`(→@) `︳﹍﹏`(→_)。**刻意不收** `！？（），。；`
+    # 这类中文标点：它们 NFKC 也变半角，但对规则命中无影响，而收了会让
+    # **每一段中文**都建归一化视图（实测那正是 243ms/MB 的来源）。
+    "\ufe13\ufe19\ufe30\ufe33\ufe34\ufe4d-\ufe4f\ufe52\ufe55\ufe62\ufe63\ufe66\ufe6b"
+    "\ufe00-\ufe0f"                        # 变体选择符
+    "\ufeff"                                # BOM / 零宽不换行空格
+    # ── BMP 外的数学字母数字（𝐀-𝟿 / 𝔸-𝕫 等）：社交媒体与笔记软件里常见，
+    # 用户粘进对话就是一次「视觉等价绕过」。整段 U+1D400-1D7FF 一起收，
+    # 不为它们逐个建范围表（这一段 NFKC 后全是 ASCII 字母/数字）。
+    "\U0001d400-\U0001d7ff"
+    "\U000107a5"                            # 𐞥（NFKC → q，孤立一例）
+    "\U0001f100-\U0001f1ff"                # 带圈/括注字母数字（🅐 ⓿ 等）
+    "\U0001fb00-\U0001fbff"                # 遗留计算符号（🬀 段）
+    "]"
+)
+# 归一化开关：默认开。`0` = 回到「只在原文上扫」（历史行为）。
+_NORMALIZE_SCAN_ON = is_true(os.environ.get("MASKIT_NORMALIZE_SCAN", "1"))
+
+
+def _normalize_view(text):
+    """返回 (归一化视图, 坐标映射表)。
+
+    映射表：`mapping[i] = (start, end)` 表示视图第 i 个字符对应原文的
+    `text[start:end]`。零宽字符在视图里不存在，所以它不占视图位置——
+    这正是我们要的（它只影响两侧字符能否被规则看见，本身不该被替换）。
+
+    **纯 ASCII 走快路径**：直接返回原对象与恒等映射，不做任何拷贝。
+    长会话里绝大多数叶子是 ASCII 或纯中文，这个快路径决定了归一化的成本。
+    """
+    if not _NORMALIZE_SCAN_ON or not text:
+        return text, None
+    # 快路径 1：全 ASCII 且无零宽 → 视图就是原文
+    if text.isascii() and not any(c in _ZERO_WIDTH_SET for c in text):
+        return text, None
+    # 快路径 2（**性能关键**）：没有「可能变形」的字符 → 视图就是原文。
+    # 中文正文与 ASCII 代码走这条，成本是一次 C 实现的正则搜索（1MB ≈ 3ms）。
+    # 没有这道预检时，每一段中文都要逐字符 NFKC + 建映射表（实测 232ms/MB）。
+    if not _DEFORMABLE_RX.search(text):
+        return text, None
+    try:
+        import unicodedata
+
+        view_chars = []
+        mapping = []
+        for i, ch in enumerate(text):
+            if ch in _ZERO_WIDTH_SET:
+                continue          # 零宽不进视图，也不占映射位
+            norm = unicodedata.normalize("NFKC", ch)
+            for nch in norm:
+                view_chars.append(nch)
+                # 一个原文字符可能展开成多个视图字符（NFKC 的合字/兼容展开）：
+                # 每个展开字符都映射回同一个原文区间。这是保守做法——命中其中
+                # 任一个都替换整个原文区间，宁可多遮一个字符，也不漏遮。
+                mapping.append((i, i + 1))
+        view = "".join(view_chars)
+        if view == text and len(mapping) == len(text):
+            return text, None     # 归一化没改变任何东西：省下映射表
+        return view, mapping
+    except Exception:
+        # 归一化出错 → 退回原文（不做归一化扫描）。这是**降级不是漏检**：
+        # 原文扫描照常进行，只是没有归一化增强。
+        return text, None
+
+
+def _normalize_map_range(mapping, start, end):
+    """把视图坐标区间 `[start, end)` 反投回原文坐标区间；无法映射时返回 None。
+
+    映射可能「一对多」（NFKC 展开），所以取**所有**被覆盖原文区间的最小并集：
+    起点取最左，终点取最右。保守方向：宁可多遮，不漏遮。
+    """
+    if not mapping:
+        return (start, end)
+    try:
+        if start < 0 or end <= start or end > len(mapping):
+            return None
+        s0 = min(mapping[i][0] for i in range(start, end))
+        e0 = max(mapping[i][1] for i in range(start, end))
+        return (s0, e0)
+    except Exception:
+        return None
+
+
+def _known_coverage():
+    """当前「脱敏覆盖项」的指纹（sent 记录的有效性判据）。
+
+    含什么：规则开关表、NER 开关、自定义词表内容、值级白名单。
+    不含什么：任何时间/会话/请求维度——sent 的语义是「这段文本在**这套覆盖项**
+    下首次被打码时的形态」，跟谁发的、什么时候发的无关。
+
+    为什么必须含它：关掉某条规则后，同一文本要按新覆盖项重算（否则用户关了
+    规则却发现历史文本仍被遮，无法自救）。
+    """
+    try:
+        return (
+            tuple(sorted(BUILTIN_RULES.items())),
+            bool(NER_ENABLED),
+            tuple(sorted(CUSTOM_WORDS.keys())),
+            tuple(sorted(ALLOW_VALUES)),
+        )
+    except Exception:
+        # 拿不到就返回一个**唯一**值：宁可让 sent 失效（多算一次），
+        # 也不能让不同覆盖项共用同一条 sent 记录（那会把旧形态永远钉住）。
+        return (id(BUILTIN_RULES), bool(NER_ENABLED), time.time())
+
+
+def _known_lookup_spans(text: str):
+    """在 text 里找**已知值**，返回 [(start, end, token, label)]（已排序、互不重叠）。
+
+    两层过滤：
+      1. 4-gram 位图：每个 needle 的首 4 字符先查位图，不命中直接跳过；
+      2. 完整比对：位图命中才 `text.find`。
+    位图允许碰撞（只是多一次 find），所以正确性不依赖位图。
+
+    **覆盖项过滤（2026-10-25）**：`_KNOWN` 是进程级的，但「该不该遮」取决于
+    当前规则开关。用户关掉 `PHONE` 后，之前登记的手机号**必须**不再被 known
+    遮住——否则用户关规则、值仍被遮，会以为开关坏了（`tests/test_leaf_cache.py::
+    test_rule_toggle_invalidates_cached_result` 锁这条）。
+
+    判据：`label` 是内置规则名时，看 `BUILTIN_RULES[label]`；自定义词标签
+    （`TERM` / `NAME` 等不在规则表里的）一律放行——它们的开关由词表本身管。
+    """
+    if not text:
+        return []
+    try:
+        with _KNOWN_LOCK:
+            if not _KNOWN_BY_HEAD:
+                return []
+            entries = list(_KNOWN_BY_HEAD.values())
+            bits = bytes(_KNOWN_BITS)
+        # 位图快速排除：只对**长度 >= 4** 的 needle 有意义
+        def _gram_in_bits(s):
+            if len(s) < 4:
+                return True
+            g = _known_gram(s, 0)
+            idx = (g >> 3) & ((1 << 14) - 1)
+            return bool(bits[idx >> 3] >> (idx & 7) & 1)
+
+        # 覆盖项：label 是内置规则名时，规则关掉就整条失效
+        def _still_covered(lbl):
+            if lbl in BUILTIN_RULES:
+                return bool(BUILTIN_RULES.get(lbl))
+            return True
+
+        spans = []
+        for orig, token, label in entries:
+            if not _still_covered(label):
+                continue
+            if not _gram_in_bits(orig):
+                continue
+            start = 0
+            while True:
+                i = text.find(orig, start)
+                if i < 0:
+                    break
+                start = i + len(orig)
+                # 边界检查（对齐 magpie `knownBound`）：值嵌在更长的**标识符**里
+                # 时不该替换。实测反例：已知值 `aabb1c2d` 会让 `xaabb1c2dx`
+                # 变成 `x{{TERM_…}}x` —— 那是一个完全不同的标识符（变量名、
+                # 哈希前缀），改坏它等于让模型拿到用户从没写过的字符串。
+                #
+                # 判据：两侧若都是字母数字/下划线，说明它是更长 token 的一段。
+                # 中文不需要这条（汉字之间没有「标识符」概念，且中文姓名本来就
+                # 可能紧邻其它汉字）。
+                if i > 0 and text[i - 1].isascii() and (text[i - 1].isalnum() or text[i - 1] == "_"):
+                    continue
+                j = i + len(orig)
+                if j < len(text) and text[j].isascii() and (text[j].isalnum() or text[j] == "_"):
+                    continue
+                spans.append((i, j, token, label))
+        if not spans:
+            return []
+        # 长值优先、同起点先到先得：与 `_mask_by_spans` 的「重叠整段丢弃」契约配合
+        spans.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+        out = []
+        cursor = 0
+        for s, e, tok, lbl in spans:
+            if s < cursor:
+                continue          # 与已接受区间重叠：整段跳过（不截断，防还原重复吐字）
+            out.append((s, e, tok, lbl))
+            cursor = e
+        return out
+    except Exception:
+        return []
+
+
+def _sent_key(text: str, coverage: tuple):
+    """一段文本的 sent 键：文本 + **覆盖项**一起哈希。
+
+    必须含覆盖项：关掉某条规则后，同一文本要按新覆盖项重算（`test_known_forward`
+    的 `CoverageChangeRecomputesTests` 锁这条）。
+    """
+    h = hashlib.sha256()
+    h.update(repr(coverage).encode("utf-8", "replace"))
+    h.update(b"\x00")
+    h.update(text.encode("utf-8", "surrogatepass"))
+    return h.digest()
+
+
+def _sent_lookup(key):
+    """取已固化的 known 区间；未命中返回 None。
+
+    双代语义：`_SENT_CUR` 是当代，`_SENT_OLD` 是上一代（换代时整体搬过去）。
+    **命中 old 就搬到 cur**，让仍在使用的条目活过下一轮换代。
+
+    ⚠️ 搬动必须**同时受 `_SENT_MAX` 约束**（2026-10-25 复核发现）：原实现只
+    `_SENT_CUR[key] = v`，没有上限检查——一旦 cur 已满（比如刚换代、或大量
+    old 命中），cur 会**无限增长**（`_sent_store` 只在插入时检查，而这里不经过
+    它）。那是无界内存增长，在长会话里会持续累积。
+    """
+    with _SENT_LOCK:
+        v = _SENT_CUR.get(key)
+        if v is not None:
+            return v
+        v = _SENT_OLD.get(key)
+        if v is not None:
+            # 仍在使用：搬到 cur（受上限约束，满了就换代而不是无界增长）
+            if len(_SENT_CUR) >= _SENT_MAX:
+                _SENT_OLD.clear()
+                _SENT_OLD.update(_SENT_CUR)
+                _SENT_CUR.clear()
+            _SENT_CUR[key] = v
+            return v
+    return None
+
+
+def _sent_store(key, spans):
+    with _SENT_LOCK:
+        if len(_SENT_CUR) >= _SENT_MAX:
+            _SENT_OLD.clear()
+            _SENT_OLD.update(_SENT_CUR)
+            _SENT_CUR.clear()
+        _SENT_CUR[key] = spans
+
+
+# ===================== 出口前复检（egress verify）=====================
+#
+# 最后一道网：脱敏后的字节**回头再扫一遍**，仍能匹配到本次请求里登记过的原文
+# 就阻断。它抓的不是假想风险，而是「规则漏了 / 路径豁免错了 / 覆盖项算错了」
+# 这类**已知会发生的**缺陷（本方案 A-1/A-2 修掉的三条漏检路径，任何一条若再
+# 出现，这里都能兜住）。
+#
+# 参照 `askalf/cordon` 的 `egressViolations`，但**刻意不抄它的归一化匹配**
+# （NFKC + 去零宽 + 大小写折叠 + 分隔符盲）：那一层误报面大，实测把
+# `1 3 8 0 0 1 3 8 0 0 0` 这类正常排版文本也算泄漏。本仓的归一化由 B-3
+# 在**扫描入口**做（更早、更准），复检只做精确子串比对。
+#
+# 成本（实测，见 `tests/test_egress_verify.py` 头部）：needle ≤ 200 且
+# body ≤ 4MB 时 <5% 额外开销（脱敏本身 166 ms/MB）。超预算**跳过并留痕**，
+# 绝不阻断 —— 否则大 body 会恒定 503，把可用性问题变成不可用。
+# 开关：默认开。环境变量只用于**关**（`MASKIT_EGRESS_VERIFY=0`），
+# 与其它 `MASKIT_*` 开关同一口径（`is_true` 是严格判据，不认裸 bool()）。
+_MASK_EGRESS_ON = is_true(os.environ.get("MASKIT_EGRESS_VERIFY", "1"))
+# needle 上限：实测 200 个 × 4MB ≈ 46ms（单 alternation 复合正则）
+_MASK_EGRESS_MAX_NEEDLES = max(10, _env_int("MASKIT_EGRESS_MAX_NEEDLES", 200))
+# body 上限：4 MiB（脱敏单条上限 32 MiB，但复检是额外开销，取更小的预算）
+_MASK_EGRESS_MAX_BYTES = max(64 * 1024, _env_int(
+    "MASKIT_EGRESS_MAX_BYTES", 4 * 1024 * 1024))
+# needle 最短长度：与 `_KNOWN_MIN` 同口径，更短的值在正常文本里误报率过高
+_MASK_EGRESS_MIN_NEEDLE = 8
+
+# 复检命中时**是否阻断**：默认**不阻断**（只记录 + 取证）。
+#
+# 用户第一准则（2026-10-26 定案，原话：「不管怎么样不应该阻断我的请求啊，只是
+# 日志记录有提示的吧……这个是第一准则，不然的话都无法使用了」）：
+#
+# · Maskit 是本地透明代理。阻断请求的那一刻，用户的微信机器人 / 编辑器助手 /
+#   CI 机器人就**整条不可用**，而用户往往几小时后才发现「原来是网关吃了请求」
+#   （上层应用只会报「上游 503 / 重试失败」）。
+# · 漏一个值的代价是**一个值出网**（可事后补救：日志、取证、改规则）；
+#   阻断一个请求的代价是**整条业务链路不可用**（不可补救）。
+#
+# 所以复检的角色是「告警 + 取证」，不是「闸门」。`FAIL_CLOSED` 管的是「脱敏管线
+# **抛异常**、不知道遮没遮」—— 那种情况放行等于必然明文出网，阻断是对的；
+# 复检看到的是「脱敏成功、但某处残留」，那大概率是规则**主动放过**的正常输出
+# （2026-10-26 真机 12 条 503 全部如此），升级成硬失败是把「可能漏一个值」
+# 换成「整条链路不可用」。
+#
+# 需要旧行为（命中就拦）的用户显式设 `MASKIT_EGRESS_BLOCK=1`。
+_MASK_EGRESS_BLOCK = is_true(os.environ.get("MASKIT_EGRESS_BLOCK", "0"))
+
+
+# 复检的「同口径复判」表：label -> (规则正则, 捕获组, 值校验)。
+#
+# 为什么必须有（2026-10-26 真机 12 条 503 的根因）：复检旧实现是**裸精确子串**，
+# 于是「规则看过并明确决定不遮」的位置也被判成泄漏 ——
+#   · `139…5050` 落在 `139…50501`（12 位）里 → ID_BOUND_R 不满足，规则主动拒绝；
+#   · `139…5050` 落在 `ID139…5050X` 里 → 两侧字母边界都不满足；
+#   · 邮箱落在 `https://<user>@<host>…` 与 `…<host>.` 里 →
+#     EMAIL 的右边界排除 `.`、左边界排除 `:` 与词法字符。
+# 这些残留是规则的**正常输出**，不是漏检。把「AI 在正文里讨论过某个号码」这件事
+# 判成泄漏，会让请求恒定 503（真机就是这样：模型分析文本里写了 12 位示例）。
+#
+# 判据：needle 的每个出现位置，用**该 needle 自己的 label** 对应的规则去复判 ——
+# 规则在该位置会匹配、且值校验通过，才算「该遮没遮」。
+#
+# 非内置标签（自定义词 TERM/编号/密级、NER 的 NAME/ORG/ADDR）**不在此表**：
+# 它们的语义本来就是无边界子串匹配（`_literal_word_pattern` 对 >=2 字词无边界），
+# 所以精确子串命中即泄漏，行为保持不变。
+_MASK_EGRESS_LABEL_RX = {}
+# 建表锁（2026-10-26 复核发现）：`_mask_egress_verify` 跑在 `_MASK_POOL`
+# 专职线程里（并发宽度可配），两个 worker 可能同时首次调用。原实现是
+# 「判非空 → 逐条 append」，于是第二个线程会看到**非空但残缺**的表就返回 ——
+# 那个 label 查不到 matcher 就落到 `return True`（判泄漏）。方向是误报不是漏报，
+# 但配上 `MASKIT_EGRESS_BLOCK=1` 就是假 503。改成锁内建到局部、最后一次发布。
+_MASK_EGRESS_LABEL_LOCK = threading.Lock()
+
+
+def _mask_egress_label_matchers():
+    """构建（并缓存）label -> (正则, 捕获组, 值校验) 表。
+
+    懒构建的原因：`RULES` 与 `_xxx_ok` 都在本模块后面的位置定义，模块导入期
+    取不到；而且这份表**只读**，构建一次即可（`RULES` 是模块常量，不热重载）。
+
+    值校验必须与扫描侧同一批函数（`_phone_ok` / `_email_ok` / …）：漏一个就是
+    第二套口径 —— 复检认为「规则会遮」，扫描侧却因校验拒绝而不遮，反而制造
+    假阴性（真泄漏被放过）。
+    """
+    if _MASK_EGRESS_LABEL_RX:
+        return _MASK_EGRESS_LABEL_RX
+    with _MASK_EGRESS_LABEL_LOCK:
+        # 双重检查：另一个线程可能已经建好了（锁外那次快查是为了不付锁代价）
+        if _MASK_EGRESS_LABEL_RX:
+            return _MASK_EGRESS_LABEL_RX
+        try:
+            validators = {
+                "CARD": _card_ok,
+                "IDCARD": _idcard_ok,
+                "PHONE": _phone_ok,
+                "LANDLINE": _landline_ok,
+                "EMAIL": _email_ok,
+                "IBAN": _iban_ok,
+                "JWT": _jwt_ok,
+                "IP_PUBLIC": _ip_public_ok,
+                "IPV6_PRIVATE": _ipv6_private_ok,
+                "USCC": _uscc_ok,
+            }
+            built = {}
+            for rx, label, group_idx in RULES:
+                # 同名 label 有多条规则时（IP_PRIVATE 就有两条）：
+                # 任一规则能命中即视为「规则会遮」，所以存成列表。
+                built.setdefault(label, []).append(
+                    (rx, group_idx, validators.get(label)))
+            # **建完再一次性发布**：并发线程不会看到「非空但残缺」的表。
+            _MASK_EGRESS_LABEL_RX.update(built)
+        except Exception:
+            # 表建不起来 → 复检退回「裸精确子串」（保守方向：宁可误报也不漏报）。
+            # 不静默：调用点拿到的空表就是退化信号（本函数只在首次调用时跑，
+            # 异常即代码缺陷）。
+            return {}
+    return _MASK_EGRESS_LABEL_RX
+
+
+def _mask_egress_span_is_rule_owned(text, needle, pos, label):
+    """该 needle 在 `pos` 处的这次出现，**扫描规则会不会遮它**？
+
+    返回 True = 规则在该位置会匹配并遮住（所以残留是真泄漏）；
+    False = 规则主动拒绝（形态合法地不该遮），不算泄漏。
+
+    判定必须在 `pos` **附近**重新跑一遍规则，而不是只看子串：边界断言
+    （`ID_BOUND_L/R`）、分隔符反向引用、以及 `_xxx_ok` 的值语义都要一起生效。
+    搜索窗口取 `[pos - 窗口, pos + len(needle) + 窗口]`：边界断言最多看 1 个字符，
+    但 EMAIL/CONNSTR 这类规则可能从更早的位置起匹配，给 120 字符足够覆盖
+    （needle 自身长度已含在内）。
+    """
+    matchers = _mask_egress_label_matchers().get(label)
+    if not matchers:
+        # 非内置标签（自定义词 / NER）：语义就是无边界子串匹配 → 命中即泄漏
+        return True
+    end = pos + len(needle)
+    start = max(0, pos - 120)
+    # 窗口右界必须**封顶**（2026-10-26）：`finditer` 没有 endpos 时，只要该位置
+    # 之后再无匹配就会一路扫到文本末尾 —— 真机 984KB × 24 needle × 多次命中
+    # 实测 473ms（超过脱敏本身）。真正要看的是「从 `start` 起、能否有一个匹配
+    # 覆盖到 `pos`」，所以右界取 `end + 120` 就够：边界断言最多看 1 字符，
+    # EMAIL/CONNSTR 这类规则不会需要更长前瞻。
+    stop = min(len(text), end + 120)
+    for rx, group_idx, validator in matchers:
+        try:
+            for m in rx.finditer(text, start, stop):
+                if m.start() > pos:
+                    break
+                gs, ge = m.span(group_idx)
+                if gs <= pos and ge >= end:
+                    # 规则覆盖了这个位置：只有值校验也通过，扫描侧才真的会遮它
+                    if validator is None:
+                        return True
+                    try:
+                        if validator(m.group(group_idx)):
+                            return True
+                    except Exception:
+                        # 校验器自身异常 → 按「会遮」处理（保守：宁可报泄漏）
+                        return True
+        except Exception:
+            continue
+    return False
+
+
+def _leaked_values(masked_text, needles, labels, limit=8):
+    """列出复检命中的值（**掩码预览 + 条数**，不写原文）。
+
+    为什么事件里要有它：只记一条「有泄漏」等于让用户自己重放整包去猜。
+    真机 2026-10-26 的事故里，用户看到 503 后完全不知道是哪个值、哪个规则 ——
+    只能让 AI 回放事件库才能定位。
+
+    安全：残留值本身就是已经出网的明文，但事件库是本地、只有用户自己能看，
+    而且它不进 MASK 的 items（那份受 `CREDENTIAL_LABELS` 保护）。所以这里只给
+    **label + 长度 + 掩码预览**，不给原文 —— 与 SCAN_WARN 同一口径。
+
+    `labels` 由调用方传入（不读全局/会话状态）：本函数可能在专职线程里被并发
+    调用，从全局或会话反查 sid 会拿到别人的数据。
+    """
+    out = []
+    try:
+        labels = labels or {}
+        for n in needles:
+            if len(out) >= limit:
+                break
+            try:
+                cnt = masked_text.count(n)
+            except Exception:
+                continue
+            if not cnt:
+                continue
+            _lbl = str(labels.get(n) or "")
+            out.append({
+                "label": _lbl[:24],
+                "length": len(n),
+                "count": cnt,
+                "preview": _preview(n, _lbl),
+            })
+    except Exception:
+        pass
+    return out
+
+
+def _mask_egress_note_pass(sid, n):
+    """记录「复检命中了 needle、但按规则同口径判定为不该遮」的条数。
+
+    为什么必须留痕（与 `egress_skipped` 同一纪律，AGENTS.md §3.8）：
+    「复检放过了某处残留」是**漏检路径的豁免**。静默放行等于用户以为复检
+    什么都没看到，而实际上它看到了 N 处并主动不报 —— 将来规则改坏时，
+    用户无法区分「复检没跑」与「复检跑了但全放行」。
+
+    累加在会话上、由 MASK 事件取走并清零，语义是「本次请求」。
+    """
+    s = _session_get(sid) if sid else None
+    if isinstance(s, dict) and n:
+        s["egress_passed"] = int(s.get("egress_passed") or 0) + int(n)
+
+
+def _take_egress_pass(sid):
+    """取走本轮的「复检放过」计数并清零（**请求级**语义）。"""
+    s = _session_get(sid) if sid else None
+    if not isinstance(s, dict):
+        return 0
+    return int(s.pop("egress_passed", 0) or 0)
+
+
+def _mask_egress_note_skip(sid, reason):
+    """记录「本轮复检被跳过」及原因（**必须留痕**，不能静默）。
+
+    与 `_note_signed_block_skip` / `_note_definition_skip` 同一纪律：豁免是
+    漏检路径，静默豁免等于用户以为跑了、其实没跑。
+
+    会话不存在时不建（探测/单测路径不能凭空造会话）：生产链路上脱敏阶段
+    一定已建过会话，这里只是补记。
+    """
+    s = _session_get(sid) if sid else None
+    if isinstance(s, dict):
+        s["egress_skipped"] = True
+        s["egress_skip_reason"] = str(reason or "")[:64]
+
+
+def _mask_egress_needles(fwd, labels, new_orig=None):
+    """从**本次请求**的映射里挑出可以当 needle 的原文。
+
+    ⚠️ `fwd` 是**会话累计**表（跨请求复用窗口），必须用 `new_orig`（本轮新增）
+    收窄 —— 否则 needle 集合随会话单调增长，一旦超过 `_MASK_EGRESS_MAX_NEEDLES`
+    就**此后每轮都走 `needles_over_budget`**，闸门等于永久关掉（2026-10-25 复核
+    发现的 P1：真机长会话 fwd 可达数百条）。
+
+    `new_orig` 为 None 时退回全表（兼容旧调用点），但生产路径必须传。
+
+    排除（每一条都有理由）：
+      · 短于 `_MASK_EGRESS_MIN_NEEDLE`：误报率过高；
+      · **凭据类**（`CREDENTIAL_LABELS`）：它们的原文要被写进正则对象，而
+        `re.compile` 的 pattern 会进异常信息/日志 —— 等于把凭据原文放到诊断面；
+      · 本身是占位符：防套娃。
+    """
+    out = []
+    try:
+        pool = new_orig if new_orig is not None else (fwd or {})
+        for orig in pool:
+            if not isinstance(orig, str) or len(orig) < _MASK_EGRESS_MIN_NEEDLE:
+                continue
+            if (labels or {}).get(orig) in CREDENTIAL_LABELS:
+                continue
+            if _PLACEHOLDER_RX.match(orig):
+                continue
+            out.append(orig)
+        return out
+    except Exception:
+        return []
+
+
+def _mask_egress_verify(masked_text, values, sid=""):
+    """复检：脱敏后的文本里还有没有原文？返回 True 表示**发现泄漏**。
+
+    判据顺序（每一步都必要）：
+      1. 预算：needle 数 / body 大小超限 → 记 `egress_skipped` 并返回 False（不阻断）；
+      2. 占位符位置填**分隔符**（不是删掉，见下），占位符是**已脱敏**形态；
+      3. 逐 needle 定位 + 同口径规则复判（`_mask_egress_span_is_rule_owned`）。
+
+    绝不抛异常（热路径）：出错按「没发现泄漏」处理并留痕，因为阻断的代价
+    远大于漏这一道网（fail-closed 主闸仍在前面）。
+    """
+    try:
+        if not _MASK_EGRESS_ON:
+            return False
+        needles = [v for v in (values or []) if isinstance(v, str)
+                   and len(v) >= _MASK_EGRESS_MIN_NEEDLE]
+        if not needles:
+            return False
+        if len(needles) > _MASK_EGRESS_MAX_NEEDLES:
+            _mask_egress_note_skip(sid, "needles_over_budget")
+            return False
+        if len(masked_text) > _MASK_EGRESS_MAX_BYTES:
+            _mask_egress_note_skip(sid, "body_over_budget")
+            return False
+        # 占位符是已脱敏形态，不能参与泄漏判定；但**必须换成不可拼接的分隔符**，
+        # 不能直接删掉。
+        #
+        # 为什么（2026-10-26 真机第二类 503 的根因）：`sub("")` 会让占位符两侧的
+        # 文本拼在一起 —— AI 在正文里写「部分被遮」的示例
+        # `13996{{PHONE_xxxxxx}}825050` 时，删掉占位符就拼出了完整号码，复检
+        # 报泄漏、请求 503。而实际上行的那份字节里中间是占位符，号码**并没有**
+        # 明文出网 —— 那是删占位符造出来的假阳性。
+        #
+        # NUL 选为分隔符：不在任何 needle 里（needle 是正常文本），也不是
+        # `[A-Za-z0-9]` 等边界字符类的一员，所以不会改变规则的边界判定。
+        stripped = _PLACEHOLDER_RX.sub("\x00", masked_text)
+        if not stripped:
+            return False
+        # 剔除**按协议契约整块豁免**的区域（签名思考块 / 密文句柄）：它们本就要
+        # 原样上行，是已接受的取舍（`signed_blocks_skipped` 计数）。对它们做
+        # 「泄漏判定」等于把豁免升级成硬失败 —— 实测会让带 thinking 回放的
+        # Claude 会话直接 503（2026-10-25 复核发现的 P1）。
+        #
+        # 为什么不能简单 `replace(块原文, "")`：豁免块记录的是**该块自己的 JSON**
+        # （键顺序/转义与整包不同），在整包文本里找不到等长子串。改按「值」判：
+        # 每个 needle 若**全部出现位置都落在某个豁免块的原文里**，则不算泄漏。
+        _exempt = [b for b in _take_exempt_blocks(sid) if b]
+        if _exempt:
+            _leaks = []
+            for _n in needles:
+                _total = stripped.count(_n)
+                if not _total:
+                    continue
+                _in_exempt = sum(b.count(_n) for b in _exempt)
+                # 豁免块之外的命中数 > 0 才算真泄漏（块内命中是协议允许的原样上行）
+                if _total - _in_exempt > 0:
+                    _leaks.append(_n)
+            return bool(_leaks)
+        # 逐 needle 定位，再对每个位置做「同口径复判」（见
+        # `_mask_egress_span_is_rule_owned`）。
+        #
+        # 为什么不再用单条 alternation 一次扫完：`str.find` 循环本身是 C 速度，
+        # 命中位置通常只有几十处，复判只在命中处跑规则，成本远低于「扫全量 + 全部
+        # 当泄漏」。真机长会话实测：24 needle / 790KB → 判完 < 20ms。
+        #
+        # 需要 label 才能复判，所以这里直接从 needle 原文反查 label；
+        # 反查不到（理论上不会发生）按「会遮」处理 —— 保守方向是报泄漏。
+        labels_map = None
+        _passed = 0
+        for _n in needles:
+            _pos = stripped.find(_n)
+            if _pos < 0:
+                continue
+            if labels_map is None:
+                _s = _session_get(sid) if sid else None
+                labels_map = (_s.get("labels") or {}) if isinstance(_s, dict) else {}
+            _label = labels_map.get(_n) or ""
+            while _pos >= 0:
+                if _mask_egress_span_is_rule_owned(stripped, _n, _pos, _label):
+                    return True
+                # 这处残留被判定为「规则主动放过」→ 计入留痕（不静默豁免）
+                _passed += 1
+                _pos = stripped.find(_n, _pos + 1)
+        if _passed:
+            _mask_egress_note_pass(sid, _passed)
+        return False
+    except Exception as e:
+        # 复检自身出错 → 按「没发现」处理并留痕。**不阻断**：主闸（fail-closed）
+        # 已经在前面，这里只是加一道网；把复检的 bug 变成 503 是反向伤害。
+        _mask_egress_note_skip(sid, "verify_error:%s" % type(e).__name__)
+        return False
 
 # 自定义敏感词持久化映射表（仅内存常驻，不随 TTL/LRU 淘汰）：
 # 解决长任务、Agent 工具调用时因超过复用表 TTL 或引擎重启导致无法还原的问题。
@@ -2783,11 +3837,15 @@ def _remember(fwd, labels, orig, label):
             fwd[orig] = perm_token
             labels[orig] = label
             _touch_recent(perm_token, orig)
+            _known_add(orig, perm_token, label)
             return True
         hit = tables.fwd.get(orig)
         reused = bool(hit) and (_is_custom_word_orig(orig) or time.time() - hit[2] <= _recent_ttl())
         fwd[orig] = _recall_token(orig, label)
         labels[orig] = label
+        # 登记到 known：这个值从今以后**任何位置**出现都要遮（见 `_KNOWN_*` 注释）。
+        # 凭据类/短值会被 `_known_add` 自己挡掉，这里不用判。
+        _known_add(orig, fwd[orig], label)
         return reused
     return False
 
@@ -3786,6 +4844,120 @@ def _rule_enabled(label):
     return bool(BUILTIN_RULES.get(label, True))
 
 
+# ── per-kind 三态（2026-10-25，B-4）──────────────────────────────────
+#
+# 取值：`mask`（默认）/ `warn` / `block`。
+#
+#   mask  —— 改写为占位符（历史行为）；
+#   warn  —— **只提醒、不改写、不阻断**。原文照常上行，仅记 `warned` 计数与
+#            `warned_labels`。这是「先观察误报率再决定」的入口，但**它不安全**：
+#            设成 warn 就是明文出网。UI 文案与 SECURITY.md 必须明说（见
+#            `test_rule_actions.py::WarnActionTests` 的 docstring）。
+#   block —— 遮 + 阻断该请求（`rule_blocked` 标记由请求钩子转成 503）。
+#
+# 为什么需要三态：只有「开/关」两态时，用户遇到误报只能整条规则关掉（漏检面
+# 立刻扩大），遇到高风险类型又没法要求「命中就拦」。
+RULE_ACTIONS = {}
+RULE_ACTION_VALUES = ("mask", "warn", "block")
+
+
+def _rule_action(label):
+    """该规则的处置方式；非法/缺省一律回退 `mask`。
+
+    回退方向是**保守**的：配置写错（`"banana"`）不能让规则变成「什么都不做」——
+    那等于静默关掉脱敏。与 `is_true` 的「宁可少开，不可误开」同一取向。
+    """
+    a = RULE_ACTIONS.get(label)
+    if a in RULE_ACTION_VALUES:
+        return a
+    return "mask"
+
+
+def _take_known_hits(sid):
+    """取走本轮的 known 正向打码命中数并清零（**请求级**语义）。
+
+    为什么必须发出去：用户看到「没有锚点却被遮」时需要能归因 —— 否则会以为
+    规则误报，进而去关规则（扩大漏检面）。`known_hits > 0` 就说明这是
+    「已知值正向打码」，不是规则命中。
+    """
+    s = _session_get(sid) if sid else None
+    if not isinstance(s, dict):
+        return 0
+    return int(s.pop("known_hits", 0) or 0)
+
+
+def _take_egress_skip(sid):
+    """取走本轮的「出口复检被跳过」标记与原因并清零（**请求级**语义）。
+
+    这是「超预算跳过必须留痕」这条承诺的唯一落点。不发出去等于静默跳过 ——
+    用户以为复检跑过了，其实没跑。
+    """
+    s = _session_get(sid) if sid else None
+    if not isinstance(s, dict):
+        return False, ""
+    skipped = bool(s.pop("egress_skipped", False))
+    reason = str(s.pop("egress_skip_reason", "") or "")
+    return skipped, reason
+
+
+def _take_warned(sid):
+    """取走本轮的 `warned` 计数与标签并清零（**请求级**语义）。
+
+    为什么必须有：`warn` 三态的价值就是「让用户看见哪些值被放行了」。
+    只累加不发出等于用户设了 warn 之后**什么都看不到** —— 那和关掉规则
+    没有区别，却还留着「我以为设了 warn 就安全」的误解。
+    """
+    s = _session_get(sid) if sid else None
+    if not isinstance(s, dict):
+        return 0, []
+    n = int(s.pop("warned", 0) or 0)
+    labels = sorted(s.pop("warned_labels", set()) or [])
+    return n, labels
+
+
+def _take_rule_block(sid):
+    """取走本轮的 `rule_blocked` 标记并清零（**请求级**语义）。
+
+    为什么必须「取走即清」：标记累加在**会话**上，而它的语义是「**这次请求**
+    命中了被设为 block 的类型」。同一 sid 的后续请求若不清零，会被前一个请求
+    的标记误拦 —— 实测：req1 命中 `DB_PASSWORD`，req2 只是 `hello world`，
+    也被 503（2026-10-25 复核）。与 `_take_signed_skips` / `_take_definition_skips`
+    同一口径：会话上累加、事件侧取走清零，不让会话级累计值冒充本轮结论。
+
+    返回 `(blocked, labels)`。
+    """
+    s = _session_get(sid) if sid else None
+    if not isinstance(s, dict):
+        return False, []
+    blocked = bool(s.pop("rule_blocked", False))
+    labels = sorted(s.pop("rule_blocked_labels", set()) or [])
+    return blocked, labels
+
+
+def _allow_value_hit(value):
+    """该值是否在值级白名单里（**整值**精确匹配，大小写不敏感）。
+
+    为什么是整值而不是子串：白名单的语义是「这个**值**我确认可以放行」。
+    做成子串匹配的话，放行 `Uint8Array` 会连带放行 `Uint8ArrayFoo`——
+    那是一个完全不同（可能是真的）的凭据值。
+
+    为什么大小写不敏感：与自定义词表的大小写折叠口径一致（`_custom_words_plan`
+    对 literal 词也做 `lower()` 归一）。用户填 `Uint8Array` 时不该因为代码里
+    写成 `uint8array` 就失效。
+    """
+    # 热路径：`_hit` 每次命中都调它，而白名单通常是空的。先做**零成本**短路
+    # （空集合判断），再做字符串归一——顺序反过来就是给每个命中白付一次
+    # `strip().lower()`（实测 1MB 文本 9800 次命中 ≈ 30ms，占完整 mask 的三分之一）。
+    if not ALLOW_VALUES:
+        return False
+    if not value:
+        return False
+    try:
+        return str(value).strip().lower() in ALLOW_VALUES
+    except Exception:
+        return False
+
+
 def _custom_word_enabled(word, label):
     if label in SENSITIVE_DISABLED:
         return False
@@ -3880,6 +5052,12 @@ def _custom_word_regex(word):
     if len(word) == 1:
         rx = re.compile(rf"(?<![{_SINGLE_WORD_BOUND}]){esc}(?![{_SINGLE_WORD_BOUND}])", re.IGNORECASE)
     else:
+        # 刻意**不加**词边界（2026-10-29 实测否决）：试过给纯 ASCII 词加
+        # `(?<![A-Za-z0-9_])` 边界，结果 20 条协议契约测试全红——它们锁的是
+        # 「同名键出现在编码块/标识符里也必须照常扫描」（`acme` 嵌在 base64 里
+        # 必须被替换，`tests/test_protocol_contracts.py`）。
+        # 编码块被改坏的根因是「媒体字段没有豁免」，不是词边界：修在
+        # `_media_value_exempt`，不要动这里的子串语义。
         rx = re.compile(esc, re.IGNORECASE)
     _CUSTOM_WORD_RX_CACHE[word] = rx
     return rx
@@ -3897,6 +5075,8 @@ def _literal_word_pattern(word):
     if len(word) == 1 or word in SENSITIVE_WORD_WHOLE:
         bound = _SINGLE_WORD_BOUND if len(word) == 1 else _WHOLE_WORD_BOUND
         return rf"(?<![{bound}]){esc}(?![{bound}])"
+    # 不加 ASCII 词边界：理由见 `_custom_word_regex` 同位置注释（20 条协议契约测试
+    # 锁住「编码块/标识符里也要扫」）。两条路径必须**同口径**，否则单测过、线上漂。
     return esc
 
 
@@ -4607,6 +5787,95 @@ def _ner_doc_budget(seconds, *, deadline=None, cancel_event=None):
         ner_engine.end_budget()
 
 
+def _overlaps_any_placeholder(text, start, end):
+    """区间 `[start, end)` 是否与 `text` 里任何占位符重叠。
+
+    与 `_mask_excluding_placeholders_ed` 的「跳过占位符片段」同一目的，但那是
+    替换辅助函数、按正则分块处理；这里需要在**替换之前**判断一个已知区间，
+    所以单独实现。共用 `_PLACEHOLDER_RX`（唯一定义源），不另写格式。
+    """
+    try:
+        for m in _PLACEHOLDER_RX.finditer(text, max(0, start - 64), min(len(text), end + 64)):
+            if m.start() < end and m.end() > start:
+                return True
+        return False
+    except Exception:
+        # 判不出来时按「重叠」处理（跳过）——宁可少遮一处，也不劈开既有占位符
+        return True
+
+
+def _zh_name_spans(text, ner_entities):
+    """中文姓名启发层：补 NER 漏检、剔 NER 过检（2026-10-25，C-1）。
+
+    为什么必须有这一层：NER 是概率模型，`客户某甲` 这类「角色词 + 姓名」的
+    固定句式经常漏检，而 `张开的括号` / `王国的军队` 会被误标成人名（实测见
+    `tests/test_zh_names.py` 头部）。`engine/zh_names.py` 用纯 stdlib 的
+    姓氏表 + 上下文证据 + 反例词表双向修正。
+
+    **只在 NER 开启时生效**：它是 NER 的后处理，不是独立检测器——关掉 NER 时
+    跑它等于给用户一个他没开的检测面。
+
+    返回 `(补充的实体列表, 应当删除的实体列表)`：
+      · 补充：`[{"start": s, "end": e, "type": "NAME"}]`，坐标是**伤疤文本**坐标系
+        （与 `_ner_entity_spans` 的输入同坐标系，调用方直接合并即可）；
+      · 删除：NER 原始实体里那些「反例词」形态的区间。
+    """
+    try:
+        if not NER_ENABLED or not text:
+            return [], [], False
+        import zh_names
+
+        # 剔误：从 NER 原始实体里挑出反例词形态的
+        raw = [(e.get("start", 0), e.get("end", 0), e.get("type", ""))
+               for e in (ner_entities or []) if isinstance(e, dict)]
+        drop_idx = set()
+        for sp in zh_names.rejected_spans(text, raw):
+            for i, r in enumerate(raw):
+                if (r[0], r[1]) == (sp[0], sp[1]):
+                    drop_idx.add(i)
+        removed = [ner_entities[i] for i in sorted(drop_idx)]
+        # 补漏：只在**未被 NER 覆盖**的区域找（已覆盖的不重复标，免得区间打架）
+        covered = [(r[0], r[1]) for i, r in enumerate(raw) if i not in drop_idx]
+        found = []
+        # 截断标志由**本调用方**带出（模块级计数会跨 worker 线程串号，见
+        # `zh_names.find_names` 的注释）
+        _spans, _truncated = zh_names.find_names(text, return_truncated=True)
+        for s0, e0, lbl in _spans:
+            if any(s0 < ce and e0 > cs for cs, ce in covered):
+                continue
+            found.append({"start": s0, "end": e0, "type": lbl})
+        return found, removed, _truncated
+    except Exception as e:
+        _ner_warn_once("zh_names", "中文姓名启发层降级: %s: %s" % (type(e).__name__, e))
+        return [], [], False
+
+
+def _mask_by_spans_ed(text, spans):
+    """同 `_mask_by_spans`，额外返回本次重建的 `Edit` 列表（坐标为**入参** text）。
+
+    为什么必须同时给 Edit（2026-10-28 真机 `om_compose` 的根因）：旧实现只重建
+    text、不让调用方更新 `OffsetMap`，于是下一次 `_update_om(edits, curr_len)` 里
+    `om.dst_len != curr_len` → `compose` 抛 ValueError → `om_broken` → 这条请求
+    **整段跳过语义识别**。known 正向打码在长会话第二轮起必然命中，实测 10-28
+    有 3025/5800 条 MASK 事件因此被记成 `om_compose` 降级（partial）。
+    调用方拿到 Edit 后必须 `_update_om(edits, len(text) 替换前)`。
+    """
+    if not spans:
+        return text, []
+    out = []
+    edits = []
+    cursor = 0
+    for start, end, repl in spans:
+        if start < cursor:
+            continue          # 与已接受区间重叠：整段跳过，防错位且防还原重复吐字
+        out.append(text[cursor:start])
+        out.append(repl)
+        edits.append(Edit(start, end, repl))
+        cursor = end
+    out.append(text[cursor:])
+    return "".join(out), edits
+
+
 def _mask_by_spans(text, spans):
     """按 [start, end, repl) 区间一次性重建文本（spans 须已按 start 排序）。
 
@@ -4615,19 +5884,11 @@ def _mask_by_spans(text, spans):
     - 绝不能将重叠区间截断为 [cursor, end) 替换，因为 repl 绑定的完整原文在还原
       (restore) 时会将前序已覆盖的明文重复吐出，导致文本严重错位与破坏性重复。
     - 上游实体抽取层（ner_engine / _ner_entity_spans）负责确保实体区间两两不交。
+
+    只需结果、不需要维护坐标映射的调用方用它；会继续改写文本的调用方用
+    `_mask_by_spans_ed` 并把 Edit 交给 `_update_om`。
     """
-    if not spans:
-        return text
-    out = []
-    cursor = 0
-    for start, end, repl in spans:
-        if start < cursor:
-            continue          # 与已接受区间重叠：整段跳过，防错位且防还原重复吐字
-        out.append(text[cursor:start])
-        out.append(repl)
-        cursor = end
-    out.append(text[cursor:])
-    return "".join(out)
+    return _mask_by_spans_ed(text, spans)[0]
 
 
 class OffsetMap:
@@ -4819,6 +6080,95 @@ def _ner_entity_spans(text, entities):
         if cursor < end:
             spans.append((cursor, end, label))
     return spans
+
+
+# 2~3 字纯中文 NAME 若没有强上下文佐证，按误报处理（不遮）。
+# 上界选 3 而不是 4：真名多为 2~3 字，而 4 字以上更可能是机构/地址，不应在此降噪。
+_SHORT_NAME_MAX_CHARS = 3
+
+
+def _short_name_without_context(text, start, end, frag, label):
+    """短中文 NAME 的强上下文复核：True = 判为误报，不遮。
+
+    为什么（2026-10-28 真机事件库）：近 3 天 NAME 命中 65103 次，其中 62141 次
+    （95%）是 ≤3 字中文普通词 —— `简洁` 4990 / `时直` 4987 / `边界` 4800 /
+    `项目规` 4564 / `时明` 4266。它们把正常正文改成占位符，模型据此分析代码必然出错，
+    用户只看到「AI 答得不对」。代价取向与 `ner_engine._looks_like_code_identifier`
+    同一条：**宁可漏掩一个短名，不可误掩普通词**；跳过会计数上报
+    （`short_name_no_context`），不静默。
+    """
+    try:
+        if label not in ("NAME", "PERSON"):
+            return False
+        if not (2 <= len(frag) <= _SHORT_NAME_MAX_CHARS):
+            return False
+        import zh_names
+        if any(not zh_names.is_han(ch) for ch in frag):
+            return False
+        # 用户显式配置的词不接受启发式降噪（词表是用户意图，不是模型猜测）
+        if frag in CUSTOM_WORDS:
+            return False
+        return not zh_names.has_strong_context(text, start, end)
+    except Exception:
+        return False
+
+
+def _range_overlaps(ranges, s, e):
+    """`[s, e)` 是否落在给定区间列表中的某一个区间内（区间数很小，线性即可）。"""
+    for a, b in ranges:
+        if b > s and a < e:
+            return True
+    return False
+
+
+def _expand_long_entity_spans(text, planned, per_needle=64, total=512):
+    """把已判定为实体的**长值**在全文所有出现处一并打码。
+
+    为什么（2026-10-28 真机 2280 条 `egress_verify` flagged）：NER 是 **span 级**
+    替换（只遮模型标出的那几处），而出回复检是**全文精确子串**比对
+    （`_mask_egress_verify`）。同一个长值在长会话里出现多次时，未被 span 覆盖的
+    位置必然让复检报「有残留」—— 不是真泄漏，是两套口径不一致，且逐条打黄整个
+    日志页。既然本轮已经判定该字面是敏感实体，就没有理由在别处留明文。
+
+    短值不扩展（阈值与复检同口径 `_MASK_EGRESS_MIN_NEEDLE`）：2~3 字高频词的
+    误掩码代价远大于收益，它们由上面的强上下文复核处理。
+
+    上限 `per_needle` / `total` 是热路径护栏：`str.find` 是 C 速度，但长会话里
+    同一串可能重复上千次，无界扩展会把结果区间数推到万级，拖慢 `_mask_by_spans`。
+    """
+    if not planned:
+        return planned
+    ph = [(m.start(), m.end()) for m in _PLACEHOLDER_RX.finditer(text)]
+    out = list(planned)
+    taken = sorted((s, e) for s, e, _ in planned)
+    seen = set()
+    added = 0
+    for s, e, tok in planned:
+        if e - s < _MASK_EGRESS_MIN_NEEDLE:
+            continue
+        needle = text[s:e]
+        if not needle or needle in seen:
+            continue
+        seen.add(needle)
+        hits = 0
+        pos = 0
+        while hits < per_needle and added < total:
+            i = text.find(needle, pos)
+            if i < 0:
+                break
+            pos = i + 1
+            j = i + len(needle)
+            # 已有占位符区间不能被二次替换（会劈开 token），已规划区间不重复
+            if _range_overlaps(ph, i, j) or _range_overlaps(taken, i, j):
+                continue
+            out.append((i, j, tok))
+            taken.append((i, j))
+            taken.sort()
+            added += 1
+            hits += 1
+    if added:
+        out.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+    return out
 
 
 def mask(text, sid):
@@ -5046,6 +6396,7 @@ def _mask_text(text, sid):
     if s is None:
         _new_session(sid)
         s = sessions[sid]
+
     fwd = s["fwd"]
     labels = s["labels"]
     rev = s["rev"]
@@ -5059,6 +6410,24 @@ def _mask_text(text, sid):
     new_orig = set()
 
     def _hit(orig, label="API_KEY"):
+        # 值级白名单（B-4）：**所有**命中路径统一在这里拦截，而不是在各个
+        # 调用点各写一遍——否则前缀规则 / 自定义词 / NER / 归一化补充扫描
+        # 各漏一处就是一条白名单失效路径（实测：只在 RULES 循环里加，
+        # `DB_PASSWORD=<白名单值>` 仍被前缀规则遮掉）。
+        if _allow_value_hit(orig):
+            return
+        # per-kind 三态（B-4）：同样必须在**所有**命中路径上生效。
+        # 之前只加在 RULES 循环里，于是「前缀规则命中的 API_KEY」完全绕过了三态
+        # ——用户把 API_KEY 设成 `block` 却发现 `sk-xxx` 照常放行（2026-10-25 复核）。
+        _action = _rule_action(label)
+        if _action == "warn":
+            # 只提醒、不改写：原文照常上行，仅记账。
+            s["warned"] = int(s.get("warned") or 0) + 1
+            s.setdefault("warned_labels", set()).add(label)
+            return
+        if _action == "block":
+            s["rule_blocked"] = True
+            s.setdefault("rule_blocked_labels", set()).add(label)
         if orig not in fwd:
             new_orig.add(orig)
             if _remember(fwd, labels, orig, label):
@@ -5069,6 +6438,45 @@ def _mask_text(text, sid):
         tok = fwd.get(orig)
         if tok is not None:
             hit_tokens.setdefault(tok, (label, _orig_digest(orig)))
+
+    # ── 已发送字节固化（sent）+ 已知值正向打码（known）────────────────────
+    #
+    # 两步的顺序很关键：**先查 sent，命中就用记下的区间；只有新文本才按当前
+    # known 重算**。否则 known 集合一扩张，所有历史叶子的字节就会跟着变，
+    # 上游 prompt cache 整段失效（magpie 真实事故：cache_read = 0）。
+    #
+    # 为什么在这里（规则扫描之前）：known 命中的是**规则匹配不到的裸引用**，
+    # 先遮掉之后，后面所有规则都不会再碰这些区间（它们已变成占位符）。
+    try:
+        _cov = _known_coverage()
+        _k = _sent_key(text, _cov)
+        _spans = _sent_lookup(_k)
+        if _spans is None:
+            _spans = _known_lookup_spans(text)
+            _sent_store(_k, list(_spans))
+        if _spans:
+            # `_spans` 里的 token 是 known 索引里那个（可能来自别的会话），
+            # 实际替换必须用**本会话**签发的 token —— `_hit` 走 `_remember`
+            # 保证同一原文在 TTL 内复用同一 token（语义与改动前一致）。
+            repl = []
+            for _s0, _e0, _tok, _lbl in _spans:
+                _orig = text[_s0:_e0]
+                _hit(_orig, _lbl)
+                cur_tok = fwd.get(_orig)
+                if cur_tok:
+                    repl.append((_s0, _e0, cur_tok))
+            if repl:
+                _known_len = len(text)
+                text, _known_edits = _mask_by_spans_ed(text, repl)
+                # om 必须跟着走：少了这一步，后面的 `_update_om` 会因
+                # `om.dst_len != curr_len` 抛 ValueError，整条请求跳过 NER
+                # （2026-10-28 真机 3025 条 om_compose 的真因）。
+                _update_om(_known_edits, _known_len)
+            s["known_hits"] = int(s.get("known_hits") or 0) + len(_spans)
+    except Exception as _e:
+        # known/sent 是**增强**，出错不能影响主链路（fail-open 到「不做正向打码」），
+        # 但首次要告警一行，不能静默。
+        _ner_warn_once("known_scan", "known 扫描降级: %s: %s" % (type(_e).__name__, _e))
 
     # ── 叶子结果缓存命中路径（批次 8）───────────────────────────────────────
     # 抽样自检：每 _LEAF_CACHE_VERIFY_EVERY 次调用里有一次故意不用缓存，走完整
@@ -5095,7 +6503,18 @@ def _mask_text(text, sid):
     # Key 前缀命中归 API_KEY；可被 builtin_rules.API_KEY 关闭
     if _rule_enabled("API_KEY"):
         prefix_rx = _prefix_secret_regex()
-        if prefix_rx:
+        # 预筛（2026-10-25，性能关键）：前缀清单从 9 个扩到 21 个后，这条正则
+        # 在 1MB 中文文本上要 **47ms**（0 命中）——它是 `(?<!...)(?:p1|p2|…)`
+        # 形态，引擎在每个字符位置都要起一次尝试。
+        #
+        # 先用 `str.find` 把「文本里压根没有任何前缀」的情况挡掉：C 实现的
+        # 子串查找 21 次只要 **4.3ms**，而且真实文本（中文正文、普通代码）
+        # 几乎总是走这条快路径。含前缀时才跑正则，那时它本来就会很快返回。
+        #
+        # 判据必须用**原始前缀**（含 `-`/`_`）：正则把它们展开成 `[-_]` 等价类，
+        # 所以 `sk_live_` 也会命中 `sk-` 这一支。预筛用 `in` 会漏掉这类等价写法——
+        # 所以下面额外把 `-`/`_` 的两种形态都放进预筛集合。
+        if prefix_rx and _prefix_may_hit(text):
             def _prefix_sub(m):
                 orig = m.group()
                 _hit(orig)
@@ -5165,8 +6584,15 @@ def _mask_text(text, sid):
                 if len(exempt_conn) < _CONNSTR_EXEMPT_MAX:
                     exempt_conn.append((m.start(), m.end()))
                 continue
+            # SECRET 的值语义收窄：键名已改成前缀/后缀通配（见 RULES 里那条注释），
+            # 匹配面变大，靠值把计数词与代码标识符挡回去。key_name 取值之前的整段。
+            if label == "SECRET" and not _secret_value_ok(orig, text[m.start():m.start(1)]):
+                continue
             if label == "EMAIL" and _overlaps_exempt_conn(m.start(), m.end(), exempt_conn):
                 continue
+            # 白名单与三态都统一在 `_hit` 里处理（见那里的注释）：
+            # 在循环里再判一次会与 `_hit` 的口径分叉（warn 时这里 continue、
+            # 那边 return，两处各改一处就漂移）。
             _hit(orig, label)
             matched.append(orig)
         # 按唯一原文替换（dict.fromkeys 去重且保序）。曾直接 `for orig in matched`：
@@ -5180,7 +6606,10 @@ def _mask_text(text, sid):
         # 同时跳过已有占位符片段（防污染：内置规则如 hex 匹配会劈开占位符）
         if matched:
             unique_orig = list(dict.fromkeys(matched))
-            repl_map = {orig: fwd[orig] for orig in unique_orig}
+            # `fwd` 里没有该原文 = `_hit` 没登记它（warn 三态 / 白名单 / 已存在但
+            # 未登记等）。用 `.get` 并跳过，**不能**用 `fwd[orig]` —— 那会 KeyError
+            # 把整条脱敏管线打挂（实测：warn 模式下 `DB_PASSWORD=` 直接抛）。
+            repl_map = {orig: fwd[orig] for orig in unique_orig if orig in fwd}
             def _rule_sub(m):
                 orig = m.group(group_idx)
                 if orig in repl_map:
@@ -5195,6 +6624,106 @@ def _mask_text(text, sid):
             text, edits = _mask_excluding_placeholders_ed(text, rx, _rule_sub, group_idx=group_idx)
             _update_om(edits, curr_len)
 
+    # ── 归一化补充扫描（2026-10-25，B-3）─────────────────────────────────
+    #
+    # 为什么放在规则扫描**之后**：原文扫描已经处理了绝大部分；这一趟只补
+    # 「视觉等价写法」漏掉的部分（零宽插入、全角数字/符号、NFKC 兼容字符）。
+    # 放在之前会让归一化视图的坐标反投与原文改写交错，反而更容易出错。
+    #
+    # 判据与主扫描**完全一致**（同一个 `_rule_enabled`、同一批 `_xxx_ok` 校验、
+    # 同样的占位符避让），只是跑在归一化视图上、命中区间反投回原文坐标。
+    # 这样「全角手机号」与「半角手机号」走的是同一条规则与同一套校验，
+    # 不会出现「归一化路径比主路径宽松」的第二套口径。
+    # 性能：`_normalize_view` 已经是「没有变形字符就返回 None 映射」的快路径，
+    # 这里再短路一次是为了**避免那次 1.6ms/MB 的预检本身**在纯中文/ASCII 文本上
+    # 白跑（实测低命中 1MB：完整 mask 95ms，其中归一化相关 ~5ms 可省则省）。
+    # 判据与 `_normalize_view` 内部完全一致（同一个 `_DEFORMABLE_RX`）。
+    if _NORMALIZE_SCAN_ON and text and _DEFORMABLE_RX.search(text):
+        _nview, _nmap = _normalize_view(text)
+        if _nmap is not None:      # None = 视图与原文一致，无需补充扫描
+            _norm_spans = []
+            for _rx, _lbl, _gi in RULES:
+                if not _rule_enabled(_lbl):
+                    continue
+                if not _rule_may_hit(_nview, _lbl):
+                    continue
+                for _m in _rx.finditer(_nview):
+                    _hit_v = _m.group(_gi)
+                    # 与主扫描同一套值校验（缺一个就是第二套口径）
+                    _ok = True
+                    if _lbl == "CARD":
+                        _ok = _card_ok(_hit_v)
+                    elif _lbl == "IDCARD":
+                        _ok = _idcard_ok(_hit_v)
+                    elif _lbl == "PHONE":
+                        _ok = _phone_ok(_hit_v)
+                    elif _lbl == "LANDLINE":
+                        _ok = _landline_ok(_hit_v)
+                    elif _lbl == "EMAIL":
+                        _ok = _email_ok(_hit_v)
+                    elif _lbl == "IBAN":
+                        _ok = _iban_ok(_hit_v)
+                    elif _lbl == "JWT":
+                        _ok = _jwt_ok(_hit_v)
+                    elif _lbl == "USCC":
+                        _ok = _uscc_ok(_hit_v)
+                    elif _lbl == "SECRET":
+                        _ok = _secret_value_ok(_hit_v, _nview[_m.start():_m.start(_gi)])
+                    # IP 两条必须在这里补上（2026-10-26 修）：主扫描有、归一化扫描没有，
+                    # 于是同一段文本仅因为含变形字符（全角数字/零宽）就让环回地址
+                    # 127.0.0.1 / 私网段被当 IP_PUBLIC 遮掉，而纯 ASCII 叶子按
+                    # `_ip_public_ok` 拒绝不遮 —— 两套口径 → 出口复检报泄漏 → 503。
+                    # 这正是“归一化路径比主路径宽松”的第二套口径，本段注释早已明令禁止。
+                    elif _lbl == "IP_PUBLIC":
+                        _ok = _ip_public_ok(_hit_v)
+                    elif _lbl == "IPV6_PRIVATE":
+                        _ok = _ipv6_private_ok(_hit_v)
+                    elif _lbl == "CONNSTR":
+                        _ok = _connstr_ok(_hit_v, _m, _nview)
+                    if not _ok:
+                        continue
+                    _rng = _normalize_map_range(_nmap, _m.start(_gi), _m.end(_gi))
+                    if _rng is None:
+                        continue
+                    _s0, _e0 = _rng
+                    # 命中区间若**与已有占位符重叠**，整段跳过（防污染）。
+                    # 为什么必须有这一条：占位符 `{{LABEL_<6位hex/辅音>}}` 本身会被
+                    # 各种规则命中（实测 `{{SECRET_xxx}}` 的 hex 段被 IPV6_PRIVATE
+                    # 当成地址、整个占位符被拆成 `S{{IPV6…}}RET_vq{{IPV6…}}s}}`）——
+                    # 那既破坏还原，又把标签打烂。主扫描靠 `_mask_excluding_placeholders_ed`
+                    # 天然避开，这里必须自己判。
+                    if _overlaps_any_placeholder(text, _s0, _e0):
+                        continue
+                    _orig_v = text[_s0:_e0]
+                    if not _orig_v.strip():
+                        continue
+                    _hit(_orig_v, _lbl)
+                    _tok_v = fwd.get(_orig_v)
+                    if _tok_v:
+                        _norm_spans.append((_s0, _e0, _tok_v))
+            if _norm_spans:
+                # 与已有占位符区间重叠的整段丢弃（`_mask_by_spans` 的契约），
+                # 所以这里先按起点排序、长区间优先，再交给它。
+                _norm_spans.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+                _norm_len = len(text)
+                text, _norm_edits = _mask_by_spans_ed(text, _norm_spans)
+                # NER 段用 `om.map_range` 把**原文**坐标翻到伤疤坐标。旧实现只改
+                # text 不改 om，于是归一化命中过的请求里 NER 实体整体错位
+                # （不是崩溃，是静默遮错位置）。
+                _update_om(_norm_edits, _norm_len)
+
+    # ── 高熵凭据检测（C-3，默认关）──────────────────────────────────────
+    # 覆盖「无前缀、无标签」的随机串。开启后默认只 **warn**（提醒、不改写）：
+    # 误报率未校准前不能替用户决定改写内容。
+    if _high_entropy_on():
+        try:
+            _he_spans = _high_entropy_spans(text)
+            if _he_spans:
+                s["warned"] = int(s.get("warned") or 0) + len(_he_spans)
+                s.setdefault("warned_labels", set()).add("HIGH_ENTROPY")
+        except Exception:
+            pass
+
     # ── AI 实体识别（NER）：人名 (NAME) / 机构 (ORG) / 详细地址 (ADDR) ──
     # 排在全部确定性规则之后：同一原文以规则/自定义词为准，语义模型只补规则覆盖不到
     # 的自由文本。模型在干净的 original 上抽取上下文，抽出的区间经 om.map_range
@@ -5206,6 +6735,31 @@ def _mask_text(text, sid):
     # 结果才允许进叶子缓存 —— 残缺结果一旦入库就等于把漏检永久固化（与 NER 负缓存
     # 同一类坑）。判据是 `skip_epoch()` 前后是否变化：它只统计「结果残缺」类原因
     # （见 ner_engine._CACHE_POISON_SKIPS），`model_unavailable` 不在其中。
+    # 短名强上下文复核的计数（本叶子）：循环外统一记录，不在热路径上反复调
+    _short_name_skips = [0]
+
+    def _plan_entity(s0, e0, lbl):
+        """实体区间 → planned 条目（None = 跳过）。收窄边界、短名复核、登记映射。"""
+        raw_frag = text[s0:e0]
+        frag = raw_frag.strip()
+        if len(frag) < 2:
+            return None
+        # 区间两端可能带空白，收窄到 strip 后的边界，免得把空格/换行一起换成占位符
+        # （还原后会丢排版）。
+        lead = len(raw_frag) - len(raw_frag.lstrip())
+        a, b = s0 + lead, s0 + lead + len(frag)
+        if _short_name_without_context(text, a, b, frag, lbl):
+            _short_name_skips[0] += 1
+            return None
+        # 记账口径说明（易错，必须保留）：_hit() 必须传伤疤坐标系的残片 frag，
+        # 绝不能传原文实体。因为 restore() 会把占位符换回 fwd[TOKEN]，
+        # 出网文本在该位置只剩残片，注册成完整原文会导致还原时把占位符覆盖的部分重复吐出。
+        _hit(frag, lbl)
+        token = fwd.get(frag)
+        if not token:
+            return None
+        return (a, b, token)
+
     _ner_clean = True
     _ner_epoch0 = None
     if NER_ENABLED:
@@ -5220,6 +6774,28 @@ def _mask_text(text, sid):
                 _ner_warn_once("model_missing",
                                "NER 已开启但模型文件不可用（%s），本次未做实体识别"
                                % ner_engine.status().get("model_dir"))
+                # 模型不可用时**仍要跑**中文姓名启发层（2026-10-25 CI 发现）：
+                # 它是纯规则（姓氏表 + 上下文证据），本来就不依赖模型 ——
+                # 恰恰是「模型不可用」时最该由它兜底。原实现把它整块放在 `else`
+                # （模型可用）分支里，于是 CI 无模型环境下启发层完全不生效，
+                # `test_zh_names_are_masked_when_ner_on` 直接红。
+                translated_entities = []
+                _zh_extra, _zh_drop, _zh_truncated = _zh_name_spans(text, [])
+                if _zh_truncated:
+                    try:
+                        ner_engine.record_skip("zh_names_truncated",
+                                               "中文姓名启发层只扫了前 32KB")
+                    except Exception:
+                        pass
+                planned = []
+                for s0, e0, lbl in _ner_entity_spans(text, _zh_extra):
+                    item = _plan_entity(s0, e0, lbl)
+                    if item:
+                        planned.append(item)
+                if planned:
+                    planned.sort(key=lambda x: (x[0], -x[1]))
+                    planned = _expand_long_entity_spans(text, planned)
+                    text = _mask_by_spans(text, planned)
             else:
                 entities = ner_engine.extract_entities(original)
                 translated_entities = []
@@ -5243,28 +6819,52 @@ def _mask_text(text, sid):
                     translated_entities.append({"start": s2, "end": e2, "type": lbl})
 
                 planned = []
+                # 中文姓名启发层（C-1）：补 NER 漏检、剔 NER 过检。
+                # 必须在 `_ner_entity_spans` **之前**做——它返回的补充实体与删除
+                # 列表都要并进 `translated_entities`，再由 `_ner_entity_spans`
+                # 统一按占位符边界切分（那条切分逻辑只该有一份）。
+                _zh_extra, _zh_drop, _zh_truncated = _zh_name_spans(text, translated_entities)
+                # 姓名扫描截断必须可见（超长文本只扫前 32KB，见 `zh_names.MAX_SCAN_CHARS`）。
+                # 写在 **sid 级会话字典**里（不是模块级计数）——本函数跑在 `_MASK_POOL`
+                # 的多 worker 线程里，模块级计数会跨请求串号。
+                if _zh_truncated:
+                    try:
+                        import ner_engine as _ne
+                        _ne.record_skip("zh_names_truncated",
+                                        "中文姓名启发层只扫了前 32KB")
+                    except Exception:
+                        pass
+                if _zh_drop:
+                    _drop_keys = {(d.get("start"), d.get("end")) for d in _zh_drop}
+                    translated_entities = [
+                        e for e in translated_entities
+                        if (e.get("start"), e.get("end")) not in _drop_keys
+                    ]
+                if _zh_extra:
+                    translated_entities.extend(_zh_extra)
                 for s0, e0, lbl in _ner_entity_spans(text, translated_entities):
-                    raw_frag = text[s0:e0]
-                    frag = raw_frag.strip()
-                    if len(frag) < 2:
-                        continue
-                    # 实体区间两端可能带空白，收窄到 strip 后的边界，
-                    # 免得把空格/换行一起换成占位符（还原后会丢排版）。
-                    lead = len(raw_frag) - len(raw_frag.lstrip())
-                    # 记账口径说明（易错，必须保留）：_hit() 必须传伤疤坐标系的残片 frag，
-                    # 绝不能传原文实体。因为 restore() 会把占位符换回 fwd[TOKEN]，
-                    # 出网文本在该位置只剩残片，注册成完整原文会导致还原时把占位符覆盖的部分重复吐出。
-                    _hit(frag, lbl)
-                    token = fwd.get(frag)
-                    if token:
-                        planned.append((s0 + lead, s0 + lead + len(frag), token))
+                    item = _plan_entity(s0, e0, lbl)
+                    if item:
+                        planned.append(item)
                 if planned:
                     # 起点相同时贪心优先覆盖更长的区间，防止短区间覆盖导致长区间残片明文泄漏
                     planned.sort(key=lambda x: (x[0], -x[1]))
+                    planned = _expand_long_entity_spans(text, planned)
                     text = _mask_by_spans(text, planned)
         except Exception as e:
             _ner_warn_once("runtime", "NER 识别降级，本次未做实体识别: %s: %s" % (type(e).__name__, e))
         _ner_clean = _ner_skip_epoch() == _ner_epoch0
+        if _short_name_skips[0]:
+            # 误报降噪必须可见（不静默），但归类为 partial_scope：它是**减噪**，
+            # 不代表「所配置的检测没跑完」，不能把日志打黄（与 zh_names_truncated 同口径）。
+            try:
+                import ner_engine as _ne_short
+                _ne_short.record_skip(
+                    "short_name_no_context",
+                    "短中文姓名无角色词/称谓佐证，按误报跳过 %d 处" % _short_name_skips[0],
+                )
+            except Exception:
+                pass
 
     # last_hits / new_orig 累积而非覆盖：mask() 被 _mask_tree 对每个字符串叶子
     # 各调一次，覆盖会让 count 只反映最后一个叶子的命中（曾导致 MASK 行
@@ -6289,16 +7889,100 @@ _MASK_PROTOCOL_ID_PARENTS = {
 # 只在这类父 key 下才豁免的字段（工具名/媒体容器）。
 # 覆盖 OpenAI tools[].function / 旧式 functions[] / function_call（含响应侧）、
 # Anthropic tool_use、Gemini functionCall，以及 image_url/inline_data 等媒体容器。
+# 媒体容器：这些父键下的 `url` / `data` / `b64_json` / `image_url` 是内联二进制或
+# 图片地址，改了就破图。必须是**窄集合**——`_MASK_PROTOCOL_PARENTS` 含 `content`，
+# 拿它当判据会把普通内容块里的 `data`（如 `redacted_thinking.data`）一并豁免，
+# 那是一条实打实的漏检路径（`tests/test_protocol_state.py` 锁死）。
+_MASK_MEDIA_PARENTS = {
+    "image_url", "inline_data", "thumbnail", "input_image", "source", "file",
+    "audio", "image", "video", "document",
+}
 _MASK_PROTOCOL_PARENTS = {
     "function", "functions", "function_call", "functionCall", "tool_use", "tools", "tool",
     "image_url", "inline_data", "thumbnail", "input_image", "source", "file",
+    # content 也是工具块（`tool_use` / `functionCall`）的父键：Anthropic 的
+    # `messages[].content[].name` 与 Gemini 的 `parts[].name` 都挂在这里。
+    # 缺了它，定义侧 `tools[].name` 豁免而调用侧被改 → 上游工具名校验必然失败
+    # （2026-10-25 实测：`tools[0].name='acme_lookup'` vs
+    # `content[0].name='{{TERM_xxx}}_lookup'`）。
+    "content", "contents", "parts", "block", "blocks",
+    # Codex / Responses 的 custom tool 命名空间（`^[a-zA-Z0-9_-]+$`，magpie #3143）。
+    "namespace",
+    # Responses API 的 `input[]` 协议信封：元素是 `{type, name, arguments, call_id}`，
+    # `name` 与 `namespace` 是上游逐字匹配的工具标识。
+    # 注意它与 Anthropic 的 `tool_use.input` 同名不同义：后者是**参数对象**，
+    # 由 `_scope_of_path` 按「数组信封 vs 参数对象」区分（见该函数注释）。
+    "input",
 }
-_MASK_SKIP_KEYS = {"id", "tool_call_id", "tool_use_id", "name", "url", "data", "b64_json"}
+_MASK_SKIP_KEYS = {"id", "tool_call_id", "tool_use_id", "name", "url", "data", "b64_json", "namespace"}
+
+# 内联二进制（data URL）与媒体地址：改了必然破上游解码（图片/音视频/Office 容器），
+# 而 base64 里不承载可脱敏的自然语言。
+_DATA_URL_MIME_RX = re.compile(r"^data:([a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*)", re.I)
+# 这些**媒体专属**键的 http(s) 地址不再当文本扫。不把 `url`/`data` 放进来：它们在
+# 业务区里可能是正文（`{"data": "..."}`），扩大豁免面会变成真漏检。
+_MASK_MEDIA_VALUE_KEYS = frozenset({
+    "image_url", "file_data", "file_url", "file_id", "input_image", "b64_json",
+})
+
+
+# 文本型 MIME（含 XML/JSON 家族）：**不**豁免——它们装的是可读文本，可能藏 PII。
+# `image/svg+xml` 也走这条（SVG 的 <text> 是明文）。
+_TEXTISH_MIME_RX = re.compile(
+    r"^(?:text/|application/(?:json|xml|javascript|ecmascript|x-ndjson"
+    r"|x-www-form-urlencoded|ld\+json|vnd\.api\+json))",
+    re.I,
+)
+
+
+def _is_binary_data_url(value):
+    """`data:<非文本 MIME>...` → True。文本类 data URL 不豁免（可能藏 PII）。"""
+    m = _DATA_URL_MIME_RX.match(value)
+    if not m:
+        return False
+    mime = m.group(1).lower()
+    if _TEXTISH_MIME_RX.match(mime):
+        return False
+    return not (mime.startswith("text/") or mime.endswith(("+xml", "+json")))
+
+
+def _media_value_exempt(key, value):
+    """媒体值豁免：返回原因码（空串 = 不豁免）。
+
+    **为什么必须有**（2026-10-29 真机事故）：Codex 把含图表的 Excel 渲染成 PNG，
+    base64 塞进 `input[].output[].image_url`；该字段不在任何豁免集合里（`image_url`
+    不在 `_MASK_SKIP_KEYS`，`_MASK_MEDIA_PARENTS` 只盖住 `{"image_url": {"url":…}}`
+    这种嵌套形态），于是整段 base64 被当文本扫。用户自定义词表里的 3 字 ASCII 短词
+    （无边界子串匹配）在几十万字符的 base64 里必然命中，替换成 `{{TERM_xxx}}` 后
+    上游直接 `Only base64 data is allowed` 400——而且客户端会把这份**已被改坏的
+    请求**存进历史，之后每轮重发都 400。
+
+    判据只看**值形态**（不看键名），所以 `input[].output[]`、`input[].content[]`、
+    工具参数里的同名字段都能覆盖：
+      · 任何位置的二进制 data URL（图片/音视频/Office/PDF/octet-stream）；
+      · 媒体专属键的 http(s) 地址（改了同样让上游取不到图）。
+
+    豁免是**漏检路径**，调用方必须计数上报（`media_skipped`），不得静默。
+    """
+    if not isinstance(value, str) or not value:
+        return ""
+    # 只在**媒体专属键**上豁免：值级无差别豁免会变成一处真漏检——
+    # `{"type":"redacted_thinking","data":"data:image/…"}` 这类业务区字段
+    # 按契约必须扫描（`tests/test_protocol_contracts.py` 锁死）。
+    if key not in _MASK_MEDIA_VALUE_KEYS:
+        return ""
+    if _is_binary_data_url(value):
+        return "data_url"
+    head = value[:8].lower()
+    if head.startswith("http://") or head.startswith("https://"):
+        return "media_url"
+    return ""
 # 工具调用关联 ID：上游生成的不透明句柄，客户端靠它把工具结果连回上一轮函数调用。
 # 这组**不分业务区一律豁免**（判定点在 _mask_tree 的 in_business 之前），
 # 因为脱敏它必然断链且保护不了任何东西。call_id 是 OpenAI Responses API 的形式，
-# tool_call_id 是 Chat Completions 的，tool_use_id 是 Anthropic 的。
-_MASK_CORRELATION_ID_KEYS = {"tool_call_id", "tool_use_id", "call_id"}
+# tool_call_id 是 Chat Completions 的，tool_use_id 是 Anthropic 的，file_id 是
+# OpenAI Files/Responses 的文件句柄（改了上游 404，与 call_id 同性质）。
+_MASK_CORRELATION_ID_KEYS = {"tool_call_id", "tool_use_id", "call_id", "file_id"}
 # 业务区容器 key：进入后任何字段都照常扫描
 _MASK_BUSINESS_KEYS = {"input", "arguments", "parameters", "partial_json", "documents"}
 _MASK_MAX_DEPTH = 24
@@ -6345,6 +8029,10 @@ _MASK_PROTECTED_KEY_NAMES = frozenset(
     | set(_MASK_PROTOCOL_PARENTS)
     | set(_MASK_PROTOCOL_ID_PARENTS)
     | set(_MASK_BUSINESS_KEYS)
+    # 媒体专属键（`file_data` 等）也必须进保护名单：它们不在 `_MASK_SKIP_KEYS`、
+    # 也不在 `_MASK_PROTOCOL_PARENTS` 里，曾经被当数据键名脱敏 ——
+    # 症状比改坏 base64 更直接：上游收到 `{"{{TERM_xxx}}": "data:…"}`，字段名直接没了。
+    | set(_MASK_MEDIA_VALUE_KEYS)
     | {
         # 对话协议骨架
         "role", "type", "content", "contents", "parts", "messages", "message",
@@ -6572,6 +8260,118 @@ def _state_carrier_match(obj, key, parent, path, in_business, role):
     return _contracts.match(obj, key, parent, path, role, in_business)
 
 
+# ── 定义区（defs）作用域（2026-10-25）──────────────────────────────
+#
+# 什么属于「定义区」：用户**交给上游按结构读**的东西，不是对模型说的话。
+# 包括工具定义（`tools` / `functions` / `functionDeclarations`）、它们的 JSON Schema
+# （`parameters` / `input_schema` / `schema` / `json_schema` / `properties` / `definitions` /
+# `$defs`）、结构化输出约束（`response_format` / `format`）、以及 Codex 的 grammar。
+#
+# 为什么必须单独划一个作用域：这里改任何一个字符，上游都会拒——工具名不匹配、
+# namespace 字符集不合法、grammar 解析失败、enum 值不在集合里、required 对不上
+# properties。而**保护价值为零**：这些位置本来就不载业务正文。
+# 实测三条 400 路径见 `tests/test_tool_definition_scope.py` 头部注释。
+#
+# 但定义区里的**自然语言**（`description` / `title` / `examples`）必须照常扫描——
+# 那才是模型读到的文本，也是唯一可能带 PII 的地方。
+# 这与 magpie `internal/redact/json.go` 的 `keepIn` 同源：
+#   `if under(path, defs) { return key != "description" }`
+_DEFINITION_KEYS = frozenset({
+    "tools", "tool", "functions", "functionDeclarations", "function_declarations",
+    "parameters", "input_schema", "schema", "json_schema", "definitions", "$defs",
+    "response_format", "format", "toolConfig", "tool_config",
+})
+# 定义区里该被扫描的键（用户填的**取值**与自然语言）。其余一律原样上行。
+#
+# 为什么 enum / const / default 算「取值」而不是「结构」：它们是用户写的业务数据
+# （`{"owner": {"enum": ["张三"]}}` / `{"host": {"default": "100.118.x.x"}}`），
+# 不是上游按语法校验的东西。`tests/test_regressions.py` 的 RequestCoverageTests
+# 把这两类当成审计验收点锁死（实测：豁免掉它们就是真实 PII 明文出网）。
+#
+# 反向：工具名 / namespace / pattern / properties 键名 / required / grammar / type
+# 必须豁免——改写它们只会让上游拒请求（400），保护价值为零。
+# 这条边界与 magpie `keepIn` 的「defs 里只扫 description」不同：magpie 把 enum 也
+# 当结构。我们的口径更严（多扫 enum/default/const），因为本产品的审计验收点要求它。
+_DEFINITION_TEXT_KEYS = frozenset({
+    "description", "title", "examples", "example",
+    "enum", "const", "default",
+})
+
+
+def _note_media_skip(sid, kind):
+    """记一次「媒体/内联二进制整块未扫描」（本轮计数，按原因码分开）。
+
+    与 `_note_signed_block_skip` 同一纪律：豁免是**漏检路径**，静默豁免等于用户
+    以为扫了、其实没扫。累加在会话上、由 MASK 事件取走并清零，语义是「本次请求」。
+    """
+    s = _session_get(sid)
+    if isinstance(s, dict):
+        s["media_skipped"] = int(s.get("media_skipped") or 0) + 1
+
+
+def _take_media_skips(sid):
+    """取走本轮媒体豁免计数并清零（请求级语义）。"""
+    s = _session_get(sid) if sid else None
+    if not isinstance(s, dict):
+        return 0
+    return int(s.pop("media_skipped", 0) or 0)
+
+
+def _note_definition_skip(sid):
+    """记一次「定义区字符串未扫描」（本轮计数）。
+
+    与 `_note_signed_block_skip` 同一纪律：豁免是**漏检路径**，静默豁免等于用户
+    以为扫了、其实没扫。计数累加在会话上、由 MASK 事件取走并清零，语义是
+    「本次请求」；取不到会话时不记（探测/单测路径不能因此抛异常）。
+    """
+    s = _session_get(sid)
+    if isinstance(s, dict):
+        s["definition_skipped"] = int(s.get("definition_skipped") or 0) + 1
+
+
+def _note_exempt_block(sid, text):
+    """记录一段「按协议契约整块不扫描、将原样上行」的文本（供出口复检剔除）。
+
+    为什么必须有（2026-10-25 复核发现的 P1）：签名思考块（`thinking` + `signature`
+    / `redacted_thinking`）在 `_mask_tree` 里是 `return obj` **整块原样上行** ——
+    这是被接受的取舍（计数进 `signed_blocks_skipped`）。但出口复检拿会话 `fwd`
+    当 needle 扫整包字节，只要同一值在**别处**被遮过（当前 user message / 历史
+    普通消息），复检就会在这个豁免块里精确命中 → 503 打断合法请求。
+
+    而客户端回放 thinking 时，思考正文里复述用户原文（姓名/邮箱/电话）是**多轮
+    会话必然出现**的形态。两套机制必须同口径：豁免区不做泄漏判定。
+
+    有界：只留本轮、最多 `_EXEMPT_BLOCKS_MAX` 段、每段截断（复检用不到全文）。
+    """
+    s = _session_get(sid) if sid else None
+    if not isinstance(s, dict) or not isinstance(text, str) or not text:
+        return
+    lst = s.setdefault("exempt_blocks", [])
+    if len(lst) < _EXEMPT_BLOCKS_MAX:
+        lst.append(text[:_EXEMPT_BLOCKS_MAX_CHARS])
+
+
+# 单轮最多记几段豁免块、每段最多留多少字符（复检只需能定位「这段不该判泄漏」）
+_EXEMPT_BLOCKS_MAX = 64
+_EXEMPT_BLOCKS_MAX_CHARS = 8192
+
+
+def _take_exempt_blocks(sid):
+    """取走本轮的豁免块文本并清零（**请求级**语义）。"""
+    s = _session_get(sid) if sid else None
+    if not isinstance(s, dict):
+        return []
+    return s.pop("exempt_blocks", []) or []
+
+
+def _take_definition_skips(sid):
+    """取走本轮「定义区字符串未扫描」计数并清零（MASK 事件用）。"""
+    s = _session_get(sid) if sid else None
+    if not isinstance(s, dict):
+        return 0
+    return int(s.pop("definition_skipped", 0) or 0)
+
+
 def _leaf_exempt(key, parent, in_business):
     """叶子（字符串 / 数值）是否落在「协议位置」从而豁免扫描。
 
@@ -6604,17 +8404,62 @@ def _leaf_exempt(key, parent, in_business):
         return True
     if key in _MASK_SKIP_KEYS:
         # 协议位置判定（业务区内不豁免）：
-        # - name：仅工具定义/调用位置的工具名（tools[].function.name / tool_use.name）
-        # - url/data/b64_json：仅媒体容器里的图片 URL/base64（改了就破图）
+        # - name / namespace：仅工具定义/调用位置（`tools[].function.name` /
+        #   `tool_use.name` / `input[].name`）。2026-10-25 修 D1 时加宽过，但**不能**
+        #   靠 `_MASK_PROTOCOL_PARENTS` 一个集合撑到底：`content` 现在也在里面，
+        #   拿它当父键会把 `tool_result.content[].data` 这类真业务载荷一并豁免。
+        # - url/data/b64_json/image_url：**仅媒体容器**（图片/音频内联数据，改了就破图）。
+        #   判据必须是窄集合 `_MASK_MEDIA_PARENTS`，不能用 `_MASK_PROTOCOL_PARENTS`——
+        #   后者含 `content`，而 `{"type":"redacted_thinking","data":...}` 的父键正是
+        #   `content`；用它会把「协议不可改写状态」与「普通内容块」混为一谈。
         # - id：仅协议容器（messages/content/tool_calls/response/output 等）的关联 ID
-        if key == "name" and parent not in _MASK_PROTOCOL_PARENTS:
+        if key in ("name", "namespace") and parent not in _MASK_PROTOCOL_PARENTS:
             return False
-        if key in ("url", "data", "b64_json", "image_url") and parent not in _MASK_PROTOCOL_PARENTS:
+        if key in ("url", "data", "b64_json", "image_url") and parent not in _MASK_MEDIA_PARENTS:
             return False
         if key == "id" and parent not in _MASK_PROTOCOL_ID_PARENTS:
             return False
         return True
     return False
+
+
+def _scope_of_path(path):
+    """当前位置的作用域：`business` / `definition` / `protocol`。
+
+    三个作用域互斥，判定规则是**看谁先出现**：
+
+      · `business`：路径里先出现的是业务容器键（`input` / `arguments` / `parameters` …）
+        且它的下一段不是数组下标。工具参数里的敏感值必须无条件扫描。
+      · `definition`：路径里先出现的是定义区键（`tools` / `parameters` / `schema` …）。
+        上游按结构读，只扫自然语言（`_DEFINITION_TEXT_KEYS`）。
+      · `protocol`：两者都没有。按原来的 `_leaf_exempt` 判据（协议位置豁免）。
+
+    为什么必须按「谁先出现」而不是「是否包含」：`parameters` 这一个键名在两条
+    协议里意思相反——
+
+      · `tools[0].function.parameters` → JSON Schema 定义（上游按结构读）
+      · `tool_use.input` 里若有个叫 `parameters` 的字段 → 工具自己的参数（业务数据）
+
+    同理 `input`：Anthropic 的 `tool_use.input` 是参数对象（业务），
+    OpenAI Responses 的 `input[]` 是协议信封数组（`{type, name, arguments, call_id}`）。
+    后者里的 `name` / `namespace` 是上游逐字匹配的工具标识，改写就 400。
+
+    2026-10-25 实测（`tests/test_tool_definition_scope.py`）：不区分这两者时，
+    Responses 的 `input[0].name` / `input[0].namespace` 被改写、
+    `tools[0].parameters.properties` 的键名被改写，两者都是确定的 400 路径。
+    """
+    for i, k in enumerate(path):
+        if not isinstance(k, str):
+            continue
+        is_array_next = (i + 1 < len(path)) and isinstance(path[i + 1], int)
+        if k in _DEFINITION_KEYS:
+            return "definition"
+        if k in _MASK_BUSINESS_KEYS:
+            # 下一段是数组下标 → 数组信封（Responses `input[]`），不是参数对象
+            if is_array_next:
+                continue
+            return "business"
+    return "protocol"
 
 
 def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0, flag=None, role=None):
@@ -6641,17 +8486,31 @@ def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0, flag=None, rol
         _check_mask_work(*control)
     if depth > _MASK_MAX_DEPTH:
         raise ValueError("json_depth_exceeded: 请求嵌套超过脱敏递归上限，拒绝透传")
-    in_business = any(k in _MASK_BUSINESS_KEYS for k in path)
+    _scope = _scope_of_path(path)
+    in_business = _scope == "business"
+    in_definition = _scope == "definition"
     if isinstance(obj, str):
         # 仅顶层 retention 的合法协议枚举保真；同名业务值、数组及非法值照常扫描。
         # 不放进全局标量豁免，避免 customer / schema const 等位置漏检。
         if path == ("prompt_cache_retention",) and obj in ("in-memory", "24h"):
+            return obj
+        # 定义区里只有自然语言该扫（`_DEFINITION_TEXT_KEYS`），其余原样上行：
+        # 工具名 / namespace / pattern / enum / required / properties 键名 / grammar
+        # 改写任何一处都只会让上游拒请求，保护价值为零。
+        if in_definition and key not in _DEFINITION_TEXT_KEYS:
+            _note_definition_skip(sid)
             return obj
         # 业务区（tool_use.input / function.arguments 等参数容器）内一律扫描：
         # 不应用任何全局字段名豁免——input 里的 type/role/model/id 都可能是业务数据
         # （审计实测：input.type 放手机号曾原文上行）。只有业务区外的协议位置才跳过。
         # 判据抽到 `_leaf_exempt`：数值分支必须用同一套，否则两边行为会漂。
         if _leaf_exempt(key, parent, in_business):
+            return obj
+        # 媒体/内联二进制豁免（2026-10-29）：必须在 `_mask_hit` 之前，否则整段
+        # base64 会被规则与自定义词扫到、改坏后上游解码失败（详见函数 docstring）。
+        _media_kind = _media_value_exempt(key, obj)
+        if _media_kind:
+            _note_media_skip(sid, _media_kind)
             return obj
         return _mask_hit(obj, sid, flag)
     # bool 是 int 的子类，必须先判掉：否则 True/False 会被 str() 成 "True"/"False"
@@ -6665,7 +8524,15 @@ def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0, flag=None, rol
         # 而 fail-closed 只兜异常，兜不住「静默判定为无需改写」。
         # 修法：取字符串形态过一遍规则，命中才把整个值换成占位符（类型由 number
         # 变 string，上游读到的就是占位符，与字符串形态的脱敏结果一致）。
-        if key in _MASK_SKIP_NUMERIC_KEYS or _leaf_exempt(key, parent, in_business):
+        # 定义区的数值分支必须与字符串分支**同判据**（2026-10-25 复核发现的 P1）：
+        # 字符串分支只豁免 `_DEFINITION_TEXT_KEYS` 之外的键（`enum`/`const`/`default`
+        # 照扫），数值分支却曾 `in_definition` 一刀切返回 —— 于是
+        # `{"host": {"default": "100.118.x.x"}}`（字符串）被遮、
+        # `{"host": {"default": 10011800000}}`（JSON number）原样上行。
+        # 那是本文件自己的注释明令禁止的口径（enum/const/default 是**取值**不是结构）。
+        if (key in _MASK_SKIP_NUMERIC_KEYS
+                or (in_definition and key not in _DEFINITION_TEXT_KEYS)
+                or _leaf_exempt(key, parent, in_business)):
             return obj
         s = repr(obj) if isinstance(obj, float) else str(obj)
         out = mask(s, sid)
@@ -6681,6 +8548,11 @@ def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0, flag=None, rol
         return [_mask_tree(v, sid, key, parent, path + (i,), depth + 1, flag, role)
                 for i, v in enumerate(obj)]
     if isinstance(obj, dict):
+        # 定义区的**键名**一律不脱敏（`properties` 的键就是参数名，改了模型填不上参）。
+        # 与上面的定义区作用域同一理由，只是作用在 dict 分支。
+        if in_definition:
+            return {k: _mask_tree(v, sid, k, key, path + (k,), depth + 1, flag, role)
+                    for k, v in obj.items()}
         # 协议元数据对象整棵跳过。必须放在 dict 分支——str 分支的
         # _MASK_SKIP_SCALAR_KEYS 对对象值无效（见该集合上方的注释）。
         if not in_business and key in _MASK_SKIP_SUBTREE_KEYS:
@@ -6693,6 +8565,12 @@ def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0, flag=None, rol
         if carrier is not None:
             _note_signed_block_skip(sid)
             if carrier.scope == "block":
+                # 整块原样上行：把它的文本内容记下来，出口复检据此剔除
+                # （否则复检会在这个豁免块里命中别处登记过的原文 → 503 打断合法请求）
+                try:
+                    _note_exempt_block(sid, json.dumps(obj, ensure_ascii=False))
+                except Exception:
+                    pass
                 return obj
             locked = _contracts.protected_fields(carrier, obj)
         # 键名脱敏（2026-09 起，审计 B2）。旧实现是「键名一律不脱敏」，理由是
@@ -7279,25 +9157,30 @@ def _parse_response_payload(body_text, ct):
                     if txt:
                         chunks.append(txt)
                 # text chunks: OpenAI delta
-                for c in data.get("choices", []):
-                    d = c.get("delta", {})
+                # `_choices_of`：`choices` 可能不是 list（真值非 list 会抛 not iterable，
+                # 真机 2026-10-25 事故），审计侧同样不能被带崩。
+                for c in _choices_of(data):
+                    d = c.get("delta") or {}
                     if isinstance(d.get("content"), str):
                         chunks.append(d["content"])
         else:  # json
             data = json.loads(body_text)
             model_field = data.get("model")
             # OpenAI chat
-            for c in data.get("choices", []):
-                msg = c.get("message", {})
+            for c in _choices_of(data):
+                msg = c.get("message") or {}
                 if isinstance(msg.get("content"), str):
                     chunks.append(msg["content"])
                 elif isinstance(msg.get("content"), list):
                     for p in msg["content"]:
                         if isinstance(p, dict) and isinstance(p.get("text"), str):
                             chunks.append(p["text"])
-                for tc in msg.get("tool_calls", []):
-                    args = tc.get("function", {}).get("arguments", "")
-                    if args:
+                for tc in msg.get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    args = fn.get("arguments", "") if isinstance(fn, dict) else ""
+                    if isinstance(args, str) and args:
                         chunks.append(args)
             # Anthropic
             if isinstance(data.get("content"), list):
@@ -9210,8 +11093,101 @@ async def _request_impl(flow: http.HTTPFlow):
         # 静默降级等于「以为开了、其实没脱」。
         ner_skips = _res.ner_skips
         ner_metrics = _res.ner_metrics or {}
+        # ── 出口前复检（最后一道网）───────────────────────────────────────
+        # 脱敏后的字节回头再扫一遍：仍能匹配到本次登记的原文就**记录**（默认）。
+        # 抓的是「规则漏了 / 路径豁免错了 / 覆盖项算错了」这类已知会发生的
+        # 缺陷（不是假想风险）。超预算时跳过并留痕。
+        #
+        # ⚠️ **默认不阻断**（用户第一准则，2026-10-26 定案，详见
+        # `_MASK_EGRESS_BLOCK` 的注释）：Maskit 是本地透明代理，阻断请求等于
+        # 让用户的整条业务链路不可用（微信机器人 / 编辑器助手 / CI 都会只看到
+        # 「上游 503」）。漏一个值的代价可事后补救，断链不可。所以这里默认
+        # 只记事件 + 取证，请求照常上行；需要旧行为（命中就拦）的用户显式设
+        # `MASKIT_EGRESS_BLOCK=1`。
+        #
+        # ⚠️ 必须在 `masked_bytes is None` 时**也跑**（2026-10-25 复核发现）：
+        # 原实现整块包在 `if _res.masked_bytes is not None:` 里，于是**零改写**
+        # 的请求完全不复检 —— 而「零改写」恰恰可能是「本该遮但规则漏了」，
+        # 那正是这道网存在的唯一理由。零改写时拿客户端原始字节复检（它就是要
+        # 上行的那份字节），语义完全一致。
+        _egress_body = (
+            _res.masked_bytes.decode("utf-8", errors="replace")
+            if _res.masked_bytes is not None
+            else (flow.request.content or b"").decode("utf-8", errors="replace")
+        )
+        _sess_now = _session_get(sid, {})
+        # needle 只取**本轮新增**（`new_orig`），不取会话累计 `fwd` ——
+        # 否则长会话 needle 超过上限后复检永久失效（见 `_mask_egress_needles` 注释）。
+        _needles = _mask_egress_needles(
+            _sess_now.get("fwd") or {}, _sess_now.get("labels") or {},
+            _sess_now.get("new_orig") or set(),
+        )
+        if _needles:
+            try:
+                _leaked = _mask_egress_verify(_egress_body, _needles, sid)
+            except Exception:
+                _leaked = False
+            if _leaked:
+                # 默认只记录；显式开启 `MASKIT_EGRESS_BLOCK=1` 才真的拦。
+                # `decision` 字段必须如实区分两种形态 —— 前端与统计靠它归因，
+                # 把「flagged」写成「blocked」会让用户以为请求被拦了（它明明上行成功）。
+                _blocking = bool(_MASK_EGRESS_BLOCK)
+                _emit("BLOCK", host=host, method=method,
+                      path=path.split("?")[0], sid=sid,
+                      reason="egress_verify", block_source="egress",
+                      bytes=len(_egress_body),
+                      decision="blocked" if _blocking else "flagged",
+                      leaked=_leaked_values(_egress_body, _needles,
+                                             _sess_now.get("labels") or {}),
+                      msg=("脱敏后仍能匹配到本次登记的原文，请求已阻断（未上行）"
+                           if _blocking else
+                           "脱敏后仍能匹配到本次登记的原文（仅记录，请求照常上行）"),
+                      upstream=up_name, **source)
+                if _blocking:
+                    flow.response = http.Response.make(
+                        503,
+                        json.dumps(
+                            {"error": {"code": "shield_egress_unmasked",
+                                       "reason": "egress_verify"}},
+                            ensure_ascii=False,
+                        ).encode("utf-8"),
+                        {"content-type": "application/json", "x-should-retry": "false"},
+                    )
+                    return
+        # 脱敏取证（C-2）：记一条「厂商实际收到的 body」（内存、有界、不含凭据原文）。
+        # 用户想核对「发出去的是不是占位符」只能抓包，这条缓冲是唯一的本地证据。
+        #
+        # ⚠️ 必须在 `masked_bytes is None`（**零改写**）时也记：零改写的请求同样
+        # 上行，用户同样想核对「它是不是真的没被遮」——而那正是最需要证据的场景。
+        # 原实现整块包在 `if ... is not None:` 里，零改写请求在取证缓冲里查不到
+        # （2026-10-25 复核）。
+        _egress_preview_add(sid, host, path, _egress_body, (_sess_now.get("labels") or {}))
         if _res.masked_bytes is not None:
+            # ── per-kind `block` 三态（B-4）──────────────────────────────
+            # 命中类型被设为 block 时：已遮（占位符替换完成）但**不放行**——
+            # 返回 503 让用户知道「这类值按你的设置不该出网」。
+            # 与 `egress_verify` 的区别：那是引擎自己发现漏了，这是**用户配置**的
+            # 主动拦截，所以 block_source 仍是 engine（归因不同）。
+            _blk, _blocked_labels = _take_rule_block(sid)
+            if _blk:
+                _emit("BLOCK", host=host, method=method, path=path.split("?")[0],
+                      sid=sid, reason="rule_action_block", block_source="engine",
+                      bytes=len(_res.masked_bytes),
+                      msg="按规则三态设置阻断（命中类型：%s）" % ",".join(_blocked_labels[:6]),
+                      upstream=up_name, **source)
+                flow.response = http.Response.make(
+                    503,
+                    json.dumps(
+                        {"error": {"code": "shield_rule_blocked",
+                                   "reason": "rule_action_block",
+                                   "labels": _blocked_labels}},
+                        ensure_ascii=False,
+                    ).encode("utf-8"),
+                    {"content-type": "application/json", "x-should-retry": "false"},
+                )
+                return
             # 回写必须在事件循环线程里做（flow 是 mitmproxy 的对象）。
+            # （取证已在上面统一记过，见 `_egress_preview_add` 那条注释）
             flow.request.content = _res.masked_bytes
             body_rewritten = True
             first_diff_byte = _res.first_diff_byte
@@ -9338,6 +11314,7 @@ async def _request_impl(flow: http.HTTPFlow):
     except Exception:
         pass
     _s_signed = _take_signed_skips(sid)
+    _media_skipped = _take_media_skips(sid)
     # 严格模式闸门（§B3）必须在**请求出网前**生效：此时脱敏已完成（命中/占位符已定），
     # 只差回写与放行。判据用 inspection 的类别表：exempt（签名块按契约不扫）与 info
     # （取消/直通）不阻断，只有「检测没跑完」类降级才阻断。
@@ -9367,6 +11344,10 @@ async def _request_impl(flow: http.HTTPFlow):
         )
         _drop(sid)
         return
+    _warned_n, _warned_labels = _take_warned(sid)
+    _known_n = _take_known_hits(sid)
+    _egress_skipped, _egress_skip_reason = _take_egress_skip(sid)
+    _egress_passed = _take_egress_pass(sid)
     _emit(
         "MASK",
         host=host,
@@ -9375,6 +11356,18 @@ async def _request_impl(flow: http.HTTPFlow):
         sid=sid,
         count=hit_count,          # 本次实际命中的唯一原文数（含历史复用）
         new_count=new_count,      # 其中本次新增的
+        # warn 三态（B-4）：本轮被「只提醒」放行的值与类型。取走即清（请求级）。
+        # 不发出去等于用户设了 warn 却什么都看不到——那和关掉规则没区别。
+        **(({"warned": _warned_n, "warned_labels": _warned_labels}
+            if _warned_n else {})),
+        # known 正向打码命中数（B-1）：让「无锚点却被遮」可归因，不必怀疑规则误报。
+        **({"known_hits": _known_n} if _known_n else {}),
+        # 出口复检被跳过（B-2）：「超预算跳过必须留痕」这条承诺的唯一落点。
+        **({"egress_skipped": True, "egress_skip_reason": _egress_skip_reason}
+            if _egress_skipped else {}),
+        # 出口复检「命中了但按规则同口径判定不该遮」的条数：豁免不能静默
+        # （AGENTS.md §3.8）。用户看到它就能区分「复检没跑」与「跑了但全放行」。
+        **({"egress_passed": _egress_passed} if _egress_passed else {}),
         masked_total=len(fwd),    # 会话累计脱敏的唯一值总数（历史会增长）
         items=items,
         upstream=matched_up["name"] if matched_up else "",
@@ -9406,9 +11399,12 @@ async def _request_impl(flow: http.HTTPFlow):
         # 签名思考块整块豁免计数（本轮）：静默豁免必须可见，否则用户会以为全扫过了。
         # 缺省不加字段，避免常态噪声（与 ner_truncated 同一做法）。
         **({"signed_blocks_skipped": _s_signed} if _s_signed else {}),
+        # 媒体/内联二进制整块豁免计数（本轮）：同上，静默豁免不可接受。
+        **({"media_skipped": _media_skipped} if _media_skipped else {}),
         # 统一检测口径（§B1）：处置结论 + 完整度 + 原因码，与扩展桥接同源。
         **inspection.report_for_mask(changed=bool(hit_count), ner_skips=ner_skips,
-                                     signed_skipped=_s_signed),
+                                     signed_skipped=_s_signed,
+                                     media_skipped=_media_skipped),
         **source,
     )
 
@@ -9862,6 +11858,21 @@ def _sse_response_channel(data, kind):
     return "r%s.%s" % (data.get("output_index", 0), kind)
 
 
+def _choices_of(data):
+    """取 SSE/JSON 负载里的 `choices` 列表；值不是 list 时返回空列表。
+
+    为什么必须收窄（2026-10-25 真机事故）：原写法 `data.get("choices", []) or []`
+    只挡了「假值」，而 `choices: true` / `choices: 1` / `choices: {...}` 都是**真值**，
+    直接 `enumerate()` 会抛 `TypeError: 'bool' object is not iterable`。
+    异常冒泡到 `_stream_owned` 的 except，整条流式还原降级为原样透传 —— 真机事件
+    库里就是 11 条 `sse_stream:unhashable type: 'list'` 那一批的兄弟形态。
+
+    上游发这种畸形负载本身不合协议，我们的责任是「不被它带崩」，不是纠正它。
+    """
+    v = data.get("choices")
+    return v if isinstance(v, list) else []
+
+
 def _sse_text_slots(data):
     """列出 SSE 事件里的增量文本槽位：[(channel, text, setter, escape)]。
 
@@ -9873,7 +11884,7 @@ def _sse_text_slots(data):
     if not isinstance(data, dict):
         return slots
     # OpenAI Chat Completions / Completions 流
-    for position, c in enumerate(data.get("choices", []) or []):
+    for position, c in enumerate(_choices_of(data)):
         if not isinstance(c, dict):
             continue
         # Sparse chunks may each contain only one of several completion choices.
@@ -9968,7 +11979,7 @@ def _sse_terminal_prefixes(data):
     if data.get("type") == "response.function_call_arguments.done":
         return (_sse_response_channel(data, "args"),)
     return tuple(f"c{_sse_choice_index(c, position)}."
-                 for position, c in enumerate(data.get("choices", []) or [])
+                 for position, c in enumerate(_choices_of(data))
                  if isinstance(c, dict) and c.get("finish_reason"))
 
 
@@ -10052,7 +12063,7 @@ def _build_flush_event(tmpl_json, channel, leftover):
             hit = True
     if not hit:
         return ""
-    for c in data.get("choices", []) or []:
+    for c in _choices_of(data):
         if isinstance(c, dict):
             c["finish_reason"] = None  # 补发事件不能带结束标记
     prefix = ""
@@ -10813,6 +12824,168 @@ def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse
     return _stream
 
 
+# ===================== 还原失败归因细分（C-2）=====================
+#
+# 真机事件库复盘（2026-10-25，43763 条事件）：
+#   RESTORE 21,267 条 → restored 13,930（65.5%）、no_placeholder_in_response
+#   7,192（**33.8%**）、unresolved **3**（0.01%）；最终响应残留严格形态占位符
+#   **1 条**。
+#
+# 结论：「占位符没被还原」几乎不存在；用户体感「没还原」的主因是
+# `no_placeholder_in_response` 这个**大桶**把三种完全不同的事混成一个数字：
+#   · 模型压根没提那些值（正常，占绝大多数）；
+#   · 模型提了、但改写了形态且没兜住（真问题）；
+#   · 响应没走完（流中断 / 客户端断开 / 上游 5xx）。
+#
+# 用户看到「33% 没还原」只会以为引擎坏了。所以必须细分，且**不改变**
+# 「有没有真的漏还原」的判定（`unresolved` 仍是唯一告警态）。
+
+# 宽松形态：模型常把 `{{PHONE_abcdef}}` 写成 `PHONE_abcdef` / `{{ PHONE_abcdef }}` /
+# `{{phone_abcdef}}`。**匹配**层面刻意宽松（花括号整体可选，裸形态也要能命中），
+# 但**判定**层面必须收紧，见 `_response_has_placeholder_shape` 的分级判据。
+# 这一层只用于归因（「模型提没提」），不参与还原决策（还原走 `restore()` 的
+# 严格/宽松/转义三遍）。
+# 两个捕获组分别是 label 与后缀，判定层要按后缀查签发台账。
+_LOOSE_SHAPE_RX = re.compile(
+    r"(?:\{\{?\s*)?([A-Za-z][A-Za-z0-9]{0,11})\s*[_\-]\s*"
+    r"([0-9a-fA-F]{6}|[bcdfghjkmnpqrstvwxzBCDFGHJKMNPQRSTVWXZ]{6})"
+    r"(?:\s*\}?\}?)?",
+    re.IGNORECASE,
+)
+# 这些「LABEL_suffix」形态是代码/常量，不是占位符（实测误报源）
+_LOOSE_SHAPE_DENY = frozenset({"utf", "http", "https", "base", "sha", "md", "sha256", "sha1"})
+
+
+def _response_has_placeholder_shape(text):
+    """响应里是否出现过「像占位符」的片段（严格或宽松形态都算）。
+
+    只用于**归因**：区分「模型压根没提」与「模型提了但形态坏了」。
+    绝不参与还原决策——那仍然只走 `restore()`。
+
+    判据分级（2026-10-29 收紧）：
+      · 带花括号（`{{X_sfx}}` / `{X_sfx}`）→ 认：模型明确在写占位符；
+      · 裸形态（`X_sfx` / `X-sfx`）→ 后缀必须**由本机签发过**
+        （`_ISSUED_SUFFIXES`），否则普通标识符会把归因污染掉；
+      · 后缀全是数字 → 一律不认。
+
+    为什么必须收紧：后缀分支 `[0-9a-fA-F]{6}` 把纯 6 位数字也当成后缀，于是
+    OpenAI 工具调用 ID `call_417868`、版本串 `gen-179315`、日期串
+    `V19511040_202211`、base62 凭证片段 `garKuE-DnrfcP` 全被记成「占位符被
+    改写」。用 2026-10-27 / 10-28 各 200 条 `placeholder_rewritten` 样本的
+    `resp_preview` 回放：命中 210 / 208 次，**零个真占位符** —— 该标签因此
+    完全失真，还把本应归为 `not_mentioned` 的请求错误标黄（10-27 单日
+    1069/4109 = 26% 都来自这里）。
+
+    已知漏检面：hex6 老格式不进签发台账（`_suffix_indexable` 只收纯辅音），
+    所以「裸的 hex6 占位符被模型剥了花括号」不再被识别；hex6 后缀恰好全数字的
+    那一小部分（`(10/16)^6`，约 6%）连带花括号也会被 `isdigit` 判掉 —— 方向
+    保守，优先消除假阳性。
+    """
+    try:
+        if not text or not isinstance(text, str):
+            return False
+        for m in _LOOSE_SHAPE_RX.finditer(text):
+            whole, label, suffix = m.group(0), m.group(1), m.group(2).lower()
+            # 取标签部分的字母前缀做排除（`UTF_8abc` 这类代码常量）
+            head = re.match(r"[a-z]+", label.lower())
+            if head and head.group(0) in _LOOSE_SHAPE_DENY:
+                continue
+            # 新格式后缀是纯辅音、绝不含数字，全数字只可能来自工具调用 ID / 版本号
+            # （`call_417868` / `gen-179315`）。hex6 老格式有约 6% 概率后缀恰好全数字
+            # （`(10/16)^6`），这一小类归因会漏检——方向保守，不为它放宽判据。
+            if suffix.isdigit():
+                continue
+            # 带花括号 = 模型明确在写占位符，端到端形态已足够，不要求台账
+            if "{" in whole:
+                return True
+            # 裸形态：只认本机签发过的后缀
+            if _issued_suffix(suffix):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _restore_status_of(*, masked_count=0, unresolved=0, restored_count=0,
+                       placeholder_seen=False, complete=True):
+    """派生 `restore_status`（细分版）。
+
+    优先级（高 → 低）：
+      `no_sensitive_data` > `unresolved` > `response_incomplete` >
+      `placeholder_rewritten` > `not_mentioned` > `restored`
+
+    ⚠️ 顺序不是随意的：
+      · `unresolved` 必须是**唯一告警态**，所以它排在除「压根没遮」之外的最前；
+      · `response_incomplete`（流断了）不能算成引擎的还原能力问题，所以排在
+        「形态被改写」之前 —— 否则用户会去查规则，实际是网络断了；
+      · `restored` 排最后：只要真还原过就是成功，哪怕还有别的旁证。
+
+    为什么 `not_mentioned` 单独成一态而不是并入 `restored`：它占真机 34%，
+    混进 `restored` 会让「还原率」虚高到 99%，用户无法区分「模型没提」与
+    「引擎没干活」。分开之后两个数字都有意义。
+    """
+    if masked_count <= 0:
+        return "no_sensitive_data"
+    if unresolved > 0:
+        return "unresolved"
+    if not complete:
+        return "response_incomplete"
+    if restored_count > 0:
+        return "restored"
+    if placeholder_seen:
+        return "placeholder_rewritten"
+    return "not_mentioned"
+
+
+# ===================== 脱敏取证缓冲（C-2）=====================
+#
+# 「厂商实际收到了什么」现在是看不见的：事件库只留 preview，凭据连 preview 都不存。
+# 用户想核对「这条请求到底发出去的是不是占位符」只能抓包。
+#
+# 参照 magpie `maskrec`：**内存**留最近 N 条脱敏后的 body（不落盘、不新增原文持有）。
+# 与 magpie 的差别：我们只留**脱敏后**的文本（占位符形态），不留可还原的原文对照——
+# 原文仍只在 `sessions[sid]["rev"]` 里，取证端点不碰它。
+_EGRESS_PREVIEW_MAX = 50
+_EGRESS_PREVIEW_BODY_MAX = 8 * 1024      # 单条最多 8KB（取证用，不需要全文）
+_EGRESS_PREVIEW = collections.deque(maxlen=_EGRESS_PREVIEW_MAX)
+
+
+def _egress_preview_reset():
+    """清空取证缓冲（**只给测试与「清空映射」动作**用）。"""
+    _EGRESS_PREVIEW.clear()
+
+
+def _egress_preview_add(sid, host, path, masked, labels):
+    """记一条「厂商实际收到的 body」（内存、有界、不含凭据原文）。
+
+    为什么存 `masked`（脱敏后）而不是原文：取证要回答的是「发出去的是不是占位符」，
+    存原文等于再造一份明文持有面（且会被 UI 展示）。
+    为什么凭据类只留占位符：占位符本身不含原文，可以安全展示。
+    """
+    try:
+        body = str(masked or "")
+        if len(body) > _EGRESS_PREVIEW_BODY_MAX:
+            body = body[:_EGRESS_PREVIEW_BODY_MAX] + "…"
+        _EGRESS_PREVIEW.append({
+            "ts": time.time(),
+            "sid": str(sid or "")[:32],
+            "host": str(host or "")[:120],
+            "path": str(path or "")[:200],
+            "masked": body,
+            "labels": sorted({str(v) for v in (labels or {}).values()})[:12],
+        })
+    except Exception:
+        pass
+
+
+def _egress_preview_list():
+    """取取证缓冲（最新在后）。"""
+    try:
+        return list(_EGRESS_PREVIEW)
+    except Exception:
+        return []
+
+
 def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, streamed_text=None, stream_actual="whole", stream_usage=None, prepare_only=False):
     """记录 RESTORE 事件（流式与非流式共用）。
 
@@ -10831,17 +13004,13 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
     foreign = int(s.get("foreign", 0) or 0)
     degraded = int(s.get("degraded", 0) or 0)
     restore_signed_skipped = int(s.get("restore_signed_skipped") or 0)
-    if masked_count == 0:
-        restore_status = "no_sensitive_data"
-    elif unresolved > 0:
-        # 有占位符查不到原文（复用表淘汰/会话被扫/孤儿占位符）：告警态，前端要能看到
-        restore_status = "unresolved"
-    elif restored_count > 0:
-        restore_status = "restored"
-    else:
-        restore_status = "no_placeholder_in_response"
+    # 还原失败归因细分（C-2）：`no_placeholder_in_response` 这个大桶必须拆开
+    # （真机 34% 全在里面，混了「模型没提」「模型提了但形态坏了」「响应没走完」
+    # 三种完全不同的事，用户看到只会以为引擎坏了）。判据与优先级见
+    # `_restore_status_of` 的 docstring。
     resp_preview = ""
     resp_dialog = ""
+    _resp_text_for_shape = ""
     try:
         # 流式接管时用回调累积的文本；非流式读 flow.response.content
         if streamed_text is not None:
@@ -10859,6 +13028,26 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
     except Exception:
         resp_preview = ""
         resp_dialog = ""
+    # 归因用的响应文本：只在**已经拿到**的预览/对话上判（不额外拷贝全文）。
+    # `_LOOSE_SHAPE_RX` 只扫这几千字符，成本可忽略。
+    _resp_text_for_shape = resp_dialog or resp_preview
+    _placeholder_seen = _response_has_placeholder_shape(_resp_text_for_shape)
+    # `complete=False` 只在「响应确实没走完」时置位：流式收尾被中断/客户端断开。
+    _resp_complete = True
+    try:
+        if stream_actual == "stream" and not ok:
+            _resp_complete = False
+        if str(s.get("stream_interrupted") or ""):
+            _resp_complete = False
+    except Exception:
+        pass
+    restore_status = _restore_status_of(
+        masked_count=masked_count,
+        unresolved=unresolved,
+        restored_count=restored_count,
+        placeholder_seen=_placeholder_seen,
+        complete=_resp_complete,
+    )
     # 还原后的文本可能复述模型见到的凭据原文：落库前必须清洗。
     # 两步互补：形态正则（防用户自贴的凭据）+ 本会话原文精确串（防模型裸复述值本身）。
     resp_dialog = _redact_credentials(_redact_session_credentials(resp_dialog, s))
@@ -11008,6 +13197,7 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
         # （曾只发 status，前端读 restore_status 全部不匹配，状态文案全是死代码）
         status=restore_status,
         restore_status=restore_status,
+        placeholder_seen=_placeholder_seen,
         items=items,
         scan_scope=s.get("scan_scope") or {},  # RESTORE 归因：复用 MASK 的扫描范围
         http_status=getattr(flow.response, "status_code", None),
@@ -11200,6 +13390,46 @@ def _handle_sse(flow, sid):
     flow.response.content = _restore_sse_body(flow.response.content or b"", sid)
 
 
+
+
+def _parse_rule_actions(raw):
+    """解析 `rule_actions`：`{LABEL: "mask"|"warn"|"block"}`，非法项丢弃。
+
+    丢弃而不是整份作废：配置里混进一个拼错的键名，不该让用户其它三态设置全丢。
+    丢弃后 `_rule_action()` 会回退 `mask`（保守方向：宁可按原行为遮，不能静默放行）。
+    """
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        key = str(k or "").strip().upper()
+        act = str(v or "").strip().lower()
+        if key in DEFAULT_BUILTIN_RULES and act in ("mask", "warn", "block"):
+            out[key] = act
+    return out
+
+
+def _parse_allow_values(raw):
+    """解析 `allow_values`：整值白名单，去空白、去重（大小写折叠）、有界。
+
+    上限参照 magpie `settings/masking.go`：200 条 × 256 字符。无界白名单等于
+    无界误检面，而且每条都要在热路径上比对。
+    """
+    out = set()
+    if not isinstance(raw, (list, tuple)):
+        return out
+    for item in raw:
+        # 只收字符串（与 panel 侧同口径）：`str(None)` → `"None"` 会让白名单
+        # 凭空多出一个 `None` 值。
+        if not isinstance(item, str):
+            continue
+        v = item.strip()
+        if not v or len(v) > ALLOW_VALUE_MAX_LEN:
+            continue
+        if len(out) >= ALLOW_VALUES_MAX:
+            break
+        out.add(v.lower())
+    return out
 
 
 def _read_settings():
@@ -11462,6 +13692,11 @@ def _read_settings():
         "sensitive_word_whole": {
             str(w).strip() for w in (cfg.get("sensitive_word_whole") or []) if str(w).strip()
         },
+        # per-kind 三态（B-4）：`{LABEL: "mask"|"warn"|"block"}`，缺省 mask。
+        # 非法取值**丢弃并回退 mask**，不让配置写错把规则静默关掉。
+        "rule_actions": _parse_rule_actions(cfg.get("rule_actions")),
+        # 值级白名单（B-4）：整值精确匹配、大小写不敏感、有上限。
+        "allow_values": _parse_allow_values(cfg.get("allow_values")),
     }
 
 
@@ -11475,6 +13710,7 @@ def _maybe_reload(force=False):
     global AUDIT_SCAN_MAX, AUDIT_PARSE_MAX, AUDIT_TIME_BUDGET_S, _ENV_AUDIT_SCAN_MAX, _ENV_AUDIT_PARSE_MAX, _ENV_AUDIT_TIME_BUDGET
     global FAIL_CLOSED, RESPONSE_SCAN, STREAM_RESPONSE, STREAM_EXCLUDE_HOSTS
     global SENSITIVE_DISABLED, SENSITIVE_WORD_DISABLED, SENSITIVE_WORD_WHOLE, BUILTIN_RULES, EGRESS_PROXY
+    global RULE_ACTIONS, ALLOW_VALUES
     global COMMAND_BLOCK, _EXTRA_HEADER_SKIP_WARNED, _CUSTOM_WORD_RX_CACHE
     # 跨进程信号（清空内存映射）必须在 config mtime 的**提前返回之前**检查：
     # 它不依赖配置文件是否变过。读盘已由 event_store 做 5s 节流，热路径只是一次
@@ -11509,6 +13745,10 @@ def _maybe_reload(force=False):
         k: set(v) for k, v in (s.get("sensitive_word_disabled") or {}).items()
     }
     SENSITIVE_WORD_WHOLE = set(s.get("sensitive_word_whole") or set())
+    # 三态与值级白名单：整表换对象发布（与 BUILTIN_RULES 同一口径，
+    # 读者只会看到上一代或新一代，不会看到半填充的中间态）。
+    RULE_ACTIONS = dict(s.get("rule_actions") or {})
+    ALLOW_VALUES = set(s.get("allow_values") or set())
     # 永久映射的重建必须排在禁用集赋值**之后**：_sync_custom_word_mappings 用
     # SENSITIVE_DISABLED / SENSITIVE_WORD_DISABLED 判断哪些词仍启用，放在前面会
     # 永远按上一代配置计算（禁用词要等第二次改配置才被清掉）。

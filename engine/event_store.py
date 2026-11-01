@@ -547,7 +547,7 @@ _SUMMARY_KEEP_FIELDS = frozenset({
     # 检测结论与原因码（§B 状态通道；枚举/数字，不含正文）
     "decision", "completeness", "reasons", "reason_codes", "blocked", "failed",
     "reason", "block_source", "ner_truncated", "ner_skip_reasons",
-    "signed_blocks_skipped", "bytes", "error_code", "failure_phase",
+    "signed_blocks_skipped", "media_skipped", "bytes", "error_code", "failure_phase",
     # 失败归因（批次 8 / P0-5）：责任方与异常类名。前者让用户一眼看出该查谁
     # （引擎/上游/客户端/DNS/出口代理），后者让同一类断开能聚合计数。
     # 两者都是短枚举字符串，不含正文。
@@ -558,6 +558,20 @@ _SUMMARY_KEEP_FIELDS = frozenset({
     "upstream_may_have_executed", "engine_busy", "engine_queue_bytes", "engine_queue_depth",
     # 还原结果计数
     "restored_unique", "unresolved", "degraded", "success", "usage",
+    # C-2（2026-10-25）：还原失败归因。`placeholder_seen` 让「模型提了但形态坏了」
+    # 与「模型压根没提」在事件里可区分（真机 34% 的 no_placeholder 混了这两种）。
+    "placeholder_seen",
+    # B-4（2026-10-25）：warn 三态本轮放行的值与类型。不发出去等于用户设了
+    # warn 却什么都看不到——那和关掉规则没区别，还留着「我设了 warn」的误解。
+    "warned", "warned_labels",
+    # B-1：known 正向打码命中数（让「无锚点却被遮」可归因）
+    "known_hits",
+    # B-2：出口复检被跳过（超预算）与原因——「跳过必须留痕」的唯一落点
+    "egress_skipped", "egress_skip_reason",
+    # 2026-10-26：出口复检「命中但按规则同口径判定不该遮」的条数。
+    # 与 `egress_skipped` 同一纪律：豁免不能静默，否则用户分不清
+    # 「复检没跑」与「跑了但全放行」。纯计数，不含正文。
+    "egress_passed",
     # 耗时（毫秒）、前缀保真诊断、扫描范围计数
     "mask_ms", "upstream_ms", "first_byte_ms", "queue_wait_ms", "aux_wait_ms",
     "body_rewritten", "first_diff_byte", "suffix_reused", "short_hits", "scan_scope",
